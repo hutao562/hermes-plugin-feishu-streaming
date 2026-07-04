@@ -45,6 +45,12 @@ ignore = ["RUF001", "RUF002", "RUF003", "RUF006"]
 [tool.ruff.format]
 quote-style = "double"
 
+[tool.pytest.ini_options]
+markers = [
+  "e2e: end-to-end tests requiring real Hermes + Feishu (deselected by default)",
+]
+addopts = "-m 'not e2e'"
+
 [tool.mypy]
 python_version = "3.11"
 warn_return_any = true
