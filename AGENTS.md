@@ -26,6 +26,9 @@ $HERMES_PYTHON -m mypy hermes_lark_streaming/
 
 # Run tests (local run.py first, CI auto-downloads from GitHub)
 $HERMES_PYTHON -m pytest tests/ -q
+
+# E2E 测试（需 Hermes 运行 + lark-cli 配置，默认跳过；CI 无飞书环境安全）
+HERMES_HOME=~/.hermes $HERMES_PYTHON -m pytest -m e2e tests/e2e/ -v
 ```
 
 ## Architecture
