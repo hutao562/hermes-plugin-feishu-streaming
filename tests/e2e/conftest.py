@@ -6,8 +6,9 @@ import os
 import re
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 
@@ -119,3 +120,12 @@ def log_contains() -> Callable[..., bool]:
         regex = re.compile(pattern)
         return any(regex.search(line) for line in _read_log_since(since).splitlines())
     return _contains
+
+
+@pytest.fixture
+def count_log() -> Callable[..., int]:
+    """计数 since 之后匹配 pattern 的日志行数（不阻塞）。"""
+    def _count(since: int, pattern: str) -> int:
+        regex = re.compile(pattern)
+        return sum(1 for line in _read_log_since(since).splitlines() if regex.search(line))
+    return _count
