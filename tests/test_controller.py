@@ -125,6 +125,92 @@ def test_prune_stale_sessions_ignores_none_key_and_prunes_valid_key() -> None:
     assert valid_stale_session.flush.completed
 
 
+def test_prune_stale_sessions_dedupes_multi_key_session(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """同一 session 注册在 message_id + anchor_id 多 key 下时，应只 prune 一次。
+
+    回归 2026-07-04 11:27:55 生产日志：单次 _prune_stale_sessions 连打 6 条
+    "pruning stale session" warning。根因是 stale 按 dict key 收集而非按
+    session 去重 —— 话题群 session 同时注册在 message_id 和 anchor_id（话题
+    根消息 id）两个 key 下，两 key 都过期导致同一 session 被 warning 两次 +
+    cleanup 两次（第二次 pop 返回 None 无害但污染日志）。
+    """
+    ctrl = StreamCardController()
+    session = SimpleNamespace(
+        message_id="msg",
+        anchor_id="quoted",
+        created_at=time.time() - ctrl._session_ttl - 1,
+        flush=_DummyFlush(),
+        image_resolver=None,
+    )
+    ctrl._sessions["msg"] = session
+    ctrl._sessions["quoted"] = session  # 话题 anchor 别名，同一 session 的第 2 个 key
+
+    with caplog.at_level("WARNING", logger="hermes_lark_streaming"):
+        ctrl._prune_stale_sessions()
+
+    prune_logs = [r for r in caplog.records if "pruning stale session" in r.message]
+    assert len(prune_logs) == 1, f"同一 session 应只 prune 1 次, 实际 {len(prune_logs)} 次"
+    assert "msg" not in ctrl._sessions
+    assert "quoted" not in ctrl._sessions
+
+
+def test_on_message_started_logs_topic_delivery_hint(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """话题场景（anchor_id != message_id）应打投递诊断, 方便排查图片没进话题."""
+    ctrl = StreamCardController()
+    _enable(ctrl)
+
+    with caplog.at_level("INFO", logger="gateway.run"), \
+         patch.object(ctrl, "_fire_and_forget", side_effect=lambda coro, loop: coro.close()):
+        ctrl.on_message_started(message_id="om_msg", chat_id="chat", anchor_id="om_topic_root")
+
+    hints = [r for r in caplog.records if "话题场景" in r.message]
+    assert len(hints) == 1, "话题场景应打 1 条投递诊断"
+
+
+def test_on_message_started_no_topic_hint_for_private_chat(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """私聊（无 anchor 或 anchor == message_id）不应打话题投递诊断."""
+    ctrl = StreamCardController()
+    _enable(ctrl)
+
+    with caplog.at_level("INFO", logger="gateway.run"), \
+         patch.object(ctrl, "_fire_and_forget", side_effect=lambda coro, loop: coro.close()):
+        ctrl.on_message_started(message_id="om_msg", chat_id="chat")
+
+    hints = [r for r in caplog.records if "话题场景" in r.message]
+    assert len(hints) == 0
+
+
+def test_on_message_started_topic_diagnostic_for_topic_root_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """话题群根消息（thread_id 存在但 anchor==msg）也应打话题场景诊断.
+
+    回归自动化测试 #7 发现的盲区: 话题群里 reply_to_id=None 的新话题根消息,
+    anchor==msg, 但它仍在话题群里、图片投递同样需要 root_id/receive_id_type=thread_id。
+    判定条件应扩展为: anchor != msg OR thread_id 存在。
+    """
+    ctrl = StreamCardController()
+    _enable(ctrl)
+
+    with caplog.at_level("INFO", logger="gateway.run"), \
+         patch.object(ctrl, "_fire_and_forget", side_effect=lambda coro, loop: coro.close()):
+        ctrl.on_message_started(
+            message_id="om_msg",
+            chat_id="oc_topic_group",
+            anchor_id="om_msg",  # 根消息 anchor==msg
+            thread_id="omt_newtopic",  # 但在话题群里
+        )
+
+    hints = [r for r in caplog.records if "话题场景" in r.message]
+    assert len(hints) == 1, "话题群根消息（thread_id 存在）应打话题诊断"
+
+
 @pytest.mark.asyncio
 async def test_background_review_deferred_until_complete() -> None:
     ctrl = _setup_ctrl()
@@ -1124,6 +1210,10 @@ class TestDoCompleteCard:
         await ctrl._do_complete_card(session)
 
         assert session.segment_state.segments[0].elapsed_ms > 0
+        assert session.state == SessionState.COMPLETED
+        # COMPLETED session 不立即 cleanup——保留供 background 回合复用（跨回合合并），靠 TTL
+        assert "msg_fc" in ctrl._sessions
+        ctrl._cleanup("msg_fc")  # 显式清理（模拟 TTL 过期）
         assert "msg_fc" not in ctrl._sessions
 
     @pytest.mark.asyncio

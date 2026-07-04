@@ -93,6 +93,18 @@ class FlushController:
                 r.set_result(None)
         self._flush_resolvers.clear()
 
+    def reset_for_reactivate(self) -> None:
+        """重激活：撤销 mark_completed，重新接受更新.
+
+        用于跨回合合并（background 回合复用已 COMPLETED 的卡片）：终态卡片重新接纳
+        后续 segment 增量，靠 batch_update 追加（streaming_mode 已关，打字机失效但内容会更新）。
+        """
+        self._completed = False
+        self._flush_in_progress = False
+        self._needs_reflush = False
+        self._cancel_timer()
+        self._last_update_time = time.monotonic()
+
     def set_throttle(self, ms: float) -> None:
         self._throttle_ms = ms
 

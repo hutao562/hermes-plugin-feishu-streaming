@@ -54,11 +54,13 @@ class SegmentState:
 
     __slots__ = (
         "_counter",
+        "_force_new_segment",
         "segments",
     )
 
     def __init__(self) -> None:
         self._counter = 0
+        self._force_new_segment: bool = False
         self.segments: list[Segment] = []
 
     def _new_reasoning(self, text: str) -> Segment:
@@ -100,27 +102,31 @@ class SegmentState:
 
     def on_reasoning_delta(self, text: str) -> None:
         """处理 reasoning 增量，同类型追加否则新建 segment."""
-        if self.segments and self.segments[-1].type == SegmentType.REASONING:
+        if self.segments and self.segments[-1].type == SegmentType.REASONING and not self._force_new_segment:
             self.segments[-1].text += text
             self.segments[-1].dirty = True
         else:
+            self._force_new_segment = False
             self._new_reasoning(text)
 
     def on_answer_delta(self, text: str) -> None:
         """处理 answer 增量，同类型追加否则新建 segment."""
-        if self.segments and self.segments[-1].type == SegmentType.ANSWER:
+        if self.segments and self.segments[-1].type == SegmentType.ANSWER and not self._force_new_segment:
             self.segments[-1].text += text
             self.segments[-1].dirty = True
         else:
+            self._force_new_segment = False
             self._new_answer(text)
 
     def on_tool_event(self, tool_step_count: int) -> None:
         """处理工具调用事件，同类型标记 dirty 否则新建 segment 并终结前序 tool segment."""
         if tool_step_count <= 0:
             return
-        if self.segments and self.segments[-1].type == SegmentType.TOOL:
+        if (self.segments and self.segments[-1].type == SegmentType.TOOL
+                and not self._force_new_segment):
             self.segments[-1].dirty = True
             return
+        self._force_new_segment = False
         for seg in reversed(self.segments):
             if seg.type == SegmentType.TOOL and seg.tool_end_offset == 0:
                 seg.tool_end_offset = tool_step_count - 1
@@ -158,6 +164,21 @@ class SegmentState:
             if seg.type == SegmentType.REASONING and seg.start_time and not seg.elapsed_ms:
                 seg.elapsed_ms = (now - seg.start_time) * 1000
                 break
+
+    def begin_new_turn(self) -> None:
+        """终结末尾 segment 并强制下一个 delta 新建 segment（回合分隔）.
+
+        跨回合合并时调（background 回合复用卡片）：避免两回合同类型 segment（如 answer）
+        被拼在一起——强制下个 reasoning/answer/tool delta 走"新建 segment"分支。
+        """
+        if not self.segments:
+            return
+        now = time.time()
+        last = self.segments[-1]
+        if last.type == SegmentType.REASONING and last.start_time and not last.elapsed_ms:
+            last.elapsed_ms = (now - last.start_time) * 1000
+        last.dirty = True
+        self._force_new_segment = True
 
     @property
     def has_dirty(self) -> bool:

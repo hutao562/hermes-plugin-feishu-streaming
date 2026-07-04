@@ -56,6 +56,7 @@ class CardSession:
         "guard",
         "image_resolver",
         "message_id",
+        "reused",
         "segment_state",
         "sequence",
         "split_disabled",
@@ -83,6 +84,7 @@ class CardSession:
         self.sequence = 1
         self._loop = loop
         self.created_at = time.time()
+        self.reused: bool = False
         self.deferred_background_review_closed = False
         self.deferred_background_reviews: list[tuple[str, Callable[[str], Any]]] = []
         self.deferred_background_review_lock = Lock()

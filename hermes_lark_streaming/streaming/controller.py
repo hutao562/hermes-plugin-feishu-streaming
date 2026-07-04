@@ -135,18 +135,23 @@ class StreamingController:
                 session.state = SessionState.STREAMING
             if session.segment_state and session.segment_state.has_dirty:
                 self._schedule_flush(session)
-            _logger.info(
-                "CardKit card created: msg=%s card_id=%s",
-                session.message_id[:12],
-                (session.card_id or "")[:12],
-            )
-        except FeishuAPIError:
-            _logger.info("CardKit create failed, yielding to gateway", exc_info=True)
+            logging.getLogger("gateway.run").info(
+                "[cheerwhy-card] CardKit card created msg=%s card_id=%s anchor=%s",
+                session.message_id[:12], (session.card_id or "")[:12],
+                (session.anchor_id or session.message_id)[:12])
+        except FeishuAPIError as _e:
+            logging.getLogger("gateway.run").warning(
+                "[cheerwhy-card] CardKit create FAILED (FeishuAPI) msg=%s anchor=%s code=%s err=%s",
+                session.message_id[:12], (session.anchor_id or session.message_id)[:12],
+                getattr(_e, "code", "?"), _e)
             if hasattr(self, "_mark_text_fallback_needed"):
                 self._mark_text_fallback_needed(session)
             session.mark_failed()
-        except Exception:
-            _logger.exception("_do_create_card failed")
+        except Exception as _e:
+            logging.getLogger("gateway.run").warning(
+                "[cheerwhy-card] CardKit create FAILED (%s) msg=%s anchor=%s err=%s",
+                type(_e).__name__, session.message_id[:12],
+                (session.anchor_id or session.message_id)[:12], _e)
             session.mark_failed()
 
     async def _do_flush(self, session: CardSession) -> None:
@@ -581,7 +586,10 @@ class StreamingController:
             return await self._do_complete_card_inner(session)
         finally:
             self._flush_deferred_background_reviews(session)
-            self._cleanup(session.message_id)
+            # COMPLETED session 不立即 cleanup——保留供 background 回合复用（跨回合合并），
+            # 靠 _prune_stale_sessions 的 TTL 清理。FAILED/ABORTED 立即 cleanup。
+            if session.state != SessionState.COMPLETED:
+                self._cleanup(session.message_id)
 
     async def _do_complete_card_inner(self, session: CardSession) -> bool:
         if session.guard.should_skip("_do_complete_card"):
