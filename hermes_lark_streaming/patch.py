@@ -113,21 +113,31 @@ def on_feishu_normalize(
 
 
 @_safe_hook()
-def on_message_started(*, ctrl: Any, message_id: str, chat_id: str, anchor_id: str | None = None) -> None:
+def on_message_started(
+    *,
+    ctrl: Any,
+    message_id: str | None,
+    chat_id: str,
+    anchor_id: str | None = None,
+    thread_id: str | None = None,
+) -> None:
     """[注入点 1] 函数开头 — message.started."""
-    ctrl.on_message_started(message_id=message_id, chat_id=chat_id, anchor_id=anchor_id)
+    ctrl.on_message_started(
+        message_id=message_id, chat_id=chat_id, anchor_id=anchor_id, thread_id=thread_id,
+    )
 
 
 @_safe_hook(default_return=False)
 async def on_message_completed_wait(
     *,
     ctrl: Any,
-    message_id: str,
+    message_id: str | None,
     answer: str = "",
     duration: float = 0.0,
     model: str = "",
     tokens: dict[str, Any] | None = None,
     context: dict[str, Any] | None = None,
+    chat_id: str | None = None,
 ) -> bool:
     """[注入点 2] return 前 — message.completed，等待卡片完成收尾."""
     return bool(
@@ -138,6 +148,7 @@ async def on_message_completed_wait(
             model=model,
             tokens=tokens,
             context=context,
+            chat_id=chat_id,
         )
     )
 
@@ -189,15 +200,17 @@ def on_queued_followup_result(*, ctrl: Any, message_id: str, followup_result: di
 def on_tool_updated(
     *,
     ctrl: Any,
-    message_id: str,
+    message_id: str | None,
     tool_name: str,
     status: str,
     detail: str = "",
+    chat_id: str | None = None,
 ) -> bool:
     """[注入点 3] progress_callback — tool.updated."""
     return bool(
         ctrl.on_tool_update(
             message_id=message_id,
+            chat_id=chat_id,
             tool_name=tool_name,
             status=status,
             detail=detail,
@@ -206,21 +219,21 @@ def on_tool_updated(
 
 
 @_safe_hook(default_return=False, log_level="debug")
-def on_answer_delta(*, ctrl: Any, message_id: str, text: str) -> bool:
+def on_answer_delta(*, ctrl: Any, message_id: str | None, text: str, chat_id: str | None = None) -> bool:
     """[注入点 4] _stream_delta_cb — answer.delta."""
-    return bool(ctrl.on_answer(message_id=message_id, text=text))
+    return bool(ctrl.on_answer(message_id=message_id, chat_id=chat_id, text=text))
 
 
 @_safe_hook(default_return=False, log_level="debug")
-def on_thinking_delta(*, ctrl: Any, message_id: str, text: str) -> bool:
+def on_thinking_delta(*, ctrl: Any, message_id: str | None, text: str, chat_id: str | None = None) -> bool:
     """[注入点 5] _interim_assistant_cb — thinking.delta."""
-    return bool(ctrl.on_thinking(message_id=message_id, text=text))
+    return bool(ctrl.on_thinking(message_id=message_id, chat_id=chat_id, text=text))
 
 
 @_safe_hook(default_return=False, log_level="debug")
-def on_reasoning_delta(*, ctrl: Any, message_id: str, text: str) -> bool:
+def on_reasoning_delta(*, ctrl: Any, message_id: str | None, text: str, chat_id: str | None = None) -> bool:
     """[注入点 6] reasoning_callback — native model reasoning delta."""
-    return bool(ctrl.on_reasoning(message_id=message_id, text=text))
+    return bool(ctrl.on_reasoning(message_id=message_id, chat_id=chat_id, text=text))
 
 
 @_safe_hook(default_return=False, log_level="debug")
@@ -304,4 +317,29 @@ async def on_background_deliver(
         )
     except Exception as exc:
         _logger.warning("on_background_deliver error: %s", exc, exc_info=True)
+        return False
+
+
+async def on_bg_watcher_notify(
+    *,
+    chat_id: str,
+    content: str,
+    reply_to_message_id: str | None = None,
+) -> bool:
+    """[注入点 12] background watcher text-only 通知 → 合并到 agent 卡片或发 background card.
+
+    hermes 的 background watcher 完成通知（run.py text-only notification，含 process stdout）
+    默认 adapter.send 纯文本；此 hook 接管，让通知进卡片（合并到同 chat 的 agent 卡片，或发独立 background 卡片）。
+    """
+    try:
+        ctrl = get_controller()
+        if not ctrl.enabled:
+            return False
+        return await ctrl.on_bg_watcher_notify(
+            chat_id=chat_id,
+            content=content,
+            reply_to_message_id=reply_to_message_id,
+        )
+    except Exception as exc:
+        _logger.warning("on_bg_watcher_notify error: %s", exc, exc_info=True)
         return False

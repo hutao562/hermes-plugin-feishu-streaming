@@ -238,6 +238,7 @@ def _start_hook(indent: str) -> str:
             "            message_id=event.message_id,",
             "            chat_id=source.chat_id,",
             "            anchor_id=_lark_anchor_id,",
+            "            thread_id=getattr(source, 'thread_id', None),",
             "        )",
             "except Exception:",
             "    pass",
@@ -256,6 +257,7 @@ def _complete_hook(indent: str) -> str:
             "    _lark_completion_id = agent_result.get('_hermes_lark_completion_id') or event.message_id",
             "    _lark_card_sent = await on_message_completed_wait(",
             "        message_id=_lark_completion_id,",
+            "        chat_id=source.chat_id,",
             "        answer=response,",
             "        duration=_response_time,",
             "        model=agent_result.get('model', ''),",
@@ -324,6 +326,7 @@ def _tool_hook(indent: str) -> str:
             "    if _run_still_current() and event_type in ('tool.started', 'tool.completed'):",
             "        if on_tool_updated(",
             "            message_id=event_message_id,",
+            "            chat_id=source.chat_id,",
             "            tool_name=tool_name or '',",
             "            status='started' if event_type == 'tool.started' else 'completed',",
             "            detail=preview or '',",
@@ -343,7 +346,10 @@ def _answer_hook(indent: str) -> str:
         [
             "try:",
             "    from hermes_lark_streaming.patch import on_answer_delta",
-            "    if text and _run_still_current() and on_answer_delta(message_id=event_message_id, text=text):",
+            (
+                "    if text and _run_still_current() and on_answer_delta("
+                "message_id=event_message_id, chat_id=source.chat_id, text=text):"
+            ),
             "        return",
             "except Exception:",
             "    pass",
@@ -360,7 +366,7 @@ def _thinking_hook(indent: str) -> str:
             "try:",
             "    from hermes_lark_streaming.patch import on_thinking_delta",
             "    if (text and not already_streamed and _run_still_current()",
-            "            and on_thinking_delta(message_id=event_message_id, text=text)):",
+            "            and on_thinking_delta(message_id=event_message_id, chat_id=source.chat_id, text=text)):",
             "        return",
             "except Exception:",
             "    pass",
@@ -378,7 +384,7 @@ def _reasoning_hook(indent: str) -> str:
             "    if text and _run_still_current():",
             "        try:",
             "            from hermes_lark_streaming.patch import on_reasoning_delta",
-            "            on_reasoning_delta(message_id=event_message_id, text=text)",
+            "            on_reasoning_delta(message_id=event_message_id, chat_id=source.chat_id, text=text)",
             "        except Exception:",
             "            pass",
             "agent.reasoning_callback = _reasoning_cb",
