@@ -14,7 +14,7 @@ def test_d1_cardkit_failure_fallback(lark, log_marker, wait_for_log):
     """D1: CardKit 创建失败 -> fallback 纯文本（consume_text_fallback）。"""
     start = log_marker()
     lark.send_text(PRIVATE_CHAT, "[e2e D1] 测试")
-    assert wait_for_log(r"consume_text_fallback|fallback", since=start, timeout=60)
+    assert wait_for_log(r"consume_text_fallback|fallback", since=start, timeout=20)
 
 
 @pytest.mark.xfail(reason="卡片创建超时需 mock 慢响应", strict=False)
@@ -30,4 +30,4 @@ def test_d3_unavailable_guard(lark, log_marker, wait_for_log):
     """D3: 消息删除触发 UnavailableGuard 自动收尾。"""
     start = log_marker()
     lark.send_text(PRIVATE_CHAT, "[e2e D3] 测试")
-    assert wait_for_log(r"unavailable|auto.?terminat", since=start, timeout=60)
+    assert wait_for_log(r"unavailable|auto.?terminat", since=start, timeout=20)
