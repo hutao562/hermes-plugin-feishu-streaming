@@ -39,7 +39,8 @@ exclude = ["tests/samples"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
-ignore = ["RUF002", "RUF003", "RUF006"]
+# RUF001/002/003: 中文全角标点（，、（）等）在 string / docstring / comment 中会被误判为 ambiguous unicode
+ignore = ["RUF001", "RUF002", "RUF003", "RUF006"]
 
 [tool.ruff.format]
 quote-style = "double"
