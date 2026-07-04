@@ -22,17 +22,22 @@ GATEWAY_PID = Path(HERMES_HOME) / "gateway.pid"
 
 
 def _run_lark(*args: str) -> dict[str, Any]:
-    """跑 lark-cli（带 HERMES_HOME），返回 JSON 解析结果。"""
+    """跑 lark-cli（带 HERMES_HOME），返回 JSON 解析结果。
+
+    lark-cli 成功时 JSON 到 stdout；失败时 JSON 到 stderr（stdout 空，如 unknown flag）。
+    不加 --format json：whoami 等命令不支持该 flag（默认就是 JSON）。
+    """
     env = {**os.environ, "HERMES_HOME": HERMES_HOME}
     result = subprocess.run(
-        ["lark-cli", *args, "--format", "json"],
+        ["lark-cli", *args],
         capture_output=True, text=True, env=env, timeout=120,
     )
     import json
+    output = result.stdout if result.stdout.strip() else result.stderr
     try:
-        return json.loads(result.stdout)
+        return json.loads(output)
     except json.JSONDecodeError:
-        return {"ok": False, "error": {"message": f"non-json output: {result.stdout[:200]}"}, "raw": result.stdout}
+        return {"ok": False, "error": {"message": f"non-json output: {output[:200]}"}, "raw": output}
 
 
 class LarkCLIDriver:
