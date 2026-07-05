@@ -1229,6 +1229,43 @@ class TestDoCompleteCard:
         ctrl._client.cardkit_close_streaming.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_do_complete_card_waits_when_card_still_creating(self) -> None:
+        """#4: card 还在 CREATING（create_task 未完成）时收尾应等创建，避免僵尸 streaming 卡。
+
+        中断/abort 路径走 _complete_session（fire-and-forget）→ _do_complete_card_inner，
+        不像 on_completed_wait 在外层先 _wait_for_card_creation。若 card_id=None 直接跳过
+        收尾，create_task 跑完后 card 永远停在 streaming 态。修复：_do_complete_card_inner
+        开头等 card 创建（幂等——on_completed_wait 路径已 wait 过则立即返回）。
+        """
+        ctrl = _setup_ctrl()
+        session = CardSession("msg_abort", "chat", asyncio.get_running_loop())
+        session.state = SessionState.ABORTED  # 中断路径
+        ctrl._sessions["msg_abort"] = session
+        ready = asyncio.Event()
+
+        async def finish_create() -> None:
+            await ready.wait()
+            session.card_id = "card_abort"
+            session.card_msg_id = "msg_abort_reply"
+            session.state = SessionState.STREAMING
+
+        session.create_task = asyncio.create_task(finish_create())
+        client = ctrl._client
+        client.cardkit_close_streaming = AsyncMock()
+        client.cardkit_update = AsyncMock()
+
+        complete = asyncio.create_task(ctrl._do_complete_card_inner(session))
+        await asyncio.sleep(0.02)
+        # card 在 CREATING 时不应立即结束（修复前会立即跳过收尾）
+        assert not complete.done(), "card 在 CREATING 时应等创建，不应跳过收尾"
+
+        ready.set()  # card 创建完成
+        result = await complete
+        assert result is True
+        # card 创建后应执行 ABORTED 收尾（不再跳过）
+        assert client.cardkit_update.called, "card 创建后应执行收尾"
+
+    @pytest.mark.asyncio
     async def test_image_resolve_per_segment(self) -> None:
         """单个 segment resolve 失败不影响后续."""
         from unittest.mock import MagicMock
