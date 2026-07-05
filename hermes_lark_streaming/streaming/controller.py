@@ -595,6 +595,13 @@ class StreamingController:
         if session.guard.should_skip("_do_complete_card"):
             return False
 
+        # 等 card 创建完成——中断/abort 路径走 _complete_session（fire-and-forget）调本方法，
+        # card 可能还在 CREATING（on_completed_wait 已在外层 wait 过，幂等立即返回）。
+        # 不等的话 card_id=None 会跳过下方收尾（if session.card_id），create_task 跑完后
+        # card 永远停在 streaming 态（僵尸卡）。
+        if not await self._wait_for_card_creation(session):
+            return False
+
         await session.flush.wait_for_flush()
         session.flush.mark_completed()
 
