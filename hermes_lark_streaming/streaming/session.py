@@ -54,6 +54,7 @@ class CardSession:
         "flush",
         "footer",
         "guard",
+        "image_keys",
         "image_resolver",
         "message_id",
         "reused",
@@ -81,6 +82,7 @@ class CardSession:
         self.tool_use = ToolUseTracker()
         self.flush = FlushController(throttle_ms=CARDKIT_MS, loop=loop)
         self.footer: dict[str, Any] = {}
+        self.image_keys: list[str] = []  # image_generate 产物的飞书 img_key（complete 时渲染）
         self.sequence = 1
         self._loop = loop
         self.created_at = time.time()

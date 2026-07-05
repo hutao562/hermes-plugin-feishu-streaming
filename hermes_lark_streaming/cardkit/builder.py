@@ -457,6 +457,7 @@ def build_complete_card(
     segments: list[Segment],
     all_tool_steps: list[ToolDisplayStep],
     footer_data: dict | None = None,
+    image_keys: list[str] | None = None,
     is_error: bool = False,
     is_aborted: bool = False,
     footer_fields: list[list[str]] | None = None,
@@ -492,6 +493,10 @@ def build_complete_card(
 
     if not has_answer:
         elements.append({"tag": "markdown", "content": _T["done"][0], "text_size": body_text_size})
+
+    # image_generate 产物图（用 markdown 图片语法 ![alt](img_key)，复用 ImageResolver 已验证的渲染方式）
+    for img_key in (image_keys or []):
+        elements.append({"tag": "markdown", "content": f"![image]({img_key})"})
 
     if footer_enabled:
         elements.extend(

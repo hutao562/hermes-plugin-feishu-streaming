@@ -370,6 +370,7 @@ class StreamCardController(StreamingController):
         tokens: dict | None = None,
         context: dict | None = None,
         chat_id: str | None = None,
+        image_paths: list[str] | None = None,
     ) -> bool:
         """消息处理完成，并等待卡片真正收尾后返回是否已发送."""
         if not self.enabled:
@@ -418,7 +419,28 @@ class StreamCardController(StreamingController):
             context=context,
         )
 
+        # image_generate 产物图：上传 img_key + 存 session，等上传完才 complete
+        if image_paths:
+            await self._attach_images_to_session(session, image_paths)
+
         return await self._complete_session_wait(session)
+
+    async def _attach_images_to_session(
+        self, session: CardSession, image_paths: list[str]
+    ) -> None:
+        """上传 image_generate 产物图到飞书，img_key 存 session.image_keys 供卡片渲染."""
+        if self._client is None:
+            return
+        for path in image_paths:
+            try:
+                img_key = await self._client.upload_image_file(path)
+                if img_key:
+                    session.image_keys.append(img_key)
+                    logging.getLogger("gateway.run").info(
+                        "[cheerwhy-card] image_generate 产物上传 msg=%s path=%s -> %s",
+                        session.message_id[:12], path[-40:], img_key)
+            except Exception:
+                _logger.debug("image upload failed for %s", path, exc_info=True)
 
     def on_cron_deliver(
         self,

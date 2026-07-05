@@ -337,6 +337,40 @@ class FeishuClient:
             return str(resp.data.image_key)
         return None
 
+    async def upload_image_file(self, image_path: str) -> str | None:
+        """上传本地图片文件到飞书，返回 img_key（支持 file:// 前缀 / 裸路径）."""
+        try:
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(None, self._read_image_file, image_path)
+        except Exception:
+            _logger.debug("image file upload failed for %s", image_path, exc_info=True)
+            return None
+
+        if data is None:
+            return None
+
+        file = io.BytesIO(data)
+        request = (
+            CreateImageRequest.builder()
+            .request_body(CreateImageRequestBody.builder().image_type("message").image(file).build())
+            .build()
+        )
+        resp = await self._client.im.v1.image.acreate(request)
+        if resp.success() and resp.data and resp.data.image_key:
+            return str(resp.data.image_key)
+        return None
+
+    @staticmethod
+    def _read_image_file(path: str) -> bytes | None:
+        """读取本地图片文件（在线程池中运行）."""
+        try:
+            p = path[7:] if path.startswith("file://") else path
+            with open(p, "rb") as f:
+                return bytes(f.read())
+        except OSError:
+            _logger.debug("image file read failed: %s", path)
+            return None
+
     @staticmethod
     def _download_image(url: str, timeout: int = 15) -> bytes | None:
         """同步下载图片（在线程池中运行）."""
