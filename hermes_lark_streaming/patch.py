@@ -136,15 +136,21 @@ def collect_image_media(agent_messages: Any) -> list[str]:
     """
     import json
 
-    # 找最后一次 image_generate call_id（只取本次回合产物，避免 history 旧图重复进卡）
+    # 只取最后一个 user message 之后的 image_generate（本次回合，避免 history 旧图错误进卡）
+    last_user_idx = -1
+    for i, msg in enumerate(agent_messages or []):
+        if msg.get("role") == "user":
+            last_user_idx = i
+    if last_user_idx < 0:
+        return []
     last_ig_call_id: str | None = None
-    for msg in (agent_messages or []):
+    for msg in (agent_messages or [])[last_user_idx + 1:]:
         if msg.get("role") == "assistant":
             for call in msg.get("tool_calls") or []:
                 cid = call.get("id") or call.get("call_id")
                 name = (call.get("function") or {}).get("name") or call.get("name") or ""
                 if cid and name == "image_generate":
-                    last_ig_call_id = str(cid)  # 不断覆盖取最后
+                    last_ig_call_id = str(cid)
     if not last_ig_call_id:
         return []
 
