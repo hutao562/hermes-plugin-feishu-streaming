@@ -127,6 +127,45 @@ def on_message_started(
     )
 
 
+def collect_image_media(agent_messages: Any) -> list[str]:
+    """从 agent_messages 提取 image_generate 工具产物的本地图片路径.
+
+    扫 assistant 的 image_generate tool_calls，找对应 tool 结果的 JSON payload，
+    提取 host_image/image/agent_visible_image 字段路径（复用 Hermes _collect_media_tags 逻辑，
+    见 run.py:1080-1098）。
+    """
+    import json
+
+    # 找最后一次 image_generate call_id（只取本次回合产物，避免 history 旧图重复进卡）
+    last_ig_call_id: str | None = None
+    for msg in (agent_messages or []):
+        if msg.get("role") == "assistant":
+            for call in msg.get("tool_calls") or []:
+                cid = call.get("id") or call.get("call_id")
+                name = (call.get("function") or {}).get("name") or call.get("name") or ""
+                if cid and name == "image_generate":
+                    last_ig_call_id = str(cid)  # 不断覆盖取最后
+    if not last_ig_call_id:
+        return []
+
+    # 取该 call_id 的产物路径（单张）
+    for msg in (agent_messages or []):
+        if msg.get("role") not in ("tool", "function"):
+            continue
+        if str(msg.get("tool_call_id") or msg.get("call_id") or "") != last_ig_call_id:
+            continue
+        try:
+            payload = json.loads(msg.get("content") or "")
+        except (ValueError, TypeError):
+            continue
+        if isinstance(payload, dict) and payload.get("success"):
+            for field in ("host_image", "image", "agent_visible_image"):
+                p = payload.get(field)
+                if isinstance(p, str) and p:
+                    return [p]
+    return []
+
+
 @_safe_hook(default_return=False)
 async def on_message_completed_wait(
     *,
@@ -138,6 +177,7 @@ async def on_message_completed_wait(
     tokens: dict[str, Any] | None = None,
     context: dict[str, Any] | None = None,
     chat_id: str | None = None,
+    image_paths: list[str] | None = None,
 ) -> bool:
     """[注入点 2] return 前 — message.completed，等待卡片完成收尾."""
     return bool(
@@ -149,6 +189,7 @@ async def on_message_completed_wait(
             tokens=tokens,
             context=context,
             chat_id=chat_id,
+            image_paths=image_paths,
         )
     )
 

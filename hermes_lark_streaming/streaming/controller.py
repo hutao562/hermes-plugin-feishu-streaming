@@ -626,6 +626,7 @@ class StreamingController:
             segments=active_segments,
             all_tool_steps=all_tool_steps,
             footer_data=session.footer,
+            image_keys=session.image_keys,
             is_error=is_error,
             is_aborted=is_aborted,
             footer_fields=self._cfg.footer_fields,
