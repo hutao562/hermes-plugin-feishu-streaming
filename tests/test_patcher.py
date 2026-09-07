@@ -200,6 +200,31 @@ class TestApplyRemove:
         assert "# HERMES_LARK_REASONING_BEGIN" in content
         assert "agent.reasoning_callback = _reasoning_cb" in content
 
+    def test_apply_runner_tool_and_thinking_are_wrapper_form(self, tree: Path) -> None:
+        """TOOL/THINKING 必须是 wrapper 形态（不能引用方法体不存在的裸变量）。
+
+        回归保护：曾用旧版"函数体内"形态（引用 event_type/text 形参）注入到
+        _wire_turn_agent_callbacks 方法体 → NameError 被 except 吞掉 → hook
+        静默失效 → 工具进度/thinking 从不进卡片（卡片停创建态，用户以为卡死）。
+        """
+        _patcher().apply()
+        content = (tree / "gateway/run_turn_runner.py").read_text(encoding="utf-8")
+
+        # TOOL wrapper: 包 agent.tool_progress_callback，wrapper 内才引用 event_type
+        assert "_hermes_lark_orig_tool_cb = agent.tool_progress_callback" in content
+        assert "def _hermes_lark_tool_wrapper(event_type" in content
+        assert "agent.tool_progress_callback = _hermes_lark_tool_wrapper" in content
+
+        # THINKING wrapper: 包 agent.interim_assistant_callback
+        assert "_hermes_lark_orig_interim_cb = agent.interim_assistant_callback" in content
+        assert "def _hermes_lark_interim_wrapper(text" in content
+        assert "agent.interim_assistant_callback = _hermes_lark_interim_wrapper" in content
+
+    def test_apply_runner_reasoning_wrapper_form(self, tree: Path) -> None:
+        _patcher().apply()
+        content = (tree / "gateway/run_turn_runner.py").read_text(encoding="utf-8")
+        assert "agent.reasoning_callback = _reasoning_cb" in content
+
     def test_apply_turn_contains_lifecycle_hooks(self, tree: Path) -> None:
         _patcher().apply()
         content = (tree / "gateway/run_turn.py").read_text(encoding="utf-8")
