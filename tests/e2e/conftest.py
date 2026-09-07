@@ -6,7 +6,7 @@ import os
 import re
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +105,21 @@ def log_marker() -> Callable[[], int]:
         with GATEWAY_LOG.open("r", encoding="utf-8", errors="replace") as f:
             return sum(1 for _ in f)
     return _marker
+
+
+@pytest.fixture(autouse=True)
+def cooldown_between_e2e(request: pytest.FixtureRequest) -> Iterator[None]:
+    """E2E 真实回合间冷却（仅 e2e 标记生效）。
+
+    同一 chat 连续发消息会被 steer 进进行中回合（agent 回合不排队），前一个
+    complete 日志出现后 gateway/agent 可能仍有收尾动作。每个 e2e 测试前等
+    几秒让会话真正空闲，避免测试间串扰（实测: 无冷却时 A1 在 C2 后发被吞）。
+    """
+    if "e2e" not in [m.name for m in request.node.iter_markers()]:
+        yield
+        return
+    time.sleep(5)
+    yield
 
 
 @pytest.fixture
