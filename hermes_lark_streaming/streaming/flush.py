@@ -77,7 +77,14 @@ class FlushController:
         await self._do_flush(do_flush)
 
     async def wait_for_flush(self) -> None:
-        """等待进行中的 flush 完成."""
+        """等待进行中的 flush 完成.
+
+        若已 mark_completed（complete 收尾路径会先调 mark_completed 再进
+        wait_for_flush），直接返回——resolvers 已被清空，再等会永久挂起
+        （2026-08-01 实测：卡片停在 streaming 态 + 省略号跳动，无异常日志）。
+        """
+        if self._completed:
+            return
         if not self._flush_in_progress:
             return
         future: asyncio.Future[None] = self._loop.create_future()

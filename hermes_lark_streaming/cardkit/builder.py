@@ -110,7 +110,7 @@ def _build_tool_panel(
     steps: list[ToolDisplayStep],
     elapsed_ms: float = 0,
     *,
-    expanded: bool = True,
+    expanded: bool = False,
     element_id: str | None = TOOL_PANEL_ELEMENT_ID,
 ) -> dict:
     en_t, zh_t = _T["tool_use"]
@@ -256,6 +256,16 @@ def _build_reasoning_panel(
         en_label, zh_label = _T["thinking_panel"]
     else:
         en_label, zh_label = _T["thought"]
+    # 2026-08-07 A方案：reasoning 合并为单面板后文本可能超长，按 2400 字符分块
+    # 放多个 markdown 元素，避免单元素超飞书长度上限导致整卡被拒。
+    chunks = _split_long_text(text) if text.strip() else [text]
+    inner_elements: list[dict] = []
+    for i, chunk in enumerate(chunks):
+        el: dict = {"tag": "markdown", "content": chunk, "text_size": "notation"}
+        if text_element_id and i == 0:
+            # 流式更新只精确到第一个分块元素（旧行为兼容）；后续分块无 element_id
+            el["element_id"] = text_element_id
+        inner_elements.append(el)
     panel = _collapsible_panel(
         expanded=expanded,
         title_el={
@@ -265,12 +275,7 @@ def _build_reasoning_panel(
             "text_color": "grey",
             "text_size": "notation",
         },
-        elements=[{
-            "tag": "markdown",
-            "content": text,
-            "text_size": "notation",
-            **({"element_id": text_element_id} if text_element_id else {}),
-        }],
+        elements=inner_elements,
         vertical_spacing="8px",
     )
     if element_id:
@@ -287,7 +292,7 @@ def _build_footer_elements(
     text_size: str = "notation",
 ) -> list[dict]:
     if fields is None:
-        fields = [["status", "elapsed", "model"], ["context", "tokens"]]
+        fields = [["elapsed", "model", "context"]]
 
     data = footer_data or {}
     en_lines: list[str] = []
@@ -302,8 +307,8 @@ def _build_footer_elements(
                 if zh:
                     zh_parts.append(zh)
         if en_parts:
-            en_lines.append(" · ".join(en_parts))
-            zh_lines.append(" · ".join(zh_parts))
+            en_lines.append(" ｜ ".join(en_parts))
+            zh_lines.append(" ｜ ".join(zh_parts))
 
     if not en_lines:
         return []
@@ -345,12 +350,14 @@ def _render_footer_field(
             val = _format_elapsed(duration * 1000)
             if show_label:
                 return _T["elapsed"][0].format(val), _T["elapsed"][1].format(val)
-            return val, val
+            return f"⏱ {val}", f"⏱ {val}"
         return None, None
 
     if name == "model":
         v = data.get("model") or None
-        return v, v
+        if v:
+            return f"🧠 {v}", f"🧠 {v}"
+        return None, None
 
     if name == "tokens":
         input_t = data.get("input_tokens", 0) or 0
@@ -365,10 +372,10 @@ def _render_footer_field(
         max_c = data.get("context_max", 0) or 0
         if max_c:
             pct = int(used / max_c * 100)
-            val = f"{_compact(used)}/{_compact(max_c)} ({pct}%)"
+            val = f"{pct}%/{_compact(max_c)}"
             if show_label:
                 return _T["context"][0].format(val), _T["context"][1].format(val)
-            return val, val
+            return f"📊 {val}", f"📊 {val}"
         return None, None
 
     return None, None
@@ -417,7 +424,7 @@ def build_streaming_card_v2(
 
     if show_reasoning:
         elements.append(
-            _build_reasoning_panel(" ", expanded=True, element_id=REASONING_ELEMENT_ID)
+            _build_reasoning_panel(" ", expanded=False, element_id=REASONING_ELEMENT_ID)
         )
 
     if show_tool_use:
@@ -435,8 +442,8 @@ def build_streaming_card_v2(
         "config": {
             "streaming_mode": True,
             "streaming_config": {
-                "print_frequency_ms": {"default": 15},
-                "print_step": {"default": 1},
+                "print_frequency_ms": {"default": 120},
+                "print_step": {"default": 6},
                 "print_strategy": "fast",
             },
             "locales": _LOCALES,
@@ -546,9 +553,10 @@ def _format_run_time(run_time: str) -> str:
 
 
 def build_cron_card(
-    content: str, *, task_name: str = "", run_time: str = ""
+    content: str, *, task_name: str = "", run_time: str = "",
+    image_keys: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Cron 推送用的极简静态卡片 — schema 2.0，可选 header + markdown 内容."""
+    """Cron 推送用的极简静态卡片 — schema 2.0，可选 header + markdown 内容 + 图片."""
     card: dict[str, Any] = {
         "schema": "2.0",
         "config": {"wide_screen_mode": True, "locales": _LOCALES},
@@ -568,6 +576,9 @@ def build_cron_card(
     for chunk in _split_long_text(optimize_markdown_style(content)):
         if chunk.strip():
             card["body"]["elements"].append({"tag": "markdown", "content": chunk})
+    # image_generate 产物图（markdown 图片语法，同 build_complete_card）
+    for img_key in (image_keys or []):
+        card["body"]["elements"].append({"tag": "markdown", "content": f"![image]({img_key})"})
     return card
 
 

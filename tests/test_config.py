@@ -49,19 +49,19 @@ class TestFooterFields:
 
     def test_empty_fields_returns_default(self) -> None:
         cfg = _make_config({"streaming": {"footer": {"fields": []}}})
-        assert cfg.footer_fields == [["status", "elapsed", "model"], ["context", "tokens"]]
+        assert cfg.footer_fields == [["elapsed", "model", "context"]]
 
     def test_no_footer_returns_default(self) -> None:
         cfg = _make_config({"streaming": {}})
-        assert cfg.footer_fields == [["status", "elapsed", "model"], ["context", "tokens"]]
+        assert cfg.footer_fields == [["elapsed", "model", "context"]]
 
     def test_footer_not_dict_returns_default(self) -> None:
         cfg = _make_config({"streaming": {"footer": "invalid"}})
-        assert cfg.footer_fields == [["status", "elapsed", "model"], ["context", "tokens"]]
+        assert cfg.footer_fields == [["elapsed", "model", "context"]]
 
     def test_fields_non_list_returns_default(self) -> None:
         cfg = _make_config({"streaming": {"footer": {"fields": "status"}}})
-        assert cfg.footer_fields == [["status", "elapsed", "model"], ["context", "tokens"]]
+        assert cfg.footer_fields == [["elapsed", "model", "context"]]
 
 
 class TestHeaderEnabled:

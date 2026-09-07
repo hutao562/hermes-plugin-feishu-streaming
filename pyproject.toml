@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-lark-streaming"
-version = "0.11.2"
+version = "0.12.0"
 description = "Real-time streaming card plugin for Hermes Gateway via Feishu/Lark CardKit v2.0"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -59,4 +59,10 @@ disallow_untyped_defs = true
 
 [[tool.mypy.overrides]]
 module = "lark_oapi.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Hermes runtime modules (tools.*, plugins.*, gateway.*) are not on the static
+# analysis path — they live in the hermes install, imported only at runtime.
+module = ["tools.*", "plugins.*", "gateway.*"]
 ignore_missing_imports = true

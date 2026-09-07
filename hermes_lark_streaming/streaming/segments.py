@@ -101,12 +101,28 @@ class SegmentState:
                 break
 
     def on_reasoning_delta(self, text: str) -> None:
-        """处理 reasoning 增量，同类型追加否则新建 segment."""
-        if self.segments and self.segments[-1].type == SegmentType.REASONING and not self._force_new_segment:
-            self.segments[-1].text += text
-            self.segments[-1].dirty = True
-        else:
+        """处理 reasoning 增量：始终合并到同一个 reasoning panel（跨工具调用也合并）。
+
+        2026-08-07 A方案：原逻辑在每个 reasoning 片段（被工具调用/answer 打断后）
+        新建独立 panel，导致长思考链产生几十个 collapsible_panel，卡片 JSON 巨大、
+        手机端渲染卡顿。现在所有 reasoning 增量统一追加到第一个 REASONING segment，
+        卡片上只保留一个「💭 思考」折叠面板。
+        """
+        if self._force_new_segment:
+            # 跨回合边界：仍开新段，避免回合间思考串扰
             self._force_new_segment = False
+            self._new_reasoning(text)
+            return
+        # 找第一个 REASONING segment 作为合并目标（若存在）
+        target = None
+        for seg in self.segments:
+            if seg.type == SegmentType.REASONING:
+                target = seg
+                break
+        if target is not None:
+            target.text += text
+            target.dirty = True
+        else:
             self._new_reasoning(text)
 
     def on_answer_delta(self, text: str) -> None:

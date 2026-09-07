@@ -50,6 +50,8 @@ gateway/run.py (Hermes)
        ├─ on_message_completed_wait → controller.on_completed_wait()
        ├─ on_message_aborted    → controller.on_aborted()
        └─ on_background_deliver → controller.on_background_deliver()
+  └─ ADAPTER_INIT (injected AFTER gateway:startup emit in start()) → clarify.patch_feishu_adapter(self.adapters)
+       └─ patches FeishuAdapter.send_clarify (class method) + replaces SDK card-action processor.f (clarify inline single-select)
 
 cron/scheduler.py (Hermes)
   └─ CronPatcher (patcher.py) injects on_cron_deliver into _deliver_result
@@ -78,6 +80,16 @@ Streaming card runtime (streaming/)
 FeishuClient (feishu.py) — lark-oapi SDK wrapper
   ├─ CardKit streaming API — update single elements at 100ms intervals
 
+Clarify inline single-select (clarify.py) — monkey-patches FeishuAdapter at runtime
+  ├─ patch_feishu_adapter(adapters) — patches send_clarify class method + replaces SDK card-action processor.f
+  ├─ _find_feishu_adapter_class — scans sys.modules for the real FeishuAdapter (hermes_plugins.feishu_platform, not the source-path shadow)
+  ├─ _build_clarify_card — schema-1.0 card: markdown question + numbered options list + numbered buttons (button plain_text can't wrap, so full text lives in markdown)
+  └─ _handle_clarify_card_action — choice → resolve_gateway_clarify + resolved card; other → mark_awaiting_text + awaiting card
+
+Self-heal & watchdog (升级自愈三层防御)
+  ├─ __init__.py: register(ctx) — hermes_agent.plugins entry point; 网关启动时检测 run.py 补丁态，未完整则 verify+apply 重打 + launchctl kickstart 重启（streaming.self_heal 默认 true）
+  └─ watchdog.py — launchd WatchPaths 守护（com.hermes-lark.watchdog）：run.py 一变即 uninstall+install+kickstart（防抖 10s），install/uninstall 命令自动装/卸
+
 Card templates (cardkit/)
   ├─ builder.py — builds Feishu card JSON
   │   ├─ _build_header — card-level header with status-based theming (blue/green/red)
@@ -103,6 +115,7 @@ Card templates (cardkit/)
 - The follow-up drain hooks manage card lifecycle for Hermes's queued follow-up messages (triggered when `busy_text_mode: queue` or `busy_input_mode: queue`). `on_queued_followup_boundary` is injected at `was_interrupted = result.get("interrupted")` in `_run_agent` — it finalizes the current card and sets `response_previewed`/`already_sent` on the result dict before the drain loop processes the queued message. `on_queued_followup_result` is injected at `return _preserve_queued_followup_history_offset(...)` and uses `setdefault` to carry the deepest `_hermes_lark_completion_id` back through the recursive merge chain.
 - The COMPLETE hook uses `_lark_completion_id = agent_result.get('_hermes_lark_completion_id') or event.message_id` — in follow-up scenarios the deepest message_id propagates up via `on_queued_followup_result`, ensuring the correct card session is finalized. Non-follow-up scenarios fall back to `event.message_id`.
 - The background deliver hook (`on_background_deliver`) is injected in `_run_background_task` after `adapter.extract_images(response)`. It uses `ReplyMessage` API with `event_message_id` as anchor, so cards land in the correct topic. On success, `text_content` is cleared to avoid duplicate text delivery, while images and media files continue through the original Hermes loops. On failure, the original Hermes delivery logic runs as fallback.
+- **Clarify 内联单选** (`clarify.py`)：飞书 adapter 没实现 `send_clarify`，默认走 base.py 的数字列表 text fallback。本插件 monkey-patch 补上单选按钮卡，两处 patch：(1) `FeishuAdapter.send_clarify` 类方法 → 渲染 schema-1.0 卡（markdown 编号列表展示完整选项 + 编号按钮，因飞书 button `plain_text` 不支持换行/长文本截断）；(2) **替换 lark SDK 卡片回调 processor.f** —— SDK 在 `connect()` 时把 `adapter._on_card_action_trigger`（绑定方法）快照进 `event_handler._callback_processor_map["p2.card.action.trigger"].f`（注意 key 是**点号** `p2.card.action.trigger`，不是下划线——register 函数名 `register_p2_card_action_trigger` 带下划线，但 dict key 带点号，极易搞混），事后 patch 类无效，所以直接换该 processor 的 `.f` 指向 wrapper。wrapper 检测 `hermes_clarify_action` key → 进 clarify handler，否则转发原逻辑（approval/update-prompt 不受影响）。点选项 → 同步返回 resolved 卡 + 异步 `resolve_gateway_clarify` 唤醒 agent 线程；点「其他」→ `mark_awaiting_text` + 下条非斜杠消息由 gateway 文本拦截接手。**关键时序**：注入点 `HERMES_LARK_ADAPTER_INIT` 在 run.py 的 `await self.hooks.emit("gateway:startup", ...)` 之后（所有 adapter 已 connect、event_handler 已建），此时才能拿到 feishu 实例去替换它的 processor。**模块路径陷阱**：hermes plugin loader 把 `plugins/platforms/feishu` 加载成 `hermes_plugins.feishu_platform`（slug 派生），和源码 import 路径不同——直接按源码路径 import 会拿到影子类，patch 打上去对运行实例无效（症状：日志显示 patched 但按钮卡/回调不生效）。`_find_feishu_adapter_class` 扫 `sys.modules` 找真身（优先 `hermes_plugins.*`）。**entry 失活陷阱**：gateway text-intercept（`_maybe_intercept_clarify_text`，`include_choice_prompts=True`）会在用户发**任意**文字时提前 resolve 掉按钮卡 clarify（即使没点「其他」），之后按钮点击因 entry 已清会失败——button value 里多带一份 `"text": choice` 兜底，`_handle_clarify_card_action` 优先用 value text 而非 entry round-trip。配置开关 `streaming.clarify_inline`（默认 true）关闭后退回 text fallback。改了 `clarify.py` 后只需 `gateway restart`（editable install 即时生效），但改了 `patcher.py` 的注入点逻辑必须 `uninstall && install` 重打 run.py。
 - Commit messages: body should use bullet list format (unnumbered `- item`).
 
 ## 跨回合合并（浮浮酱的本地改动，官方上游没有）
@@ -126,14 +139,33 @@ Card templates (cardkit/)
 
 **诊断**：`hermes_lark_streaming` logger 不进 `gateway.log`（hermes logging 配置问题），合并诊断用 `logging.getLogger("gateway.run").info("[cheerwhy-merge] ...")`（在 `on_message_started` None 分支 + `_reactivate_session`），grep `[cheerwhy-merge]` 看合并是否触发（`bg turn msg=None ... reactivated=True` / `session reactivated ... cross-turn merge`）。
 
-## hermes 升级后恢复（持续用合并功能）
+## hermes 升级后自愈（三层防御）
 
-hermes 自动升级覆盖 `~/.hermes/hermes-agent/gateway/run.py` → AST hook 丢（折叠卡片 + 合并失效），但本目录的合并**源码改动不丢**（editable install 指向这里）。一键恢复：
+hermes 自动升级是**原子流程**：拉新代码覆盖 `gateway/run.py`（清掉 AST hook）→ 立即 `gateway restart`。补丁赶不上这趟车。为此建了三层防御，升级后**通常无需手动操作**：
+
+### 第 1 层：`register()` 启动时自愈（核心）
+`hermes_lark_streaming/__init__.py` 的 `register(ctx)` 是 `hermes_agent.plugins` entry point（`pyproject.toml` 已声明）。网关每次启动（含升级后自动 restart）经 `discover_plugins()`（`gateway/run.py` 的 startup）调用到这里。`register()` 逻辑（`streaming.self_heal` 默认 true，关闭后退回手动）：
+1. `Patcher.is_fully_patched()` 检测 run.py 磁盘标记。
+2. 未完整打补丁（升级抹掉了）→ `verify_target()` + `apply()` 原地重打 + 同步 cron hook。
+3. 已打补丁但 run.py mtime 晚于本进程启动时间（补丁是后打的）→ 判定当前进程没加载补丁。
+4. 任一返回 True → `_maybe_restart_gateway()` 用 detached `nohup sleep 2 && launchctl kickstart gui/$UID/ai.hermes.gateway` 延迟重启，让补丁版重新加载。
+5. `verify_target()` 失败（hermes 改了函数名）→ 只记日志不 crash，降级为等手动 reinstall。
+
+**防无限 restart 循环**：重打后磁盘变完整，下次启动 `is_fully_patched()`=True，再走 mtime 比较——restart 后新进程启动时间 > run.py mtime → 不再触发。**关键前提**：插件必须列在 `config.yaml` 的 `plugins.enabled`（entry-point 插件 opt-in），`install` 命令自动追加 `hermes-lark-streaming`，`uninstall` 自动移除。**日志走 `gateway.run` logger**（`hermes_lark_streaming` logger 不进 gateway.log），grep `[hermes-lark] self-heal` 看自愈是否触发。
+
+### 第 2 层：launchd WatchPaths 守护（双保险）
+`hermes_lark_streaming/watchdog.py` 装 launchd job（label `com.hermes-lark.watchdog`）监听 `gateway/run.py` 变化，一变就跑 `~/.hermes/.hermes_lark_watchdog.sh`（防抖 10s）：`uninstall && install && launchctl kickstart`。由 `install`/`uninstall` 命令自动装/卸到 `~/Library/LaunchAgents/`。即便 `register()` 路径出问题（如插件没 enable），run.py 一变守护也会重打+重启。日志 `~/.hermes/logs/hermes_lark_watchdog.log`。
+
+### 第 3 层：`status` 运行时检测 + 一键脚本兜底
+`status` 命令新增运行时检测：比较最近 `gateway run` 进程的启动时间与 run.py mtime，若 run.py 在进程启动后被改过 → 打印 `⚠️ hooks patched but NOT loaded by running gateway — restart needed`（直接暴露「补丁打了但进程没加载」的失效症状）。还修复了 `Feishu credentials: MISSING` 误报（status 常在非网关 shell 跑，env 里没凭据 → 现在也读 `~/.hermes/.env`）。一键兜底脚本：
 
 ```bash
 bash ~/ai/hermes-lark-streaming/reinstall_after_upgrade.sh
 ```
 
-脚本做：`pip install -e .`（防 venv 重建丢包）→ `verify`（查新 hermes 函数名匹配）→ `install`（重打 hook）→ 检查 `~/.hermes/config.yaml` 的 `streaming:` 段 → 检查合并改动（grep `_chat_index`/`begin_new_turn`）→ restart。
+脚本做：`pip install -e .` → `verify` → `install`（自动装守护 + 启用插件）→ 检查 streaming 段 → 检查合并改动 → 检查 bg_watcher 注入（≥4 处）→ 检查守护 plist → restart。
 
-**风险**：新 hermes 改了 hook 注入点函数名（`_handle_message_with_agent`/`progress_callback`/`_stream_delta_cb`/`_interim_assistant_cb`/`reasoning_callback`/background `synth_event` 注入点）→ `verify` 失败 → 三选一：a) `git pull` 等 Cheerwhy 上游适配 b) 回退 hermes 版本 c) 手动适配 `patcher.py` 的 marker（改函数名匹配）。完整升级流程 + 改动清单见记忆 `reference_cheerwhy-migration.md`。
+### background watcher 自动注入（不再手贴）
+`on_bg_watcher_notify`（注入点 12）原是手贴 hook（reinstall 脚本 step 5.5 检查但只警告不修复）。现已纳入 `patcher.py` 自动注入——两个 marker（`BG_WATCHER_FINISHED` / `BG_WATCHER_RUNNING`）注入到 `_run_process_watcher` 的 "finished with exit code" 和 "is still running~" 两个分支，调用 `on_bg_watcher_notify(chat_id, message_text)`，handled 时通过改写守卫 `if adapter and chat_id and not _hermes_lark_bg_handled:` 跳过原 adapter.send 纯文本。和其它 14 个 hook 一样自动化，`install` 自动打。
+
+**风险**：新 hermes 改了 hook 注入点函数名（`_handle_message_with_agent`/`progress_callback`/`_stream_delta_cb`/`_interim_assistant_cb`/`reasoning_callback`/background `synth_event` 注入点/bg_watcher 锚点）→ `verify` 失败 → 自愈降级（只记日志不重打），三选一：a) `git pull` 等上游适配 b) 回退 hermes 版本 c) 手动适配 `patcher.py` 的 marker（改函数名匹配）。clarify 单选的注入点锚点是 `self.hooks.emit("gateway:startup"`（start() 内），若 hermes 改了这行 → `verify` 报 "gateway startup emit anchor" 缺失 → 手动适配 `patcher.py` 的 `_find_adapter_init_site`。完整升级流程 + 改动清单见记忆 `reference_cheerwhy-migration.md`。

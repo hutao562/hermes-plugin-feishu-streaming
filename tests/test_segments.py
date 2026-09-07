@@ -167,6 +167,7 @@ class TestHasDirty:
 
 class TestMultiRound:
     def test_two_rounds(self) -> None:
+        # 2026-08-07 A方案：reasoning 跨轮合并到第一个 panel，不再新建独立段
         state = SegmentState()
         state.on_reasoning_delta("think 1")
         state.on_answer_delta("reply 1")
@@ -174,19 +175,21 @@ class TestMultiRound:
         state.on_reasoning_delta("think 2")
         state.on_answer_delta("reply 2")
         types = [s.type for s in state.segments]
-        assert types == ["reasoning", "answer", "tool", "reasoning", "answer"]
+        assert types == ["reasoning", "answer", "tool", "answer"]
+        assert state.segments[0].text == "think 1think 2"
 
     def test_el_id_naming_persists(self) -> None:
+        # 2026-08-07 A方案：reasoning 合并后只有第一个 reasoning 段保留原 el_id
         state = SegmentState()
         state.on_reasoning_delta("a")  # 0
         state.on_answer_delta("b")  # 1
         state.on_tool_event(1)  # 2
-        state.on_reasoning_delta("c")  # 3
+        state.on_reasoning_delta("c")  # 合并进 0
         assert state.segments[0].el_id == "reasoning_0_panel"
         assert state.segments[0].text_el_id == "reasoning_0_text"
+        assert state.segments[0].text == "ac"
         assert state.segments[1].el_id == "answer_1"
         assert state.segments[2].el_id == "tools_2"
-        assert state.segments[3].el_id == "reasoning_3_panel"
 
     def test_finalize_complex_scenario(self, monkeypatch: pytest.MonkeyPatch) -> None:
         times = iter(float(i) for i in range(100, 108))
@@ -198,11 +201,11 @@ class TestMultiRound:
         state.on_tool_event(2)  # tool1: offset=1
         state.on_answer_delta("mid")
         state.on_tool_event(4)  # tool2: offset=3, tool1.end=3
-        state.on_reasoning_delta("r2")
+        state.on_reasoning_delta("r2")  # 2026-08-07: 合并进 reasoning_0
         state.on_answer_delta("a2")
         state.finalize_segments(5)
 
         assert state.segments[0].elapsed_ms > 0  # r1 finalized by a1
         assert state.segments[2].tool_end_offset == 3  # tool1 finalized by tool2
         assert state.segments[4].tool_end_offset == 5  # tool2 finalized by finalize
-        assert state.segments[5].elapsed_ms > 0  # r2 finalized by a2
+        assert state.segments[0].text == "r1r2"  # r2 merged into reasoning_0

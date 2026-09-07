@@ -180,23 +180,17 @@ class TestBuildToolPanel:
 
 
 class TestBuildFooterElements:
-    def test_empty_data_renders_default_status(self) -> None:
-        # 默认字段包含 "status"，总是会渲染
-        result = _build_footer_elements({})
-        assert len(result) >= 2
-        assert "Completed" in result[1]["content"]
-
     def test_status_completed(self) -> None:
-        result = _build_footer_elements({"duration": 5})
+        result = _build_footer_elements({}, fields=[["status"]])
         assert len(result) >= 2  # hr + markdown 元素
         assert "Completed" in result[1]["content"]
 
     def test_status_error(self) -> None:
-        result = _build_footer_elements({}, is_error=True)
+        result = _build_footer_elements({}, is_error=True, fields=[["status"]])
         assert "red" in result[1]["content"]
 
     def test_status_aborted(self) -> None:
-        result = _build_footer_elements({}, is_aborted=True)
+        result = _build_footer_elements({}, is_aborted=True, fields=[["status"]])
         assert "Stopped" in result[1]["content"]
 
     def test_elapsed_displayed(self) -> None:
@@ -212,8 +206,10 @@ class TestBuildFooterElements:
             {"context_used": 50000, "context_max": 200000},
             fields=[["context"]],
         )
-        assert "50.0K" in result[1]["content"]
-        assert "25%" in result[1]["content"]
+        content = result[1]["content"]
+        assert "25%" in content
+        assert "200.0K" in content
+        assert "50.0K" not in content  # 不显示已用
 
     def test_tokens_displayed(self) -> None:
         result = _build_footer_elements(
@@ -239,7 +235,7 @@ class TestBuildFooterElements:
         assert "\n" in result[1]["content"]
 
     def test_none_footer_data_renders_status(self) -> None:
-        result = _build_footer_elements(None)
+        result = _build_footer_elements(None, fields=[["status"]])
         assert len(result) >= 2
 
     def test_no_matching_fields(self) -> None:
@@ -517,6 +513,24 @@ class TestBuildCronCard:
         card = build_cron_card(content)
         assert "| A | B |" in card["body"]["elements"][0]["content"]
 
+    def test_image_keys_rendered_as_markdown(self) -> None:
+        from hermes_lark_streaming.cardkit.builder import build_cron_card
+
+        card = build_cron_card("desc", image_keys=["img_v3_abc", "img_v3_def"])
+        elements = card["body"]["elements"]
+        # 文本在前，图片 element 在后（markdown ![image](img_key) 语法）
+        assert elements[0]["content"] == "desc"
+        assert elements[1] == {"tag": "markdown", "content": "![image](img_v3_abc)"}
+        assert elements[2] == {"tag": "markdown", "content": "![image](img_v3_def)"}
+
+    def test_image_keys_none_no_image_elements(self) -> None:
+        from hermes_lark_streaming.cardkit.builder import build_cron_card
+
+        card = build_cron_card("desc")
+        elements = card["body"]["elements"]
+        assert len(elements) == 1  # 只文本，无图片 element
+        assert elements[0]["content"] == "desc"
+
     def test_header_with_task_name(self) -> None:
         from hermes_lark_streaming.cardkit.builder import build_cron_card
 
@@ -663,6 +677,7 @@ class TestCompleteCardFooter:
         card = build_complete_card(
             segments=[_seg("answer", "hi")],
             all_tool_steps=[],
+            footer_data={"duration": 5, "model": "gpt", "context_used": 1000, "context_max": 10000},
         )
         tags = [e.get("tag") for e in card["body"]["elements"]]
         assert "hr" in tags
