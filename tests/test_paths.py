@@ -17,6 +17,7 @@ from hermes_lark_streaming.patcher import (
     _code_roots,
     _default_cron_path,
     _default_run_path,
+    _default_turn_path,
     _python_from_hermes_cli,
     _resolve_module_path,
     hermes_install_dir,
@@ -85,7 +86,11 @@ def test_resolve_falls_back_to_first_root_when_missing(
 
 @pytest.mark.parametrize(
     ("default_path", "rel"),
-    [(_default_run_path, "gateway/run.py"), (_default_cron_path, "cron/scheduler.py")],
+    [
+        (_default_run_path, "gateway/run.py"),
+        (_default_turn_path, "gateway/run_turn.py"),
+        (_default_cron_path, "cron/scheduler_delivery.py"),
+    ],
 )
 def test_default_path_respects_hermes_home(
     default_path: object, rel: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -100,7 +105,7 @@ def test_default_path_respects_hermes_home(
 
 @pytest.mark.parametrize(
     ("cls", "label"),
-    [(Patcher, "gateway/run.py"), (CronPatcher, "scheduler.py")],
+    [(Patcher, "gateway files"), (CronPatcher, "cron delivery file")],
 )
 def test_not_found_diagnostic_lists_tried_roots(
     cls: type, label: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

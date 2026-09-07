@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import sys
@@ -58,11 +59,17 @@ _PLUGIN_KEY = "hermes-lark-streaming"
 
 
 def _set_plugin_enabled(enable: bool) -> None:
-    """把本插件加入/移出 config.yaml 的 plugins.enabled（JSON 数组字符串行）.
+    """把本插件加入/移出 config.yaml 的 plugins.enabled。
 
-    保持其余 config 原样，只改 plugins 段下的 ``enabled:`` 那一行。启用自愈
+    保持其余 config 原样，只改 plugins 段下的 ``enabled:``。启用自愈
     register() 必须把插件列在 plugins.enabled（entry-point 插件默认 opt-in）。
-    用缩进感知的块遍历定位 plugins: 顶层段，避免误改其它段的 enabled:。
+
+    支持两种 YAML 形态（实测踩坑，2026-09-07）：
+      1. flow list 单行:  enabled: [a, b]
+      2. block list 多行: enabled: 换行 + 每行 "    - item"
+    旧实现只解析单行，把 block list 读成 [] 后整体压扁成
+    "enabled: [hermes-lark-streaming]"，丢掉原有 5 个插件并可能残留
+    顶格 "[hermes-lark-streaming]" 垃圾行（YAML 解析失败 → 全配置失效）。
     """
     cfg_path = hermes_home() / "config.yaml"
     if not cfg_path.exists():
@@ -70,49 +77,132 @@ def _set_plugin_enabled(enable: bool) -> None:
     text = cfg_path.read_text(encoding="utf-8")
     lines = text.splitlines(keepends=True)
 
-    changed = False
-    in_plugins = False  # 是否在顶层 plugins: 段内
+    def _indent(s: str) -> int:
+        return len(s) - len(s.lstrip())
+
+    in_plugins = False
+    enabled_line_idx: int | None = None
     for i, line in enumerate(lines):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        indent = len(line) - len(line.lstrip())
+        indent = _indent(line)
         key = line.lstrip().split(":", 1)[0].strip()
-        # 顶层（indent==0）非 plugins key → 离开 plugins 段
         if indent == 0:
             in_plugins = key == "plugins"
             continue
         if not in_plugins:
             continue
-        # plugins 段内的直接子键（indent==2，只匹配第一个 enabled:）
         if indent == 2 and key == "enabled":
-            prefix_match = re.match(r"(\s*enabled:\s*)", line)
-            if prefix_match is None:
-                break
-            prefix = prefix_match.group(1)
-            items = _parse_enabled(line)
-            if enable:
-                if _PLUGIN_KEY not in items:
-                    items.append(_PLUGIN_KEY)
-                    changed = True
-            else:
-                if _PLUGIN_KEY in items:
-                    items = [x for x in items if x != _PLUGIN_KEY]
-                    changed = True
-            if changed:
-                # 写成 YAML flow list（不加外层引号，否则 Hermes 读成字符串）。
-                # 用 yaml.safe_dump 保证引号/转义正确（含特殊字符的插件名）。
-                import yaml as _yaml
-
-                rendered = _yaml.safe_dump(items, default_flow_style=True).strip()
-                lines[i] = f"{prefix}{rendered}\n"
+            enabled_line_idx = i
             break
+    if enabled_line_idx is None:
+        return
 
-    if changed:
-        cfg_path.write_text("".join(lines), encoding="utf-8")
+    enabled_indent = _indent(lines[enabled_line_idx])
+    # 收集 items：先读 enabled: 行内联值（flow list），再收后续 "- item" 块
+    items: list[str] = []
+    inline = lines[enabled_line_idx].split(":", 1)[1] if ":" in lines[enabled_line_idx] else ""
+    if inline.strip():
+        import yaml as _yaml
+
+        parsed_items: list[str] = []
+        try:
+            parsed = _yaml.safe_load(inline)
+            if isinstance(parsed, list):
+                parsed_items = [str(x) for x in parsed]
+            elif isinstance(parsed, str):
+                # 历史格式：单引号包裹的 JSON 字符串行（'["a", "b"]'）→ 剥引号再解析。
+                stripped = parsed.strip()
+                if stripped.startswith(("[", "{")):
+                    try:
+                        nested = _yaml.safe_load(stripped)
+                        if isinstance(nested, list):
+                            parsed_items = [str(x) for x in nested]
+                    except _yaml.YAMLError:
+                        pass
+        except _yaml.YAMLError:
+            parsed_items = []
+        items = parsed_items
+    # 收集 block items：缩进 > enabled 行缩进 且以 "- " 开头
+    block_end = enabled_line_idx + 1
+    item_indent: int | None = None
+    while block_end < len(lines):
+        nxt = lines[block_end]
+        if not nxt.strip() or nxt.lstrip().startswith("#"):
+            block_end += 1
+            continue
+        nind = _indent(nxt)
+        if nind <= enabled_indent:
+            break
+        if item_indent is None:
+            item_indent = nind
+        if nxt.strip().startswith("- "):
+            raw = nxt.strip()[2:].strip()
+            if raw:
+                items.append(raw.strip("'\"") if raw.startswith(("'", "\"")) else raw)
+        block_end += 1
+
+    changed = False
+    if enable:
+        if _PLUGIN_KEY not in items:
+            items.append(_PLUGIN_KEY)
+            changed = True
+    else:
+        if _PLUGIN_KEY in items:
+            items = [x for x in items if x != _PLUGIN_KEY]
+            changed = True
+    if not changed:
+        return
+
+    # 保留原形态：原是 block list 就写 block list，原是 flow list 就写 flow list。
+    import yaml as _yaml
+
+    had_block = any(
+        _indent(lines[j]) > enabled_indent and lines[j].strip().startswith("- ")
+        for j in range(enabled_line_idx + 1, block_end)
+        if lines[j].strip()
+    )
+    prefix = lines[enabled_line_idx][:enabled_indent]
+    if had_block or (not inline.strip() and block_end > enabled_line_idx + 1):
+        # 重写为 block list：enabled: 空 + 每行 "- item"
+        new_block = [f"{prefix}enabled:\n"]
+        item_prefix = prefix + "    "
+        for it in items:
+            # 直接渲染简单字符串；含特殊字符才走 yaml（safe_dump 单值会带
+            # 文档结束符 "...\n"，实测 2026-09-07 污染 config 的元凶之一）。
+            if _is_simple_yaml_scalar(it):
+                new_block.append(f"{item_prefix}- {it}\n")
+            else:
+                rendered = _yaml.safe_dump([it], default_flow_style=False).strip()
+                new_block.append(f"{item_prefix}{rendered}\n")
+        # 删除旧 block items 行（含 enabled 行）
+        del lines[enabled_line_idx:block_end]
+        lines[enabled_line_idx:enabled_line_idx] = new_block
+    else:
+        rendered = _yaml.safe_dump(items, default_flow_style=True).strip()
+        lines[enabled_line_idx] = f"{prefix}enabled: {rendered}\n"
+        del lines[enabled_line_idx + 1:block_end]
+
+    cfg_path.write_text("".join(lines), encoding="utf-8")
+
+
+def _is_simple_yaml_scalar(value: str) -> bool:
+    """判断字符串能否安全地无引号写入 YAML block list item（插件名/id 均为简单标识符）。"""
+    if not value:
+        return False
+    # 避免与 YAML 保留字/特殊结构冲突
+    if value in {"true", "false", "null", "yes", "no", "on", "off", "~", "None", "True", "False"}:
+        return False
+    if value.lstrip().startswith(
+        ("-", "?", ":", "[", "]", "{", "}", "#", "&", "*", "!", "|", ">", "@", "`", '"', "'", "%")
+    ):
+        return False
+    if ":" in value and not value.startswith("http"):
+        return False
+    return not any(ch.isspace() for ch in value)
 
 
 def _parse_enabled(line: str) -> list[str]:
-    """解析 plugins.enabled 那一行的值（兼容 YAML flow list、JSON 字符串、旧引号格式）."""
     m = re.match(r"\s*enabled:\s*(\S.*)", line)
     if not m:
         return []
@@ -346,11 +436,24 @@ def _cmd_status() -> int:
     if patched:
         from .patcher import Patcher as _PatcherCls
 
-        content = patcher.run_path.read_text(encoding="utf-8")
+        all_text = ""
+        target_files = list(patcher.targets) if hasattr(patcher, "targets") else [patcher.run_path]
+        for p in target_files:
+            with contextlib.suppress(OSError):
+                all_text += p.read_text(encoding="utf-8") + "\n"
         for begin, _end in _PatcherCls.MARKERS:
-            found = begin in content
+            found = begin in all_text
             label = begin.replace("# HERMES_LARK_", "").replace("_BEGIN", "").lower()
             print(f"  {label}: {'installed' if found else 'missing'}")
+        # 多文件布局：标注各目标文件（新版），便于判断注入落位。
+        if len(target_files) > 1:
+            print(f"  targets({len(target_files)}):")
+            for p in target_files:
+                try:
+                    n = p.read_text(encoding="utf-8").count("HERMES_LARK_") // 2
+                except OSError:
+                    n = 0
+                print(f"    {p.name}: {n} markers")
 
     cron_patcher = _get_cron_patcher()
     if cron_patcher is not None:
