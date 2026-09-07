@@ -50,6 +50,16 @@ class Config:
         return bool(sec.get("clarify_inline", True))
 
     @property
+    def heartbeat_in_card(self) -> bool:
+        """是否把 Hermes 长回合心跳（⏳ Working — N min ...）并进卡片末尾状态行.
+
+        默认 True：心跳文本作为流式卡末尾专用元素更新，不再发独立文本消息。
+        关闭后退回 Hermes 原生心跳消息（interim 文本）。
+        """
+        sec = self._streaming_sec()
+        return bool(sec.get("heartbeat_in_card", True))
+
+    @property
     def self_heal(self) -> bool:
         """是否启用启动时自愈（默认 True）.
 

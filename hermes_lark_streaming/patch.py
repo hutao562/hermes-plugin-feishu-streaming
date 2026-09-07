@@ -284,6 +284,17 @@ def on_reasoning_delta(*, ctrl: Any, message_id: str | None, text: str, chat_id:
 
 
 @_safe_hook(default_return=False, log_level="debug")
+def on_heartbeat(*, ctrl: Any, message_id: str | None, text: str, chat_id: str | None = None) -> bool:
+    """[注入点 13] Hermes 长回合心跳 → 卡片末尾状态行.
+
+    心跳由 Hermes _run_agent_notify_long_running 周期性产生（默认 180s），
+    本函数把文本转给 controller 更新卡片末尾的 heartbeat 元素；返回 True 时
+    调用方（注入代码）跳过 Hermes 原生 adapter.send/edit 心跳消息。
+    """
+    return bool(ctrl.on_heartbeat(message_id=message_id, chat_id=chat_id, text=text))
+
+
+@_safe_hook(default_return=False, log_level="debug")
 def on_background_review_message(
     *,
     ctrl: Any,

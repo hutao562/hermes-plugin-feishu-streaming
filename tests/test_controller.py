@@ -487,6 +487,98 @@ class TestDispatch:
         assert session.card_id is not None
 
 
+class TestHeartbeat:
+    """on_heartbeat → 卡片末尾状态行。"""
+
+    def _session_with_card(self, msg_id: str = "msg_hb") -> CardSession:
+        session = _make_session(msg_id)
+        session.set_card(card_id="card_hb", card_msg_id="m_hb")
+        session.heartbeat_enabled = True
+        return session
+
+    def test_disabled_config_returns_false(self) -> None:
+        ctrl = _setup_ctrl()
+        ctrl._cfg._raw = {
+            "streaming": {"enabled": True, "heartbeat_in_card": False},
+            "feishu": {"app_id": "a", "app_secret": "s"},
+        }
+        session = self._session_with_card()
+        ctrl._sessions["msg_hb"] = session
+        assert ctrl.on_heartbeat(message_id="msg_hb", text="⏳ Working") is False
+
+    def test_no_session_returns_false(self) -> None:
+        ctrl = _setup_ctrl()
+        assert ctrl.on_heartbeat(message_id="ghost", text="⏳ Working") is False
+
+    def test_terminal_session_returns_false(self) -> None:
+        ctrl = _setup_ctrl()
+        session = self._session_with_card()
+        session.state = SessionState.COMPLETED
+        ctrl._sessions["msg_hb"] = session
+        assert ctrl.on_heartbeat(message_id="msg_hb", text="⏳ Working") is False
+
+    def test_stores_text_and_schedules_flush(self) -> None:
+        ctrl = _setup_ctrl()
+        session = self._session_with_card()
+        ctrl._sessions["msg_hb"] = session
+        with patch.object(ctrl, "_schedule_flush") as m:
+            ok = ctrl.on_heartbeat(message_id="msg_hb", text="⏳ Working — 3 min")
+            assert ok is True
+            assert session.heartbeat_text == "⏳ Working — 3 min"
+            assert session.heartbeat_dirty is True
+            m.assert_called_once_with(session)
+
+    def test_keeps_latest_text(self) -> None:
+        ctrl = _setup_ctrl()
+        session = self._session_with_card()
+        ctrl._sessions["msg_hb"] = session
+        ctrl.on_heartbeat(message_id="msg_hb", text="⏳ Working — 3 min")
+        ctrl.on_heartbeat(message_id="msg_hb", text="⏳ Working — 6 min")
+        assert session.heartbeat_text == "⏳ Working — 6 min"
+
+    def test_empty_text_returns_false(self) -> None:
+        ctrl = _setup_ctrl()
+        session = self._session_with_card()
+        ctrl._sessions["msg_hb"] = session
+        assert ctrl.on_heartbeat(message_id="msg_hb", text="") is False
+
+    @pytest.mark.asyncio
+    async def test_flush_pushes_heartbeat_element(self) -> None:
+        """flush 把 heartbeat_text 推到卡片 heartbeat_status 元素。"""
+        ctrl = _setup_ctrl()
+        session = self._session_with_card()
+        session.state = SessionState.STREAMING
+        session.heartbeat_text = "⏳ Working — 9 min — iteration 14/400"
+        session.heartbeat_dirty = True
+        ctrl._sessions["msg_hb"] = session
+        ctrl._client.cardkit_stream_element = AsyncMock()
+
+        await ctrl._do_flush(session)
+
+        assert session.heartbeat_dirty is False
+        ctrl._client.cardkit_stream_element.assert_called_once()
+        call_kwargs = ctrl._client.cardkit_stream_element.call_args
+        # (card_id, element_id, content, ...)
+        assert call_kwargs[0][0] == "card_hb"
+        assert call_kwargs[0][1] == "heartbeat_status"
+        assert "⏳ Working — 9 min" in call_kwargs[0][2]
+
+    @pytest.mark.asyncio
+    async def test_flush_skips_heartbeat_when_disabled(self) -> None:
+        ctrl = _setup_ctrl()
+        session = self._session_with_card()
+        session.state = SessionState.STREAMING
+        session.heartbeat_enabled = False
+        session.heartbeat_text = "⏳ Working"
+        session.heartbeat_dirty = True
+        ctrl._sessions["msg_hb"] = session
+        ctrl._client.cardkit_stream_element = AsyncMock()
+
+        await ctrl._do_flush(session)
+
+        ctrl._client.cardkit_stream_element.assert_not_called()
+
+
 # ── _do_create_card 集成测试 ──
 
 

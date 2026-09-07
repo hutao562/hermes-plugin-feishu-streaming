@@ -19,6 +19,7 @@ STREAMING_ELEMENT_ID = "streaming_content"
 REASONING_ELEMENT_ID = "reasoning_content"
 REASONING_TEXT_ELEMENT_ID = "reasoning_text"
 TOOL_PANEL_ELEMENT_ID = "tool_panel"
+HEARTBEAT_ELEMENT_ID = "heartbeat_status"
 _LOADING_ELEMENT_ID = "loading_icon"
 _LOADING_IMG_KEY = "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg"
 
@@ -103,6 +104,24 @@ def _loading_element() -> dict:
             "size": "16px 16px",
         },
         "element_id": _LOADING_ELEMENT_ID,
+    }
+
+
+def _build_heartbeat_element(content: str = " ") -> dict:
+    """卡片末尾的长回合心跳状态行（loading 图标之后 = 真正底部）。
+
+    element_id 固定，流式期由 controller 对同一元素反复 cardkit_stream_element
+    更新内容；complete 重建的最终卡片不含此元素 → 回合结束状态行自然消失。
+    小号灰色文本，尽量不干扰正文。
+    """
+    return {
+        "tag": "markdown",
+        "content": content,
+        "text_align": "left",
+        "text_size": "notation",
+        "text_color": "grey",
+        "margin": "4px 0px 0px 0px",
+        "element_id": HEARTBEAT_ELEMENT_ID,
     }
 
 
@@ -418,6 +437,7 @@ def build_streaming_card_v2(
     show_streaming_element: bool = True,
     header_enabled: bool = False,
     text_size: str = "normal_v2",
+    heartbeat_enabled: bool = False,
 ) -> dict[str, Any]:
     """CardKit 2.0 流式占位卡片 — 含工具面板 + streaming + loading 元素."""
     elements: list[dict] = []
@@ -436,6 +456,10 @@ def build_streaming_card_v2(
     if show_streaming_element:
         elements.append(_streaming_element(text_size=text_size))
     elements.append(_loading_element())
+    # 心跳状态行放 loading 之后 = 卡片真正末尾（不会被 insert_before 新内容挤走）。
+    # 空内容占位，首次心跳到达时由 controller 更新；回合结束 complete 重建不带它。
+    if heartbeat_enabled:
+        elements.append(_build_heartbeat_element())
 
     card = {
         "schema": "2.0",

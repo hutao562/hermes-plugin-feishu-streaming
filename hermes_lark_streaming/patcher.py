@@ -53,6 +53,7 @@ _HOOK_NAMES = [
     "INTERRUPT",
     "BG_DELIVER",
     "ADAPTER_INIT",
+    "HEARTBEAT",
 ]
 MARKERS: list[tuple[str, str]] = [(f"# {PREFIX}_{n}_BEGIN", f"# {PREFIX}_{n}_END") for n in _HOOK_NAMES]
 
@@ -71,6 +72,7 @@ MK_ABORT, MK_ABORT_END = MARKERS[11]
 MK_INTERRUPT, MK_INTERRUPT_END = MARKERS[12]
 MK_BG_DELIVER, MK_BG_DELIVER_END = MARKERS[13]
 MK_ADAPTER_INIT, MK_ADAPTER_INIT_END = MARKERS[14]
+MK_HEARTBEAT, MK_HEARTBEAT_END = MARKERS[15]
 
 # bg_watcher 注入点 12（background watcher text-only 通知覆盖）拆成两处独立 marker：
 # ① finished（进程完成通知）② running（still-running 进度推送）。新版两分支都走
@@ -702,6 +704,31 @@ def _adapter_init_hook(indent: str) -> str:
     )
 
 
+def _heartbeat_hook(indent: str) -> str:
+    # 新版：注入在 _run_agent_notify_long_running 心跳文本组装后、原生 edit/send 前。
+    # 作用域有 source / turn_ctx / _heartbeat_text（async 方法内，可 await）。
+    # on_heartbeat 返回 True = 卡片已接管 → continue 跳过原生心跳消息循环体；
+    # False = 卡片不可用 → 走原逻辑（保底）。
+    return _make_hook(
+        indent,
+        MK_HEARTBEAT,
+        MK_HEARTBEAT_END,
+        [
+            "try:",
+            "    if source.platform.value.lower() in ('feishu', 'lark'):",
+            "        from hermes_lark_streaming.patch import on_heartbeat",
+            "        if on_heartbeat(",
+            "            message_id=turn_ctx.event_message_id,",
+            "            chat_id=source.chat_id,",
+            "            text=_heartbeat_text,",
+            "        ):",
+            "            continue",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
 def _bg_watcher_hook(indent: str, begin: str, end: str) -> str:
     # 新版两分支都收敛到 _send_watcher_message：finished 文本 / running 进度文本。
     # 通过 message_text 内容区分。handled=True 时跳过原 adapter.send（卡片接管）。
@@ -929,6 +956,36 @@ def _find_turn_interrupt_site(tree: ast.Module, lines: list[str]) -> tuple[int, 
     return None
 
 
+def _find_turn_heartbeat_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    """新版长回合心跳：_run_agent_notify_long_running 心跳文本组装后、原生 edit/send 前。
+
+    ``_heartbeat_text = (`` 是 4 行多行赋值（f-string），用 AST 找该 Assign 语句
+    的 end_lineno，注入用 after（行后 = 原生 try 之前）。
+    作用域：source / turn_ctx / _heartbeat_text 全可用（async 方法）。
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == "_run_agent_notify_long_running":
+            for stmt in ast.walk(node):
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and stmt.targets[0].id == "_heartbeat_text"
+                ):
+                    lineno = (stmt.end_lineno or stmt.lineno) - 1
+                    indent = _safe_indent(lines, lineno)
+                    return lineno, indent
+    # fallback: 字符串行
+    for i, line in enumerate(lines):
+        if "_heartbeat_text = (" in line:
+            # 往后找收尾 ")"
+            for j in range(i, min(i + 10, len(lines))):
+                if lines[j].strip() == ")":
+                    indent = _safe_indent(lines, j)
+                    return j, indent
+    return None
+
+
 # ── run_turn_runner.py (TurnRunner) 定位 ─────────────────────────────────────
 
 def _find_runner_wire_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
@@ -1084,7 +1141,16 @@ class Patcher:
     def is_fully_patched(self) -> bool:
         contents = self._all_target_contents()
         all_text = "\n".join(contents.values()) if contents else ""
-        return all(begin in all_text and end in all_text for begin, end in self.MARKERS)
+        # 按布局取实际注入的 marker 组：HEARTBEAT 只在新版 run_turn.py 注入，
+        # legacy 单文件布局不含它（legacy 心跳注入点不存在），不能要求它齐全。
+        markers = self.MARKERS
+        if self.is_legacy_layout:
+            markers = [
+                (b, e)
+                for b, e in self.MARKERS
+                if b not in (MK_HEARTBEAT, MK_HEARTBEAT_END)
+            ]
+        return all(begin in all_text and end in all_text for begin, end in markers)
 
     # ── verify ────────────────────────────────────────────────────────────
 
@@ -1127,6 +1193,7 @@ class Patcher:
             "queued followup boundary", _find_turn_followup_boundary_site(tree, lines)
         )
         self._require_found("interrupt", _find_turn_interrupt_site(tree, lines))
+        self._require_found("heartbeat", _find_turn_heartbeat_site(tree, lines))
         # 字符串锚点存在性
         content = "\n".join(lines)
         for needle, label in (
@@ -1135,6 +1202,7 @@ class Patcher:
             ("_run_background_task_inner", "bg task"),
             ("_preserve_queued_followup_history_offset", "followup return"),
             ("_run_agent_queued_followup", "queued followup"),
+            ("_run_agent_notify_long_running", "long-running notify"),
         ):
             if needle not in content:
                 raise PatcherError(f"Cannot find {label} in run_turn.py — Hermes version may be incompatible")
@@ -1331,6 +1399,7 @@ class Patcher:
                     _find_turn_queued_followup_return_site(tree, lines),
                     _followup_result_hook,
                 ),
+                ("heartbeat", "after", _find_turn_heartbeat_site(tree, lines), _heartbeat_hook),
             ]
         elif name == "run_turn_runner.py":
             sites = [

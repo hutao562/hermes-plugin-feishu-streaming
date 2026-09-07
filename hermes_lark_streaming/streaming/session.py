@@ -54,6 +54,9 @@ class CardSession:
         "flush",
         "footer",
         "guard",
+        "heartbeat_dirty",
+        "heartbeat_enabled",
+        "heartbeat_text",
         "image_keys",
         "image_resolver",
         "last_activity_at",
@@ -83,6 +86,9 @@ class CardSession:
         self.tool_use = ToolUseTracker()
         self.flush = FlushController(throttle_ms=CARDKIT_MS, loop=loop)
         self.footer: dict[str, Any] = {}
+        self.heartbeat_enabled: bool = False  # 流式卡是否预留 heartbeat 状态行
+        self.heartbeat_text: str = ""  # 最近一条心跳文本（尚未推给卡片时置 dirty）
+        self.heartbeat_dirty: bool = False
         self.image_keys: list[str] = []  # image_generate 产物的飞书 img_key（complete 时渲染）
         self.sequence = 1
         self._loop = loop
