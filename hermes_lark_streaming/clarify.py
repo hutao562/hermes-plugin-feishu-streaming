@@ -230,6 +230,13 @@ async def _send_clarify(
                 "chat_id": chat_id,
                 "message_id": getattr(result, "message_id", "") or "",
             }
+            _logger.info(
+                "[clarify] sent card id=%s msg=%s choices=%d chat=%s (reply card)",
+                clarify_id,
+                (getattr(result, "message_id", "") or "")[:12] or "-",
+                len(clean) if clean else 0,
+                chat_id[:12],
+            )
         return result
     except Exception as exc:
         _logger.warning("[clarify] send_clarify failed: %s", exc, exc_info=True)
