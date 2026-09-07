@@ -19,6 +19,7 @@ TOPIC_ROOT_MSG = "om_x100b6bb3ec02b4a4b27e0fe38eef710"
 
 HERMES_HOME = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 GATEWAY_LOG = Path(HERMES_HOME) / "logs" / "gateway.log"
+AGENT_LOG = Path(HERMES_HOME) / "logs" / "agent.log"
 GATEWAY_PID = Path(HERMES_HOME) / "gateway.pid"
 
 
@@ -69,8 +70,25 @@ def require_e2e_env(request: pytest.FixtureRequest) -> None:
     whoami = _run_lark("whoami")
     if not whoami.get("available"):
         pytest.skip(f"lark-cli 未就绪: available={whoami.get('available')}")
-    if not GATEWAY_PID.exists():
-        pytest.skip(f"gateway 没跑: {GATEWAY_PID}")
+    if not _gateway_running():
+        pytest.skip(f"gateway 没跑（无 {GATEWAY_PID} 且 ps 无 gateway run 进程）")
+
+
+def _gateway_running() -> bool:
+    """gateway 判活：pid 文件优先，缺失时降级 ps 扫描。
+
+    新版 launchd 托管的主 profile gateway 不一定写 gateway.pid（family 写了，
+    主没写——是否写取决于外部监督器），所以 pid 文件不存在 ≠ gateway 没跑。
+    """
+    if GATEWAY_PID.exists():
+        return True
+    try:
+        proc = subprocess.run(
+            ["ps", "aux"], capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return "hermes_cli.main gateway run" in proc.stdout or "gateway run" in proc.stdout
 
 
 @pytest.fixture
@@ -89,10 +107,22 @@ def log_marker() -> Callable[[], int]:
     return _marker
 
 
-def _read_log_since(offset: int) -> str:
-    if not GATEWAY_LOG.exists():
+@pytest.fixture
+def agent_log_marker() -> Callable[[], int]:
+    """返回当前 agent.log 的行数偏移（配合 wait_for_agent_log 用）。"""
+    def _marker() -> int:
+        if not AGENT_LOG.exists():
+            return 0
+        with AGENT_LOG.open("r", encoding="utf-8", errors="replace") as f:
+            return sum(1 for _ in f)
+    return _marker
+
+
+def _read_log_since(offset: int, log_path: Path | None = None) -> str:
+    path = log_path or GATEWAY_LOG
+    if not path.exists():
         return ""
-    lines = GATEWAY_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     return "\n".join(lines[offset:])
 
 
@@ -110,6 +140,24 @@ def wait_for_log() -> Callable[..., str]:
                     return line
             time.sleep(interval)
         raise AssertionError(f"超时 {timeout}s 未匹配到日志 pattern={pattern!r}\n最后日志:\n{last[-500:]}")
+    return _wait
+
+
+@pytest.fixture
+def wait_for_agent_log() -> Callable[..., str]:
+    """poll agent.log 直到出现 pattern（hermes_lark_streaming logger 写 agent.log，
+    卡片元素级更新如 CardKit batch/stream element 在此，gateway.log 只有 [cheerwhy-card] 摘要）。"""
+    def _wait(pattern: str, since: int, timeout: float = 90.0, interval: float = 1.0) -> str:
+        regex = re.compile(pattern)
+        deadline = time.time() + timeout
+        last = ""
+        while time.time() < deadline:
+            last = _read_log_since(since, AGENT_LOG)
+            for line in last.splitlines():
+                if regex.search(line):
+                    return line
+            time.sleep(interval)
+        raise AssertionError(f"超时 {timeout}s 未在 agent.log 匹配到 pattern={pattern!r}\n最后日志:\n{last[-500:]}")
     return _wait
 
 
