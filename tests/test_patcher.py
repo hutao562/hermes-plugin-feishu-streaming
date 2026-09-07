@@ -212,6 +212,9 @@ class TestApplyRemove:
         assert "# HERMES_LARK_FOLLOWUP_COMPLETE_BEGIN" in content
         assert "# HERMES_LARK_FOLLOWUP_RESULT_BEGIN" in content
         assert "# HERMES_LARK_INTERRUPT_BEGIN" in content
+        assert "# HERMES_LARK_HEARTBEAT_BEGIN" in content
+        assert "on_heartbeat(" in content
+        assert "text=_heartbeat_text" in content
 
     def test_apply_idempotent(self, tree: Path) -> None:
         patcher = _patcher()

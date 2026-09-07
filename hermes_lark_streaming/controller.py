@@ -255,6 +255,39 @@ class StreamCardController(StreamingController):
         self._schedule_flush(session)
         return True
 
+    def on_heartbeat(self, *, message_id: str | None, text: str, chat_id: str | None = None) -> bool:
+        """Hermes 长回合心跳（⏳ Working — N min ...）→ 卡片末尾状态行。
+
+        返回 True = 已接管（文本进卡片元素，调用方应跳过 Hermes 原生心跳消息）；
+        False = 未接管（无卡片/心跳进卡关闭/卡片已终态），调用方走原生保底。
+        心跳频率极低（Hermes 默认 180s 一次），走 flush 同一条更新链即可。
+        """
+        if not self.enabled:
+            return False
+        if not self._cfg.heartbeat_in_card:
+            return False
+        if not text:
+            return False
+        session = self._resolve_session(message_id, chat_id)
+        if session is None or session.guard.should_skip("on_heartbeat"):
+            return False
+        # 心跳只在回合 running 期有意义；终态/无卡场景退回原生。
+        if session.state.is_terminal:
+            return False
+        # 配置层开关（卡创建时同步读 heartbeat_in_card → session.heartbeat_enabled）；
+        # 若关闭则完全不接管（Hermes 原生心跳保底）。
+        if not self._cfg.heartbeat_in_card:
+            return False
+        # 卡片创建中：文本暂存 + dirty，卡建好后的 flush 一并推（_do_create_card
+        # 完成后会 schedule flush）。若卡创建失败 fallback，session 进 FAILED →
+        # 上面 is_terminal 拦掉，Hermes 原生心跳保底。
+        session.last_activity_at = time.time()
+        session.heartbeat_text = text
+        session.heartbeat_dirty = True
+        if session.has_card:
+            self._schedule_flush(session)
+        return True
+
     def on_tool_update(
         self,
         *,

@@ -108,12 +108,14 @@ class StreamingController:
             assert self._client is not None
 
             reply_to_message_id = session.anchor_id or session.message_id
+            heartbeat_enabled = bool(self._cfg.heartbeat_in_card)
             card = build_streaming_card_v2(
                 show_tool_use=False,
                 show_reasoning=False,
                 show_streaming_element=False,
                 header_enabled=self._cfg.header_enabled,
                 text_size=self._cfg.body_text_size,
+                heartbeat_enabled=heartbeat_enabled,
             )
             card_id = await self._client.cardkit_create(card)
             card_msg_id = await self._client.reply_card_by_id(
@@ -121,6 +123,7 @@ class StreamingController:
                 card_id,
             )
             session.set_card(card_id=card_id, card_msg_id=card_msg_id)
+            session.heartbeat_enabled = heartbeat_enabled
             session.element_count = 1  # loading element
             session.flush.set_throttle(CARDKIT_MS)
 
@@ -134,6 +137,9 @@ class StreamingController:
             if session.state == SessionState.CREATING:
                 session.state = SessionState.STREAMING
             if session.segment_state and session.segment_state.has_dirty:
+                self._schedule_flush(session)
+            elif session.heartbeat_dirty and session.heartbeat_enabled:
+                # 卡创建完成时已有心跳暂存（极早到达场景）→ 立即推一次
                 self._schedule_flush(session)
             logging.getLogger("gateway.run").info(
                 "[cheerwhy-card] CardKit card created msg=%s card_id=%s anchor=%s",
@@ -321,6 +327,33 @@ class StreamingController:
                     seg.dirty = False
             except Exception as e:
                 _logger.debug("CardKit stream element failed: %s el=%s", e, seg.el_id, exc_info=True)
+
+        # ── 步骤 3: heartbeat 状态行 ──（loading 之后的独立元素，不经 segment 链）
+        if (
+            session.heartbeat_enabled
+            and session.heartbeat_dirty
+            and session.card_id
+            and session.state != SessionState.IDLE
+        ):
+            try:
+                session.sequence += 1
+                _logger.info(
+                    "CardKit heartbeat: msg=%s seq=%d len=%d",
+                    session.message_id[:12],
+                    session.sequence,
+                    len(session.heartbeat_text),
+                )
+                from ..cardkit.builder import HEARTBEAT_ELEMENT_ID
+                content = optimize_markdown_style(session.heartbeat_text) or " "
+                await self._client.cardkit_stream_element(
+                    session.card_id,
+                    HEARTBEAT_ELEMENT_ID,
+                    content,
+                    sequence=session.sequence,
+                )
+                session.heartbeat_dirty = False
+            except Exception as e:
+                _logger.debug("CardKit heartbeat update failed: %s", e, exc_info=True)
 
     async def _do_batch_update(
         self,
