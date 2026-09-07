@@ -175,6 +175,24 @@ class TestBuildToolPanel:
         title = panel["header"]["title"]["content"]
         assert "3.0s" in title
 
+    def test_running_step_shows_action_label(self) -> None:
+        """流式期折叠标题显示动作标签（📖 Reading 文件.md），不展开即见 agent 在干嘛。"""
+        step: dict = {**_STEP_RUNNING, "label": "📖 Reading 幼儿园与学习.md", "emoji": "📖"}
+        panel = _build_tool_panel([step], elapsed_ms=0)  # type: ignore[list-item]
+        title = panel["header"]["title"]["content"]
+        assert "📖 Reading 幼儿园与学习.md" in title
+        assert "1 step" in title
+        # label 自带 emoji，不再叠 🛠️
+        assert title.startswith("📖")
+
+    def test_completed_steps_fall_back_to_tool_use(self) -> None:
+        """无 running（全完成）退回 🛠️ Tool use 骨架，不含动作标签。"""
+        step: dict = {**_STEP_SUCCESS, "label": "📖 Reading 幼儿园与学习.md", "emoji": "📖"}
+        panel = _build_tool_panel([step], elapsed_ms=0)  # type: ignore[list-item]
+        title = panel["header"]["title"]["content"]
+        assert title.startswith("🛠️ Tool use")
+        assert "Reading 幼儿园与学习.md" not in title
+
 
 # --- Footer ---
 

@@ -28,6 +28,8 @@ class ToolDisplayStep(TypedDict):
     title: str
     status: str
     detail: str
+    label: str  # 单行动作标签（"📖 Reading 幼儿园与学习.md"），空则退 title
+    emoji: str  # 工具动作 emoji（折叠态快速识别）
     output: str
     error: str
     icon: str
@@ -129,18 +131,29 @@ def _basename_only(text: str) -> str:
 
 
 _TOOL_DESCRIPTORS: list[dict[str, Any]] = [
-    {"aliases": ["skill"], "icon": "app-default_outlined", "title": "Load skill", "sanitizer": None},
+    {
+        "aliases": ["skill"],
+        "icon": "app-default_outlined",
+        "title": "Load skill",
+        "emoji": "📚",
+        "verb_ing": "Loading skill",
+        "sanitizer": None,
+    },
     {
         "aliases": ["read", "open"],
         "icon": "file-link-text_outlined",
         "title": "Read",
+        "emoji": "📖",
+        "verb_ing": "Reading",
         "sanitizer": "path",
         "no_result": True,
     },
     {
-        "aliases": ["write", "edit"],
+        "aliases": ["write", "edit", "patch"],
         "icon": "edit_outlined",
         "title": "Edit",
+        "emoji": "🔧",
+        "verb_ing": "Editing",
         "sanitizer": "path",
         "no_result": True,
     },
@@ -148,33 +161,101 @@ _TOOL_DESCRIPTORS: list[dict[str, Any]] = [
         "aliases": ["web_search", "web-search", "search"],
         "icon": "search_outlined",
         "title": "Search",
+        "emoji": "🔍",
+        "verb_ing": "Searching",
         "sanitizer": "search",
     },
     {
-        "aliases": ["web_fetch", "web-fetch", "fetch"],
+        "aliases": ["web_fetch", "web-fetch", "fetch", "extract"],
         "icon": "language_outlined",
         "title": "Fetch web page",
+        "emoji": "🌐",
+        "verb_ing": "Fetching",
         "sanitizer": "url",
         "no_result": True,
     },
-    {"aliases": ["grep"], "icon": "doc-search_outlined", "title": "Search text", "sanitizer": "search"},
-    {"aliases": ["glob"], "icon": "folder_outlined", "title": "Search files", "sanitizer": "path"},
     {
-        "aliases": ["exec", "bash", "command", "run"],
+        "aliases": ["grep"],
+        "icon": "doc-search_outlined",
+        "title": "Search text",
+        "emoji": "🔎",
+        "verb_ing": "Searching text",
+        "sanitizer": "search",
+    },
+    {
+        "aliases": ["glob", "find"],
+        "icon": "folder_outlined",
+        "title": "Search files",
+        "emoji": "🗂️",
+        "verb_ing": "Searching files",
+        "sanitizer": "path",
+    },
+    {
+        "aliases": ["exec", "bash", "command", "run", "terminal"],
         "icon": "setting_outlined",
         "title": "Run command",
+        "emoji": "⚡",
+        "verb_ing": "Running",
         "sanitizer": "command",
     },
     {
-        "aliases": ["browser", "playwright", "navigate"],
+        "aliases": ["browser", "playwright", "navigate", "computer_use"],
         "icon": "browser-mac_outlined",
         "title": "Browser",
+        "emoji": "🧭",
+        "verb_ing": "Browsing",
         "no_result": True,
     },
-    {"aliases": ["agent", "task", "spawn"], "icon": "robot_outlined", "title": "Run sub-agent"},
-    {"aliases": ["check", "determine", "verify"], "icon": "list-check_outlined", "title": "Check"},
-    {"aliases": ["summarize", "analyze", "prepare"], "icon": "report_outlined", "title": "Analyze"},
-    {"aliases": ["clarify"], "icon": "chat_outlined", "title": "Clarify", "no_result": True},
+    {
+        "aliases": ["agent", "task", "spawn", "delegate"],
+        "icon": "robot_outlined",
+        "title": "Run sub-agent",
+        "emoji": "🤖",
+        "verb_ing": "Delegating",
+    },
+    {
+        "aliases": ["check", "determine", "verify", "inspect"],
+        "icon": "list-check_outlined",
+        "title": "Check",
+        "emoji": "✅",
+        "verb_ing": "Checking",
+    },
+    {
+        "aliases": ["summarize", "analyze", "prepare", "reason"],
+        "icon": "report_outlined",
+        "title": "Analyze",
+        "emoji": "🧠",
+        "verb_ing": "Analyzing",
+    },
+    {
+        "aliases": ["clarify"],
+        "icon": "chat_outlined",
+        "title": "Clarify",
+        "emoji": "❓",
+        "verb_ing": "Asking",
+        "no_result": True,
+    },
+    {
+        "aliases": ["vision", "look", "image_analyze"],
+        "icon": "eyes_outlined",
+        "title": "Looking at image",
+        "emoji": "👁️",
+        "verb_ing": "Looking at image",
+    },
+    {
+        "aliases": ["image_generate", "generate"],
+        "icon": "image_outlined",
+        "title": "Generating image",
+        "emoji": "🎨",
+        "verb_ing": "Generating image",
+    },
+    {
+        "aliases": ["memory"],
+        "icon": "brain_outlined",
+        "title": "Updating memory",
+        "emoji": "💾",
+        "verb_ing": "Updating memory",
+    },
 ]
 
 
@@ -309,12 +390,21 @@ class ToolUseTracker:
                 base_title = f"{base_title} ({_format_duration_label(s.elapsed_ms)})"
             sanitizer = desc.get("sanitizer") if desc else None
             detail = _sanitize_detail(s.detail, sanitizer)
+            emoji = (desc.get("emoji") if desc else None) or "⚙️"
+            verb_ing = (desc.get("verb_ing") if desc else None) or base_title
+            # 动作标签：emoji + 进行时动词 + 目标（detail 已脱敏/取 basename）。
+            # 目标过长（如长 command/search）截断到 60 字符防标题爆炸。
+            label = f"{emoji} {verb_ing}"
+            if detail:
+                label += f" {detail[:60]}"
             steps.append(
                 {
                     "name": s.name,
                     "title": base_title,
                     "status": s.status.value,
                     "detail": detail,
+                    "label": label,
+                    "emoji": emoji,
                     "output": s.output,
                     "error": s.error,
                     "icon": desc["icon"] if desc else "setting-inter_outlined",

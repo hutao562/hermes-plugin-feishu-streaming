@@ -133,7 +133,18 @@ def _build_tool_panel(
     element_id: str | None = TOOL_PANEL_ELEMENT_ID,
 ) -> dict:
     en_t, zh_t = _T["tool_use"]
-    en_parts, zh_parts = [en_t], [zh_t]
+    # 折叠态标题：有 running 步骤时直接显示「动作标签」（📖 Reading 幼儿园与学习.md），
+    # 让用户不展开就能看到 agent 正在操作什么；无 running（含空/全完成）退回
+    # 「🛠️ Tool use · N steps」骨架。label 自带 emoji，故 running 态不加 🛠️ 前缀。
+    running = next((s for s in reversed(steps) if s.get("status") == "running"), None)
+    if running:
+        prefix = ""
+        en_parts, zh_parts = [running.get("label") or running.get("title") or en_t], [
+            running.get("label") or running.get("title") or zh_t
+        ]
+    else:
+        prefix = "🛠️ "
+        en_parts, zh_parts = [en_t], [zh_t]
     if steps:
         tpl_en, tpl_zh = _T["steps"]
         en_parts.append(tpl_en.format(len(steps), "s" if len(steps) > 1 else ""))
@@ -150,8 +161,8 @@ def _build_tool_panel(
         expanded=expanded,
         title_el={
             "tag": "plain_text",
-            "content": f"🛠️ {' · '.join(en_parts)}",
-            "i18n_content": _i18n(f"🛠️ {' · '.join(en_parts)}", f"🛠️ {' · '.join(zh_parts)}"),
+            "content": f"{prefix}{' · '.join(en_parts)}",
+            "i18n_content": _i18n(f"{prefix}{' · '.join(en_parts)}", f"{prefix}{' · '.join(zh_parts)}"),
             "text_color": "grey",
             "text_size": "notation",
         },
