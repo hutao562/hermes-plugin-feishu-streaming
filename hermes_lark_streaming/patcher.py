@@ -1,4 +1,21 @@
-"""AST Patcher — 在 Hermes gateway/run.py 中注入 Hook 调用."""
+"""AST Patcher — 在 Hermes gateway 多文件架构中注入 Hook 调用 (2026-09 适配版).
+
+Hermes v0.21 (2026-09-06) 把单文件 gateway/run.py 拆成 facade + siblings：
+  run_turn.py            — GatewayTurnMixin（回合生命周期）
+  run_turn_runner.py     — TurnRunner（流式回调装配 _wire_turn_agent_callbacks）
+  run_inbound.py         — GatewayInboundMixin（入站 _handle_message）
+  run_startup.py         — GatewayStartupMixin（gateway:startup）
+  run_notifications.py   — GatewayNotificationsMixin（bg watcher）
+  cron/scheduler_delivery.py — cron 投递（原 scheduler.py 内函数拆出）
+
+适配策略（ADAPT_NEW_GATEWAY.md）：
+- 5 个流式 hook（tool/answer/thinking/reasoning/background_review）不再分散注入
+  各回调函数体，而是收敛到 TurnRunner._wire_turn_agent_callbacks 方法尾部：
+  每回合该方法先由 Hermes 装配 agent.X_callback，我们在方法尾包 wrapper 覆盖，
+  语义与旧版"每回合绑定"完全一致且更抗漂移。
+- 生命周期 hook（normalize/start/complete/abort/followup）注入到对应 mixin 方法。
+- adapter_init / bg_watcher / cron 分别注入到各自归属文件。
+"""
 
 from __future__ import annotations
 
@@ -56,19 +73,21 @@ MK_BG_DELIVER, MK_BG_DELIVER_END = MARKERS[13]
 MK_ADAPTER_INIT, MK_ADAPTER_INIT_END = MARKERS[14]
 
 # bg_watcher 注入点 12（background watcher text-only 通知覆盖）拆成两处独立 marker：
-# ① finished（进程完成通知）② running（still-running 进度推送）。两处都在
-# _run_process_watcher 内，走 adapter.send 纯文本，绕过 cheerwhy 的 14 个 hook。
+# ① finished（进程完成通知）② running（still-running 进度推送）。新版两分支都走
+# GatewayNotificationsMixin._send_watcher_message，收敛到该方法内注入。
 MK_BG_WATCHER_FINISHED = f"# {PREFIX}_BG_WATCHER_FINISHED_BEGIN"
 MK_BG_WATCHER_FINISHED_END = f"# {PREFIX}_BG_WATCHER_FINISHED_END"
 MK_BG_WATCHER_RUNNING = f"# {PREFIX}_BG_WATCHER_RUNNING_BEGIN"
 MK_BG_WATCHER_RUNNING_END = f"# {PREFIX}_BG_WATCHER_RUNNING_END"
 
-# bg_watcher 注入点 12 拆成两处（finished / running），加进 MARKERS 让 Patcher 统一管理。
 _BG_WATCHER_PAIRS: tuple[tuple[str, str], ...] = (
     (MK_BG_WATCHER_FINISHED, MK_BG_WATCHER_FINISHED_END),
     (MK_BG_WATCHER_RUNNING, MK_BG_WATCHER_RUNNING_END),
 )
 MARKERS.extend(_BG_WATCHER_PAIRS)
+
+MK_CRON_DELIVER = f"# {PREFIX}_CRON_DELIVER_BEGIN"
+MK_CRON_DELIVER_END = f"# {PREFIX}_CRON_DELIVER_END"
 
 _BACKUP_SUFFIX = ".hermes_lark.bak"
 
@@ -196,34 +215,67 @@ def _resolve_module_path(module_name: str, roots: list[Path]) -> Path:
     return roots[0] / rel if roots else rel
 
 
+# ── 2026-09 Hermes facade/siblings 重构：注入目标多文件化 ────────────────────
+_GATEWAY_TURN_FILE = "gateway.run_turn"
+_GATEWAY_RUNNER_FILE = "gateway.run_turn_runner"
+_GATEWAY_INBOUND_FILE = "gateway.run_inbound"
+_GATEWAY_STARTUP_FILE = "gateway.run_startup"
+_GATEWAY_NOTIF_FILE = "gateway.run_notifications"
+_CRON_DELIVERY_FILE = "cron.scheduler_delivery"
+
+
+def _module_path(module_name: str) -> Path:
+    """模块名 → 绝对文件路径（code roots 内）."""
+    return _resolve_module_path(module_name, _code_roots())
+
+
 def _default_run_path() -> Path:
-    return _resolve_module_path("gateway.run", _code_roots())
+    # 兼容旧名：主注入文件现在按 Hermes 形态自动判定（facade 有 _handle_message_with_agent
+    # 时为单文件旧版；否则走新版多文件）。此处仅保留 run.py 路径供 status/自愈使用。
+    return _module_path("gateway.run")
+
+
+def _default_turn_path() -> Path:
+    return _module_path(_GATEWAY_TURN_FILE)
+
+
+def _default_turn_runner_path() -> Path:
+    return _module_path(_GATEWAY_RUNNER_FILE)
+
+
+def _default_inbound_path() -> Path:
+    return _module_path(_GATEWAY_INBOUND_FILE)
+
+
+def _default_startup_path() -> Path:
+    return _module_path(_GATEWAY_STARTUP_FILE)
+
+
+def _default_notif_path() -> Path:
+    return _module_path(_GATEWAY_NOTIF_FILE)
 
 
 def _default_cron_path() -> Path:
-    return _resolve_module_path("cron.scheduler", _code_roots())
+    # 旧 scheduler.py 的 _deliver_result 已拆到 scheduler_delivery.py（0.21+）。
+    return _module_path(_CRON_DELIVERY_FILE)
 
 
-MK_CRON_DELIVER = f"# {PREFIX}_CRON_DELIVER_BEGIN"
-MK_CRON_DELIVER_END = f"# {PREFIX}_CRON_DELIVER_END"
-
-_ANCHOR_CHECKS: list[tuple[str, tuple[str, ...], str]] = [
-    ("Restart typing indicator so the user sees activity", (), "interrupt"),
-    ('was_interrupted = result.get("interrupted")', (), "queued follow-up boundary"),
-    ("return _preserve_queued_followup_history_offset(result, followup_result)", (), "queued follow-up return"),
-    ("agent.reasoning_config = reasoning_config", (), "reasoning_config"),
-    ("agent.background_review_callback = _bg_review_send", (), "background_review_callback"),
-    ("images, text_content = adapter.extract_images(response)", (), "background deliver"),
-    ("_already_sent = bool(", (), "complete"),
-    ("Discarding stale agent result", (), "abort"),
-    ('self.hooks.emit("gateway:startup"', (), "gateway startup emit"),
-    ("finished with exit code", (), "background watcher finished"),
-    ("is still running~", (), "background watcher running"),
-]
+# 注入点锚定（字符串）——新版按文件分组。
+# 每个条目: (文件名函数, hook 注入定位函数名, [依赖的字符串锚点], label)
+# 具体定位逻辑在各 _find_*_site 函数中按文件实现。
 
 
 def _make_hook(indent: str, begin: str, end: str, body_lines: list[str]) -> str:
     return f"{indent}{begin}\n" + "".join(f"{indent}{line}\n" for line in body_lines) + f"{indent}{end}\n"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Hook 代码生成（新版注入形态）
+#
+# TurnRunner 方法内注入的代码通过 self._ctx 访问 TurnContext：
+#   self._ctx.source / self._ctx.event_message_id / self._ctx._run_still_current()
+# GatewayTurnMixin 方法内 source/event 等是形参。
+# ════════════════════════════════════════════════════════════════════════════
 
 
 def _feishu_normalize_hook(indent: str) -> str:
@@ -283,7 +335,7 @@ def _complete_hook(indent: str) -> str:
             "        message_id=_lark_completion_id,",
             "        chat_id=source.chat_id,",
             "        answer=response,",
-            "        duration=_response_time,",
+            "        duration=_turn_seconds,",
             "        model=agent_result.get('model', ''),",
             "        tokens={",
             "            'input_tokens': agent_result.get('input_tokens', 0),",
@@ -366,42 +418,34 @@ def _tool_hook(indent: str) -> str:
 
 
 def _answer_hook(indent: str) -> str:
+    # 新版 (0.21+)：answer delta 由 ANSWER_GUARD wrapper 统一接管（guard 在
+    # Hermes 装配 stream_delta_callback 后包一层，无论原生流式开关都先调
+    # on_answer_delta）。本 ANSWER marker 保留为空壳说明块——避免双份 wrapper
+    # 造成双发，同时让 status/is_fully_patched 对 MARKERS 的检查保持全绿。
     return _make_hook(
         indent,
         MK_ANSWER,
         MK_ANSWER_END,
         [
-            "try:",
-            "    from hermes_lark_streaming.patch import on_answer_delta",
-            (
-                "    if text and self._ctx._run_still_current() and on_answer_delta("
-                "message_id=self._ctx.event_message_id, chat_id=self._ctx.source.chat_id, text=text):"
-            ),
-            "        return",
-            "except Exception:",
-            "    pass",
+            "# [0.21+] answer delta handled by ANSWER_GUARD wrapper below "
+            "(on_answer_delta called before native stream_callback).",
         ],
     )
 
 
 def _answer_guard_hook(indent: str) -> str:
-    """兜底注入：在 agent.stream_delta_callback 赋值前包一层 wrapper。
+    """兜底注入：在 agent.stream_delta_callback 装配后包一层 wrapper。
 
-    Hermes 新版把 _stream_delta_cb 拆成两个分支（原生流式分支 + TTS-only 分支），
-    原 ANSWER 注入只落在 TTS-only 分支；当 display.platforms.feishu.streaming=false
-    且未开流式 TTS 时两个分支都不执行 → _stream_delta_cb 保持 None → on_answer_delta
-    永不调用 → 回答文本不进卡片（2026-08-01 实测）。
-
-    此注入点不依赖任何 Hermes 原生分支：无论 _stream_delta_cb 是否为 None，
-    都包一层 wrapper 先调 on_answer_delta（进卡片），卡片处理了就不再走原生
-    callback（同时根治 streaming=true 时的双发）。
+    无论 Hermes 原生是否启用流式（stream_delta_cb 是否 None），wrapper 都先调
+    on_answer_delta（进卡片）；卡片处理了就 return（不同步原生流，根治 streaming=true
+    双发）；否则 fallback 到原 callback（Hermes 原生流式或 None）。
     """
     return _make_hook(
         indent,
         MK_ANSWER_GUARD,
         MK_ANSWER_GUARD_END,
         [
-            "_hermes_lark_orig_delta_cb = _stream_delta_cb",
+            "_hermes_lark_orig_delta_cb = agent.stream_delta_callback",
             "def _hermes_lark_guarded_delta_cb(text):",
             "    try:",
             "        from hermes_lark_streaming.patch import on_answer_delta",
@@ -414,7 +458,7 @@ def _answer_guard_hook(indent: str) -> str:
             "        pass",
             "    if _hermes_lark_orig_delta_cb is not None:",
             "        _hermes_lark_orig_delta_cb(text)",
-            "_stream_delta_cb = _hermes_lark_guarded_delta_cb",
+            "agent.stream_delta_callback = _hermes_lark_guarded_delta_cb",
         ],
     )
 
@@ -428,7 +472,8 @@ def _thinking_hook(indent: str) -> str:
             "try:",
             "    from hermes_lark_streaming.patch import on_thinking_delta",
             "    if (text and not already_streamed and self._ctx._run_still_current()",
-            "            and on_thinking_delta(message_id=self._ctx.event_message_id, chat_id=self._ctx.source.chat_id, text=text)):",
+            "            and on_thinking_delta(message_id=self._ctx.event_message_id,",
+            "                                  chat_id=self._ctx.source.chat_id, text=text)):",
             "        return",
             "except Exception:",
             "    pass",
@@ -446,7 +491,8 @@ def _reasoning_hook(indent: str) -> str:
             "    if text and self._ctx._run_still_current():",
             "        try:",
             "            from hermes_lark_streaming.patch import on_reasoning_delta",
-            "            on_reasoning_delta(message_id=self._ctx.event_message_id, chat_id=self._ctx.source.chat_id, text=text)",
+            "            on_reasoning_delta(message_id=self._ctx.event_message_id,",
+            "                                 chat_id=self._ctx.source.chat_id, text=text)",
             "        except Exception:",
             "            pass",
             "agent.reasoning_callback = _reasoning_cb",
@@ -465,11 +511,11 @@ def _background_review_hook(indent: str) -> str:
             "    _lark_bg_review_sender = agent.background_review_callback",
             "    def _lark_bg_review_callback(message):",
             "        _lark_bg_review_deferred = on_background_review_message(",
-            "            message_id=event_message_id,",
+            "            message_id=self._ctx.event_message_id,",
             "            text=message,",
             "            sender=_lark_bg_review_sender,",
             "        )",
-            "        if not _lark_bg_review_deferred:",
+            "        if not _lark_bg_review_deferred and _lark_bg_review_sender is not None:",
             "            _lark_bg_review_sender(message)",
             "    agent.background_review_callback = _lark_bg_review_callback",
             "except Exception:",
@@ -494,6 +540,8 @@ def _abort_hook(indent: str) -> str:
 
 
 def _interrupt_hook(indent: str) -> str:
+    # 旧版（run.py 单文件、_run_agent 闭包）形态：was_interrupted/pending_event/
+    # next_message_id/next_source/event_message_id 均在作用域。
     return _make_hook(
         indent,
         MK_INTERRUPT,
@@ -527,6 +575,61 @@ def _interrupt_hook(indent: str) -> str:
     )
 
 
+def _interrupt_hook_v2(indent: str) -> str:
+    # 新版（run_turn.py GatewayTurnMixin._run_agent_queued_followup）形态：
+    # 形参 turn_ctx/result/pending_event/source；anchor 已在 3574 行由
+    # next_message_id = self._reply_anchor_for_event(pending_event) 算出。
+    # 注入在 typing-restart 注释前（3588），next_message_id/next_source 已就绪。
+    return _make_hook(
+        indent,
+        MK_INTERRUPT,
+        MK_INTERRUPT_END,
+        [
+            "try:",
+            "    if source.platform.value.lower() in ('feishu', 'lark'):",
+            "        from hermes_lark_streaming.patch import (",
+            "            on_message_aborted, on_message_interrupted, on_message_started,",
+            "        )",
+            "        _lark_next_message_id = next_message_id or getattr(pending_event, 'message_id', None)",
+            "        _lark_next_anchor_id = next_message_id",
+            "        if result.get('interrupted') and _lark_next_message_id:",
+            "            on_message_interrupted(",
+            "                message_id=turn_ctx.event_message_id,",
+            "                new_message_id=_lark_next_message_id,",
+            "                chat_id=source.chat_id,",
+            "                anchor_id=_lark_next_anchor_id,",
+            "            )",
+            "        elif result.get('interrupted'):",
+            "            on_message_aborted(message_id=turn_ctx.event_message_id)",
+            "        elif pending_event is not None and _lark_next_message_id:",
+            "            on_message_started(",
+            "                message_id=_lark_next_message_id,",
+            "                chat_id=getattr(next_source, 'chat_id', source.chat_id),",
+            "                anchor_id=_lark_next_anchor_id,",
+            "            )",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
+def _followup_complete_hook_v2(indent: str) -> str:
+    # 新版：_run_agent_inner 的 pending 分支（if pending_event or pending:）内、
+    # 递归 _run_agent_queued_followup 之前 finalize 当前回合卡片。
+    return _make_hook(
+        indent,
+        MK_FOLLOWUP_COMPLETE,
+        MK_FOLLOWUP_COMPLETE_END,
+        [
+            "try:",
+            "    from hermes_lark_streaming.patch import on_queued_followup_boundary",
+            "    await on_queued_followup_boundary(message_id=event_message_id, result=result)",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
 def _cron_deliver_hook(indent: str) -> str:
     return _make_hook(
         indent,
@@ -534,16 +637,15 @@ def _cron_deliver_hook(indent: str) -> str:
         MK_CRON_DELIVER_END,
         [
             "try:",
-            "    if platform_name.lower() in ('feishu', 'lark'):",
+            "    if _hermes_lark_cron_target_feishu(target):",
             "        if '_hermes_lark_cron_seen' not in locals():",
             "            _hermes_lark_cron_seen = set()",
-            "        _hermes_lark_cron_key = (str(chat_id), cleaned_delivery_content.strip())",
+            "        _hermes_lark_cron_key = (str(target['chat_id']), cleaned_delivery_content.strip())",
             "        if _hermes_lark_cron_key in _hermes_lark_cron_seen:",
-            "            delivered = True",
             "            continue",
             "        from hermes_lark_streaming.patch import on_cron_deliver",
             "        if on_cron_deliver(",
-            "            chat_id=chat_id,",
+            "            chat_id=target['chat_id'],",
             "            content=cleaned_delivery_content.strip(),",
             "            loop=loop,",
             "            task_name=job.get('name', ''),",
@@ -586,8 +688,6 @@ def _bg_deliver_hook(indent: str) -> str:
 
 def _adapter_init_hook(indent: str) -> str:
     # 在 gateway:startup emit 之后 patch（所有 adapter 已 connect，event_handler 已建）。
-    # 此时 self.adapters 已填充，patch 函数能拿到 feishu 实例去替换其 card-action
-    # processor.f（绕过 lark SDK 在 register_p2_card_action_trigger 时捕获的旧引用）。
     return _make_hook(
         indent,
         MK_ADAPTER_INIT,
@@ -602,18 +702,17 @@ def _adapter_init_hook(indent: str) -> str:
     )
 
 
-def _bg_watcher_finished_hook(indent: str) -> str:
-    # 注入点 12a：_run_process_watcher 的 "finished with exit code" 分支。
-    # 该分支默认 adapter.send 纯文本通知进程完成；cheerwhy 接管：有活跃 agent
-    # session → 过滤冗余通知；否则发 background card。handled 时跳过原 adapter.send。
+def _bg_watcher_hook(indent: str, begin: str, end: str) -> str:
+    # 新版两分支都收敛到 _send_watcher_message：finished 文本 / running 进度文本。
+    # 通过 message_text 内容区分。handled=True 时跳过原 adapter.send（卡片接管）。
     return _make_hook(
         indent,
-        MK_BG_WATCHER_FINISHED,
-        MK_BG_WATCHER_FINISHED_END,
+        begin,
+        end,
         [
             "_hermes_lark_bg_handled = False",
             "try:",
-            "    if platform_name.lower() in ('feishu', 'lark'):",
+            "    if (platform_name or '').lower() in ('feishu', 'lark'):",
             "        from hermes_lark_streaming.patch import on_bg_watcher_notify",
             "        if await on_bg_watcher_notify(chat_id=chat_id, content=message_text):",
             "            _hermes_lark_bg_handled = True",
@@ -621,25 +720,14 @@ def _bg_watcher_finished_hook(indent: str) -> str:
             "    pass",
         ],
     )
+
+
+def _bg_watcher_finished_hook(indent: str) -> str:
+    return _bg_watcher_hook(indent, MK_BG_WATCHER_FINISHED, MK_BG_WATCHER_FINISHED_END)
 
 
 def _bg_watcher_running_hook(indent: str) -> str:
-    # 注入点 12b：_run_process_watcher 的 "is still running~" 进度推送分支。同 finished。
-    return _make_hook(
-        indent,
-        MK_BG_WATCHER_RUNNING,
-        MK_BG_WATCHER_RUNNING_END,
-        [
-            "_hermes_lark_bg_handled = False",
-            "try:",
-            "    if platform_name.lower() in ('feishu', 'lark'):",
-            "        from hermes_lark_streaming.patch import on_bg_watcher_notify",
-            "        if await on_bg_watcher_notify(chat_id=chat_id, content=message_text):",
-            "            _hermes_lark_bg_handled = True",
-            "except Exception:",
-            "    pass",
-        ],
-    )
+    return _bg_watcher_hook(indent, MK_BG_WATCHER_RUNNING, MK_BG_WATCHER_RUNNING_END)
 
 
 def _remove_block(content: str, begin: str, end: str) -> str:
@@ -679,33 +767,441 @@ class PatcherError(RuntimeError):
     pass
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# 新版注入点定位（多文件）
+#
+# 每个定位函数返回 (0-indexed 行号, 缩进) 或 None。
+# 定位失败 = verify 失败（防位置漂移致重复消息）。
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _safe_indent(lines: list[str], lineno: int) -> str:
+    """获取缩进，跳过空行."""
+    for i in range(lineno, -1, -1):
+        if 0 <= i < len(lines) and lines[i].strip():
+            return lines[i][: len(lines[i]) - len(lines[i].lstrip())]
+    for i in range(lineno + 1, len(lines)):
+        if lines[i].strip():
+            return lines[i][: len(lines[i]) - len(lines[i].lstrip())]
+    return ""
+
+
+def _find_method_first_stmt(tree: ast.Module, lines: list[str], method: str) -> tuple[int, str] | None:
+    """定位类方法体第一条真实语句（跳过 docstring）。"""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == method:
+            body = node.body
+            start = 0
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                start = 1
+            if start < len(body):
+                lineno = body[start].lineno - 1
+                indent = _safe_indent(lines, lineno)
+                return lineno, indent
+    return None
+
+
+def _find_method_last_stmt(tree: ast.Module, lines: list[str], method: str) -> tuple[int, str] | None:
+    """定位类方法体最后一条语句之后的位置（注入到方法尾）。"""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == method:
+            if not node.body:
+                return None
+            last = node.body[-1]
+            lineno = (last.end_lineno or last.lineno) - 1
+            indent = _safe_indent(lines, lineno)
+            return lineno, indent
+    return None
+
+
+def _find_stmt_after(tree: ast.Module, lines: list[str], needle: str) -> tuple[int, str] | None:
+    """定位某行字符串之后的插入位（下一行，同一缩进）。AST 兜底用行匹配。"""
+    for i, line in enumerate(lines):
+        if needle in line:
+            indent = _safe_indent(lines, i)
+            return i, indent  # 语义：调用方决定插到 i+1（用行级重排）
+    return None
+
+
+def _line_after(lines: list[str], idx: int) -> tuple[int, str] | None:
+    if idx + 1 < len(lines):
+        return idx + 1, _safe_indent(lines, idx)
+    return None
+
+
+# ── run_turn.py (GatewayTurnMixin) 定位 ──────────────────────────────────────
+
+def _find_turn_start_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    # _handle_message_with_agent 方法体开头（agent 回合真正开始处）。
+    return _find_method_first_stmt(tree, lines, "_handle_message_with_agent")
+
+
+def _find_turn_complete_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    """回合完成 finalize 卡片：_handle_message_with_agent 里 deliver 调用之前。
+
+    选这里而不是 _hmwa_deliver_turn_response 开头，是因为 complete hook 需要
+    ``_turn_seconds``/``response``/``agent_result``/``agent_messages``/``event``/``source``
+    全在作用域内；且 persist 已发生（库里保留全文），complete 成功后设
+    ``agent_result['already_sent']`` 并清 ``response``，deliver 看到 already_sent
+    走 streamed 分支不再重复发 body。
+    """
+    for i, line in enumerate(lines):
+        if "return await self._hmwa_deliver_turn_response(" in line:
+            indent = _safe_indent(lines, i)
+            return i, indent
+    return None
+
+
+def _find_turn_abort_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    """stale 结果丢弃（abort 通知）：调用点 return None 之前（作用域有 event）。
+
+    返回 return None 行，注入用 before（插到该行前 = discard 调用后）。
+    """
+    for i, line in enumerate(lines):
+        if "self._hmwa_discard_stale_result(" in line:
+            for j in range(i, min(i + 6, len(lines))):
+                if lines[j].strip() == "return None":
+                    indent = _safe_indent(lines, j)
+                    return j, indent
+            indent = _safe_indent(lines, i)
+            return i + 1, indent
+    return None
+
+
+def _find_turn_bg_deliver_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    # _run_background_task_inner: extract_images 之后。
+    for i, line in enumerate(lines):
+        if "images, text_content = adapter.extract_images(response)" in line:
+            return _line_after(lines, i)
+    # fallback: 方法内 images/media_files/text_content 初始化行后
+    for i, line in enumerate(lines):
+        if "images, media_files, text_content = [], [], \"\"" in line:
+            return _line_after(lines, i)
+    return None
+
+
+def _find_turn_queued_followup_return_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    # _run_agent_queued_followup: return _preserve_queued_followup_history_offset(...) 前。
+    for i, line in enumerate(lines):
+        if "return _preserve_queued_followup_history_offset(result, followup_result)" in line.strip():
+            indent = _safe_indent(lines, i)
+            return i, indent
+    return None
+
+
+def _find_turn_followup_boundary_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    """新版 queued followup 边界：_run_agent_inner 中 ``if pending_event or pending:`` 分支内。
+
+    该分支递归 _run_agent_queued_followup 前应 finalize 当前回合卡片。
+    返回分支体内 ``return await self._run_agent_queued_followup(`` 行，注入用 before
+    （插到该行前 = 分支体内、递归前；缩进即分支体缩进）。
+    """
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "if pending_event or pending:":
+            for j in range(i + 1, min(i + 5, len(lines))):
+                if "return await self._run_agent_queued_followup(" in lines[j]:
+                    indent = _safe_indent(lines, j)
+                    return j, indent  # before → 插到 j 行前（分支体内）
+    return None
+
+
+def _find_turn_interrupt_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    """新版 interrupt：_run_agent_queued_followup 内 typing-restart 注释前。
+
+    该点 result/pending_event/source/next_message_id/next_source 已全部就绪
+    （queued followup 会重开 typing），注入用 before（行前）。
+    """
+    for i, line in enumerate(lines):
+        if "Restart the typing indicator" in line and "outer typing task may be stale" in line:
+            indent = _safe_indent(lines, i)
+            return i, indent
+    # fallback: Restart typing indicator
+    for i, line in enumerate(lines):
+        if "Restart the typing indicator" in line:
+            indent = _safe_indent(lines, i)
+            return i, indent
+    return None
+
+
+# ── run_turn_runner.py (TurnRunner) 定位 ─────────────────────────────────────
+
+def _find_runner_wire_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    """定位 _wire_turn_agent_callbacks 方法尾（回调装配完成后）。
+
+    返回方法体最后一条语句所在行；调用方把各 hook 按倒序插到该行后。
+    """
+    return _find_method_last_stmt(tree, lines, "_wire_turn_agent_callbacks")
+
+
+# ── run_inbound.py (GatewayInboundMixin) 定位 ────────────────────────────────
+
+def _find_inbound_normalize_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    """_handle_message 中 event/source 解包之后（normalize 需要 source/event 已就位）。"""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == "_handle_message":
+            for stmt in node.body:
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Tuple)
+                ):
+                    names = [getattr(t, "id", None) for t in stmt.targets[0].elts]
+                    if names == ["event", "source", "is_internal"]:
+                        lineno = stmt.end_lineno or stmt.lineno
+                        return lineno, _safe_indent(lines, stmt.lineno - 1)
+    # fallback: 行匹配 event, source, is_internal
+    for i, line in enumerate(lines):
+        if "event, source, is_internal = _admitted" in line or (
+            "event, source, is_internal" in line and "=" in line
+        ):
+            return _line_after(lines, i)
+    return None
+
+
+# ── run_startup.py (GatewayStartupMixin) 定位 ────────────────────────────────
+
+def _find_adapter_init_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    """Locate the gateway:startup emit statement end — insert right after it."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Await):
+            continue
+        call = node.value
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)):
+            continue
+        if call.func.attr != "emit":
+            continue
+        if not (call.args and isinstance(call.args[0], ast.Constant) and call.args[0].value == "gateway:startup"):
+            continue
+        end = node.end_lineno or call.lineno
+        insert_line = end
+        if insert_line >= len(lines):
+            insert_line = len(lines) - 1
+        indent = _safe_indent(lines, insert_line)
+        return insert_line, indent
+    # fallback 字符串
+    for i, line in enumerate(lines):
+        if 'hooks.emit("gateway:startup"' in line:
+            # 多行调用：在 emit 语句块内找到收尾括号行即可（约 8 行内）。
+            for j in range(i, min(i + 8, len(lines))):
+                stripped = lines[j].strip()
+                if stripped.endswith(")"):
+                    return _line_after(lines, j)
+            indent = _safe_indent(lines, i)
+            return i, indent
+    return None
+
+
+# ── run_notifications.py (GatewayNotificationsMixin) 定位 ────────────────────
+
+def _find_bg_watcher_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    """_send_watcher_message 方法尾（finished/running 两分支都经此发送）。"""
+    return _find_method_last_stmt(tree, lines, "_send_watcher_message")
+
+
+def _guard_line_for_branch(lines: list[str], inject_idx: int) -> int | None:
+    """在 inject_idx 之后找要改写的 ``if adapter and chat_id:`` 行索引（旧版专用）。"""
+    for j in range(inject_idx, min(inject_idx + 30, len(lines))):
+        if lines[j].strip() == "if adapter and chat_id:":
+            return j
+    return None
+
+
+def _apply_bg_watcher_guard(lines: list[str], inject_idx: int) -> list[str]:
+    """把原 ``if adapter and chat_id:`` 改写为 ``if adapter and chat_id and not _hermes_lark_bg_handled:``."""
+    for j in range(inject_idx, min(inject_idx + 30, len(lines))):
+        if lines[j].strip() == "if adapter and chat_id:":
+            indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
+            lines[j] = f"{indent}if adapter and chat_id and not _hermes_lark_bg_handled:\n"
+            return lines
+    return lines
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Patcher — 多文件目标管理
+# ════════════════════════════════════════════════════════════════════════════
+
+
 class Patcher:
-    """管理 AST 注入的安装和移除."""
+    """管理 AST 注入的安装和移除（Hermes ≥0.21 多文件架构）。"""
 
     MARKERS: list[tuple[str, str]] = MARKERS
 
     def __init__(self, run_path: Path | None = None) -> None:
+        # 兼容旧签名：run_path 传入时只影响 run.py 目标；默认自动探测形态。
+        # 新版按文件收集目标。找不到主文件时仍报错提示。
         self.run_path = run_path or _default_run_path()
-        if not self.run_path.exists():
+        if not (self.run_path.exists() or _default_turn_path().exists()):
             tried = ", ".join(str(r) for r in _code_roots())
             raise PatcherError(
-                f"gateway/run.py not found: {self.run_path} "
-                f"(tried: {tried}). "
+                f"gateway files not found (tried: {tried}). "
                 f"Set HERMES_HOME to the dir containing hermes-agent/ and rerun."
             )
+        # 形态探测：新版特征 = gateway/run_turn.py 存在且含 class GatewayTurnMixin
+        # （旧版单文件 run.py 无 sibling）。用文件存在性而非 run.py 内容，避免
+        # facade import/注释里的函数名字样误判。
+        self.is_legacy_layout = True
+        turn_path = _default_turn_path()
+        if turn_path.exists():
+            try:
+                turn_content = turn_path.read_text(encoding="utf-8")
+                if "class GatewayTurnMixin" in turn_content:
+                    self.is_legacy_layout = False
+            except OSError:
+                pass
+        self.targets: list[Path] = self._collect_targets()
+
+    def _collect_targets(self) -> list[Path]:
+        if self.is_legacy_layout:
+            return [self.run_path]
+        paths = [
+            _default_turn_path(),
+            _default_turn_runner_path(),
+            _default_inbound_path(),
+            _default_startup_path(),
+            _default_notif_path(),
+        ]
+        return [p for p in paths if p.exists()]
+
+    def _all_target_contents(self) -> dict[Path, str]:
+        out: dict[Path, str] = {}
+        for p in self.targets:
+            with contextlib.suppress(OSError):
+                out[p] = p.read_text(encoding="utf-8")
+        return out
 
     def is_patched(self) -> bool:
-        return MK_START in self.run_path.read_text(encoding="utf-8")
+        return any(
+            MK_START in content or MK_ANSWER_GUARD in content or MK_CRON_DELIVER in content
+            for content in self._all_target_contents().values()
+        )
 
     def is_fully_patched(self) -> bool:
-        content = self.run_path.read_text(encoding="utf-8")
-        return all(begin in content and end in content for begin, end in self.MARKERS)
+        contents = self._all_target_contents()
+        all_text = "\n".join(contents.values()) if contents else ""
+        return all(begin in all_text and end in all_text for begin, end in self.MARKERS)
+
+    # ── verify ────────────────────────────────────────────────────────────
 
     def verify_target(self) -> None:
+        # 已完整补丁的文件是"产物"：marker 齐全本身就是兼容证据（注入时已对干净
+        # 文件验证过锚点）。若在此状态重跑定位器会失败——注入代码（如 followup
+        # boundary hook）会插入到两个锚点行之间，破坏 finder 的行间扫描。升级覆盖
+        # 文件会清掉 marker → is_fully_patched False → 走完整验证。
+        if self.is_fully_patched():
+            return
+        if self.is_legacy_layout:
+            self._verify_legacy()
+            return
+        self._verify_turn()
+        self._verify_runner()
+        self._verify_inbound()
+        self._verify_startup()
+        self._verify_notifications()
+        self._verify_cron()
+
+    def _parse(self, path: Path) -> tuple[ast.Module, list[str]]:
+        content = path.read_text(encoding="utf-8")
+        return ast.parse(content), content.splitlines(keepends=True)
+
+    def _require_found(self, label: str, loc: tuple[int, str] | None) -> None:
+        if loc is None:
+            raise PatcherError(f"Cannot find {label} injection site — Hermes version may be incompatible")
+
+    def _verify_turn(self) -> None:
+        p = _default_turn_path()
+        if not p.exists():
+            raise PatcherError(f"Cannot find {p} — Hermes version may be incompatible")
+        tree, lines = self._parse(p)
+        self._require_found("start", _find_turn_start_site(tree, lines))
+        self._require_found("complete", _find_turn_complete_site(tree, lines))
+        self._require_found("abort", _find_turn_abort_site(tree, lines))
+        self._require_found("bg_deliver", _find_turn_bg_deliver_site(tree, lines))
+        self._require_found("queued followup result", _find_turn_queued_followup_return_site(tree, lines))
+        self._require_found(
+            "queued followup boundary", _find_turn_followup_boundary_site(tree, lines)
+        )
+        self._require_found("interrupt", _find_turn_interrupt_site(tree, lines))
+        # 字符串锚点存在性
+        content = "\n".join(lines)
+        for needle, label in (
+            ("_handle_message_with_agent", "turn handler"),
+            ("_hmwa_deliver_turn_response", "turn deliver"),
+            ("_run_background_task_inner", "bg task"),
+            ("_preserve_queued_followup_history_offset", "followup return"),
+            ("_run_agent_queued_followup", "queued followup"),
+        ):
+            if needle not in content:
+                raise PatcherError(f"Cannot find {label} in run_turn.py — Hermes version may be incompatible")
+
+    def _verify_runner(self) -> None:
+        p = _default_turn_runner_path()
+        if not p.exists():
+            raise PatcherError(f"Cannot find {p} — Hermes version may be incompatible")
+        tree, lines = self._parse(p)
+        self._require_found("wire_callbacks tail", _find_runner_wire_site(tree, lines))
+        content = "\n".join(lines)
+        for needle, label in (
+            ("def _wire_turn_agent_callbacks", "wire callbacks"),
+            ("agent.stream_delta_callback = stream_delta_cb", "stream_delta assign"),
+            ("agent.background_review_callback, bg_release = self._make_bg_review_callbacks()", "bg review assign"),
+        ):
+            if needle not in content:
+                raise PatcherError(f"Cannot find {label} in run_turn_runner.py — Hermes version may be incompatible")
+
+    def _verify_inbound(self) -> None:
+        p = _default_inbound_path()
+        if not p.exists():
+            raise PatcherError(f"Cannot find {p} — Hermes version may be incompatible")
+        tree, lines = self._parse(p)
+        self._require_found("normalize", _find_inbound_normalize_site(tree, lines))
+        content = "\n".join(lines)
+        if "def _handle_message" not in content:
+            raise PatcherError("Cannot find _handle_message in run_inbound.py — Hermes version may be incompatible")
+
+    def _verify_startup(self) -> None:
+        p = _default_startup_path()
+        if not p.exists():
+            raise PatcherError(f"Cannot find {p} — Hermes version may be incompatible")
+        tree, lines = self._parse(p)
+        self._require_found("adapter_init", _find_adapter_init_site(tree, lines))
+
+    def _verify_notifications(self) -> None:
+        p = _default_notif_path()
+        if not p.exists():
+            raise PatcherError(f"Cannot find {p} — Hermes version may be incompatible")
+        tree, lines = self._parse(p)
+        self._require_found("bg_watcher", _find_bg_watcher_site(tree, lines))
+        content = "\n".join(lines)
+        if "def _send_watcher_message" not in content:
+            raise PatcherError(
+                "Cannot find _send_watcher_message in run_notifications.py — "
+                "Hermes version may be incompatible"
+            )
+
+    def _verify_cron(self) -> None:
+        p = _default_cron_path()
+        if not p.exists():
+            raise PatcherError(f"Cannot find {p} — Hermes version may be incompatible")
+        content = p.read_text(encoding="utf-8")
+        for needle, label in (
+            ("def _deliver_result", "deliver_result"),
+            ("for target in targets:", "delivery loop"),
+            ("cleaned_delivery_content", "cleaned_delivery_content"),
+        ):
+            if needle not in content:
+                raise PatcherError(f"Cannot find {label} in scheduler_delivery.py — Hermes version may be incompatible")
+
+    def _verify_legacy(self) -> None:
         content = self.run_path.read_text(encoding="utf-8")
         tree = ast.parse(content)
 
-        handler = _find_func_body(tree, content.splitlines(keepends=True), "_handle_message_with_agent")
+        handler = _find_method_first_stmt(tree, content.splitlines(keepends=True), "_handle_message_with_agent")
         if handler is None:
             raise PatcherError("Cannot find _handle_message_with_agent in run.py — Hermes version may be incompatible")
 
@@ -724,123 +1220,244 @@ class Patcher:
                         break
         if not anchor_found:
             raise PatcherError(
-                "Cannot find hooks.emit('agent:end', ...) anchor in run.py — Hermes version may be incompatible"
+                "Cannot find hooks.emit('agent:end', ...) anchor in run.py — "
+                "Hermes version may be incompatible"
             )
 
-        required_callbacks = {
-            "progress_callback": False,
-            "_stream_delta_cb": False,
-            "_interim_assistant_cb": False,
-        }
+        required_callbacks = {"progress_callback": False, "_stream_delta_cb": False, "_interim_assistant_cb": False}
         for node in ast.walk(tree):
             if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name in required_callbacks:
                 required_callbacks[node.name] = True
         missing = [name for name, found in required_callbacks.items() if not found]
         if missing:
             raise PatcherError(
-                f"Missing injection targets in run.py: {', '.join(missing)} — Hermes version may be incompatible"
+                f"Missing injection targets in run.py: {', '.join(missing)} — "
+                "Hermes version may be incompatible"
             )
 
-        # 字符串锚点检查：primary 命中或任一 fallback 命中即可。
-        for primary, fallbacks, label in _ANCHOR_CHECKS:
-            if primary in content or any(fb in content for fb in fallbacks):
-                continue
-            raise PatcherError(f"Cannot find {label} anchor in run.py — Hermes version may be incompatible")
+        for needle, label in (
+            ("_already_sent = bool(", "complete"),
+            ("Discarding stale agent result", "abort"),
+            ('self.hooks.emit("gateway:startup"', "gateway startup emit"),
+        ):
+            if needle not in content:
+                raise PatcherError(f"Cannot find {label} anchor in run.py — Hermes version may be incompatible")
 
-        normalize_site = _find_handle_message_source_site(tree, content.splitlines(keepends=True))
-        if normalize_site is None:
-            raise PatcherError(
-                "Cannot find _handle_message source anchor in run.py — Hermes version may be incompatible"
-            )
+    # ── apply / remove ────────────────────────────────────────────────────
 
     def apply(self) -> None:
         if self.is_fully_patched():
             return
-
+        # 部分补丁（某些文件已注入、某些没有）先清理再统一重打；清理后 verify
+        # 的是干净文件，锚点定位不受残留 marker 影响。
+        if self.is_patched() and not self.is_fully_patched():
+            self._remove_new_layout() if not self.is_legacy_layout else self._remove_legacy()
         self.verify_target()
+        if self.is_legacy_layout:
+            self._apply_legacy()
+            return
+        self._apply_new_layout()
+
+    def remove(self) -> None:
+        if self.is_legacy_layout:
+            self._remove_legacy()
+            return
+        self._remove_new_layout()
+
+    def _apply_new_layout(self) -> None:
+        for p in self.targets:
+            content = p.read_text(encoding="utf-8")
+            had_patch = any(begin in content for begin, _ in self.MARKERS)
+            if not had_patch:
+                backup = p.with_suffix(p.suffix + _BACKUP_SUFFIX)
+                if not backup.exists():
+                    shutil.copy2(p, backup)
+            for begin, end in self.MARKERS:
+                content = _remove_block(content, begin, end)
+            content = self._inject_target(p, content)
+            _atomic_write(p, content)
+
+    def _remove_new_layout(self) -> None:
+        for p in self.targets:
+            content = p.read_text(encoding="utf-8")
+            new_content = content
+            for begin, end in self.MARKERS:
+                new_content = _remove_block(new_content, begin, end)
+            if new_content != content:
+                _atomic_write(p, new_content)
+
+    def restore(self) -> None:
+        if self.is_legacy_layout:
+            backup = self.run_path.with_suffix(self.run_path.suffix + _BACKUP_SUFFIX)
+            if not backup.exists():
+                raise PatcherError(f"No backup found: {backup}")
+            shutil.copy2(backup, self.run_path)
+            return
+        restored = 0
+        for p in self.targets:
+            backup = p.with_suffix(p.suffix + _BACKUP_SUFFIX)
+            if backup.exists():
+                shutil.copy2(backup, p)
+                restored += 1
+        if restored == 0:
+            raise PatcherError("No backup found for any gateway target")
+
+    def _inject_target(self, path: Path, content: str) -> str:
+        tree = ast.parse(content)
+        lines = content.splitlines(keepends=True)
+        # 每文件独立注入。mode='before' 插到 idx 行之前（lines[idx:idx]）；
+        # mode='after' 插到 idx 行之后（lines[idx+1:idx+1]）。
+        def _insert(idx: int, indent: str, hook: str, mode: str) -> None:
+            at = idx if mode == "before" else idx + 1
+            lines[at:at] = hook.splitlines(keepends=True)
+
+        name = path.name
+        if name == "run_turn.py":
+            sites = [
+                ("bg_deliver", "after", _find_turn_bg_deliver_site(tree, lines), _bg_deliver_hook),
+                ("abort", "before", _find_turn_abort_site(tree, lines), _abort_hook),
+                ("complete", "before", _find_turn_complete_site(tree, lines), _complete_hook),
+                ("start", "before", _find_turn_start_site(tree, lines), _start_hook),
+                (
+                    "followup_complete",
+                    "before",
+                    _find_turn_followup_boundary_site(tree, lines),
+                    _followup_complete_hook_v2,
+                ),
+                ("interrupt", "before", _find_turn_interrupt_site(tree, lines), _interrupt_hook_v2),
+                (
+                    "followup_result",
+                    "before",
+                    _find_turn_queued_followup_return_site(tree, lines),
+                    _followup_result_hook,
+                ),
+            ]
+        elif name == "run_turn_runner.py":
+            sites = [
+                # 5 个流式 hook 收敛到 _wire_turn_agent_callbacks 方法尾（after）。
+                ("reasoning", "after", _find_runner_wire_site(tree, lines), _reasoning_hook),
+                ("thinking", "after", _find_runner_wire_site(tree, lines), _thinking_hook),
+                ("answer_guard", "after", _find_runner_wire_site(tree, lines), _answer_guard_hook),
+                ("answer", "after", _find_runner_wire_site(tree, lines), _answer_hook),
+                ("tool", "after", _find_runner_wire_site(tree, lines), _tool_hook),
+                (
+                    "background_review",
+                    "after",
+                    _find_runner_wire_site(tree, lines),
+                    _background_review_hook,
+                ),
+            ]
+        elif name == "run_inbound.py":
+            sites = [
+                ("normalize", "before", _find_inbound_normalize_site(tree, lines), _feishu_normalize_hook),
+            ]
+        elif name == "run_startup.py":
+            sites = [
+                ("adapter_init", "before", _find_adapter_init_site(tree, lines), _adapter_init_hook),
+            ]
+        elif name == "run_notifications.py":
+            sites = [
+                ("bg_watcher_running", "after", _find_bg_watcher_site(tree, lines), _bg_watcher_running_hook),
+                ("bg_watcher_finished", "after", _find_bg_watcher_site(tree, lines), _bg_watcher_finished_hook),
+            ]
+        else:
+            sites = []
+
+        # 多个 hook 落在同一行时（runner 尾 5 处、notif 尾 2 处），must 保证稳定顺序：
+        # 逆序插入（后插的在前，最终顺序与 sites 顺序相反 → 定义时把想先执行的放最后）。
+        # runner 期望顺序: tool → answer_guard → thinking → reasoning → background_review；
+        # notif 期望顺序: finished → running。
+        # 同 idx+同 mode 的多段归为一组、按期望顺序拼接后一次插入，避免逐段插入
+        # 时顺序反转/交错。组内顺序 = sites 定义顺序（先定义的先执行）。
+        for hook_name, _mode, loc, _fn in sites:
+            if loc is None:
+                raise PatcherError(
+                    f"Cannot locate {hook_name} injection site in {name} — Hermes version may be incompatible"
+                )
+        groups: dict[tuple[int, str], list[str]] = {}
+        group_indent: dict[tuple[int, str], str] = {}
+        for _hook_name, mode, loc, fn in sites:
+            if loc is None:  # pragma: no cover — 上面已校验
+                continue
+            idx, indent = loc
+            key = (idx, mode)
+            groups.setdefault(key, []).append(fn(indent))
+            group_indent.setdefault(key, indent)
+        # 不同插入点必须从文件尾部往前插（行号才不会因前面插入而漂移）。
+        for key in sorted(groups, key=lambda k: k[0], reverse=True):
+            idx, mode = key
+            # hook 文本自带换行（_make_hook 每行拼 indent+\n），直接拼接不要加 \n，
+            # 否则块间多出空行、remove 后残留。
+            block = "".join(groups[key])
+            _insert(idx, group_indent[key], block, mode)
+        return "".join(lines)
+
+    def _apply_legacy(self) -> None:
         content = self.run_path.read_text(encoding="utf-8")
-        if self.is_patched():
-            # 重新打补丁：还原 bg_watcher 改写的守卫行，再移除所有 marker 块。
+        had_patch = any(begin in content for begin, _ in self.MARKERS)
+        if had_patch:
             content = content.replace(
-                "if adapter and chat_id and not _hermes_lark_bg_handled:",
-                "if adapter and chat_id:",
+                "if adapter and chat_id and not _hermes_lark_bg_handled:", "if adapter and chat_id:"
             )
             for begin, end in self.MARKERS:
                 content = _remove_block(content, begin, end)
         else:
             self._backup()
-        content = self._inject_all(content)
+        content = self._inject_legacy(content)
         _atomic_write(self.run_path, content)
 
-    def remove(self) -> None:
+    def _remove_legacy(self) -> None:
         content = self.run_path.read_text(encoding="utf-8")
         if not any(begin in content for begin, _ in self.MARKERS):
             return
-        # 先还原 bg_watcher 改写的守卫行（只匹配带 _hermes_lark_bg_handled 的），
-        # 再移除所有 marker 块。
-        content = content.replace(
-            "if adapter and chat_id and not _hermes_lark_bg_handled:",
-            "if adapter and chat_id:",
-        )
+        content = content.replace("if adapter and chat_id and not _hermes_lark_bg_handled:", "if adapter and chat_id:")
         for begin, end in self.MARKERS:
             content = _remove_block(content, begin, end)
         _atomic_write(self.run_path, content)
-
-    def restore(self) -> None:
-        backup = self.run_path.with_suffix(self.run_path.suffix + _BACKUP_SUFFIX)
-        if not backup.exists():
-            raise PatcherError(f"No backup found: {backup}")
-        shutil.copy2(backup, self.run_path)
 
     def _backup(self) -> None:
         backup = self.run_path.with_suffix(self.run_path.suffix + _BACKUP_SUFFIX)
         if not backup.exists():
             shutil.copy2(self.run_path, backup)
 
-    def _inject_all(self, content: str) -> str:
+    def _inject_legacy(self, content: str) -> str:
         tree = ast.parse(content)
         lines = content.splitlines(keepends=True)
 
+        def _loc(needle: str, after: int = 0) -> tuple[int, str] | None:
+            for i, line in enumerate(lines):
+                if needle in line:
+                    idx = i + after
+                    return idx, _safe_indent(lines, idx)
+            return None
+
         hook_defs: list[tuple[str, str, tuple[int, str] | None]] = [
-            ("normalize", "normalize", _find_handle_message_source_site(tree, lines)),
-            ("start", "start", _find_func_body(tree, lines, "_handle_message_with_agent")),
-            ("complete", "complete", _find_handler_return(tree, lines)),
-            ("followup_complete", "followup_complete", _find_followup_complete_site(tree, lines)),
-            ("followup_result", "followup_result", _find_followup_result_site(tree, lines)),
-            ("abort", "abort", _find_handler_abort(tree, lines)),
-            ("interrupt", "interrupt", _find_interrupt_site(tree, lines)),
-            ("tool", "tool", _find_func_body(tree, lines, "progress_callback")),
-            ("answer", "answer", _find_func_body(tree, lines, "_stream_delta_cb")),
-            ("answer_guard", "answer_guard", _find_stream_delta_assign(tree, lines)),
-            ("thinking", "thinking", _find_func_body(tree, lines, "_interim_assistant_cb")),
-            ("reasoning", "reasoning", _find_reasoning_site(tree, lines)),
-            ("background_review", "background_review", _find_background_review_site(tree, lines)),
-            ("bg_deliver", "bg_deliver", _find_bg_deliver_site(tree, lines)),
+            ("normalize", "normalize", _loc("source = event.source")),
+            ("start", "start", _find_method_first_stmt(tree, lines, "_handle_message_with_agent")),
+            ("complete", "complete", _loc("_already_sent = bool(")),
+            ("abort", "abort", _loc("Discarding stale agent result")),
+            ("tool", "tool", _find_method_first_stmt(tree, lines, "progress_callback")),
+            ("answer", "answer", _find_method_first_stmt(tree, lines, "_stream_delta_cb")),
+            ("answer_guard", "answer_guard", _loc("agent.stream_delta_callback = _stream_delta_cb")),
+            ("thinking", "thinking", _find_method_first_stmt(tree, lines, "_interim_assistant_cb")),
+            ("reasoning", "reasoning", _loc("agent.reasoning_config = reasoning_config")),
+            (
+                "background_review",
+                "background_review",
+                _loc("agent.background_review_callback = _bg_review_send"),
+            ),
+            ("bg_deliver", "bg_deliver", _loc("images, text_content = adapter.extract_images(response)")),
             ("adapter_init", "adapter_init", _find_adapter_init_site(tree, lines)),
-            ("bg_watcher_finished", "bg_watcher_finished", _find_bg_watcher_branch(lines, "finished with exit code")),
-            ("bg_watcher_running", "bg_watcher_running", _find_bg_watcher_branch(lines, "is still running~")),
+            ("bg_watcher_finished", "bg_watcher_finished", _loc("finished with exit code")),
+            ("bg_watcher_running", "bg_watcher_running", _loc("is still running~")),
         ]
-
-        sites: list[tuple[int, str, str]] = []
-        for hook_fn_name, name, loc in hook_defs:
-            if loc is None:
-                # 定位失败硬失败，不静默跳过（防位置漂移致重复消息）
-                raise PatcherError(
-                    f"Cannot locate {name} injection site — Hermes version may be incompatible"
-                )
-            sites.append((loc[0], loc[1], hook_fn_name))
-
-        sites.sort(key=lambda x: x[0], reverse=True)
         _HOOK_FNS = {
             "normalize": _feishu_normalize_hook,
             "start": _start_hook,
             "complete": _complete_hook,
-            "followup_complete": _followup_complete_hook,
-            "followup_result": _followup_result_hook,
             "abort": _abort_hook,
-            "interrupt": _interrupt_hook,
             "tool": _tool_hook,
-            "answer": _answer_hook,
+            "answer": _answer_guard_hook,
             "answer_guard": _answer_guard_hook,
             "thinking": _thinking_hook,
             "reasoning": _reasoning_hook,
@@ -850,288 +1467,58 @@ class Patcher:
             "bg_watcher_finished": _bg_watcher_finished_hook,
             "bg_watcher_running": _bg_watcher_running_hook,
         }
+        sites: list[tuple[int, str, str]] = []
+        for hook_fn_name, name, loc in hook_defs:
+            if loc is None:
+                raise PatcherError(f"Cannot locate {name} injection site — Hermes version may be incompatible")
+            sites.append((loc[0], loc[1], hook_fn_name))
+        sites.sort(key=lambda x: x[0], reverse=True)
         for idx, indent, fn_name in sites:
             hook = _HOOK_FNS[fn_name](indent)
             lines[idx:idx] = hook.splitlines(keepends=True)
-
-        # bg_watcher 两处：插入的 hook 设了 _hermes_lark_bg_handled，需把原
-        # ``if adapter and chat_id:`` 守卫改成 ``... and not _hermes_lark_bg_handled``
-        # 以跳过原 adapter.send（handled=True 时不重复发纯文本）。两处都要在 hook
-        # 注入点之前初始化 _hermes_lark_bg_handled=False。
-        content = "".join(lines)
-        lines = content.splitlines(keepends=True)
-        lines = _apply_bg_watcher_guard(lines, "finished with exit code")
-        lines = _apply_bg_watcher_guard(lines, "is still running~")
-
         return "".join(lines)
 
 
-def _find_func_body(tree: ast.Module, lines: list[str], name: str) -> tuple[int, str] | None:
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == name:
-            body = node.body
-            start = 0
-            if (
-                body
-                and isinstance(body[0], ast.Expr)
-                and isinstance(body[0].value, ast.Constant)
-                and isinstance(body[0].value.value, str)
-            ):
-                start = 1
-            if start < len(body):
-                lineno = body[start].lineno - 1
-                indent = _safe_indent(lines, lineno)
-                return lineno, indent
-    return None
-
-
-def _find_stream_delta_assign(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
-    """定位 ``agent.stream_delta_callback = _stream_delta_cb`` 赋值行。
-
-    用 AST 找赋值语句（比字符串匹配稳，可跳过注释/字符串里的同名文本），
-    返回该行（0-indexed）与缩进，注入点插在这一行之前。
-    """
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Attribute):
-            continue
-        attr = node.targets[0]
-        if attr.attr != "stream_delta_callback":
-            continue
-        value = node.value
-        if not (isinstance(value, ast.Name) and value.id == "_stream_delta_cb"):
-            continue
-        lineno = node.lineno - 1
-        indent = _safe_indent(lines, lineno)
-        return lineno, indent
-    return None
-
-
-def _find_adapter_init_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
-    """Locate the ``gateway:startup`` emit in start() — AFTER all adapters connect.
-
-    Returns the line index + indent right after the emit STATEMENT, where the
-    hook can access ``self.adapters`` (all adapters connected, event handlers
-    built). Must insert after the full ``await self.hooks.emit("gateway:startup",
-    {...})`` statement — the call spans multiple lines and the dict's inner ``)``
-    must not be mistaken for the statement end.
-    """
-    start_node: ast.AsyncFunctionDef | None = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "start":
-            start_node = node
-            break
-    if start_node is None:
-        return None
-
-    # Walk start()'s direct statements to find the Expr containing the emit call.
-    # Using AST end_lineno gives the true statement end (robust to nested parens).
-    for stmt in ast.walk(start_node):
-        if not isinstance(stmt, ast.Await):
-            continue
-        call = stmt.value
-        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)):
-            continue
-        if call.func.attr != "emit":
-            continue
-        # Check first arg is the "gateway:startup" string
-        if not (call.args and isinstance(call.args[0], ast.Constant) and call.args[0].value == "gateway:startup"):
-            continue
-        end = stmt.end_lineno or call.lineno
-        # Insert on the line AFTER the statement ends.
-        insert_line = end  # 0-indexed = end_lineno (1-indexed)
-        if insert_line >= len(lines):
-            insert_line = len(lines) - 1
-        indent = _safe_indent(lines, insert_line)
-        return insert_line, indent
-    return None
-
-
-def _find_handle_message_source_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_message":
-            for stmt in node.body:
-                if (
-                    isinstance(stmt, ast.Assign)
-                    and len(stmt.targets) == 1
-                    and isinstance(stmt.targets[0], ast.Name)
-                    and stmt.targets[0].id == "source"
-                    and isinstance(stmt.value, ast.Attribute)
-                    and stmt.value.attr == "source"
-                    and isinstance(stmt.value.value, ast.Name)
-                    and stmt.value.value.id == "event"
-                ):
-                    lineno = stmt.end_lineno or stmt.lineno
-                    return lineno, _safe_indent(lines, stmt.lineno - 1)
-    return None
-
-
-def _find_handler_return(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("_already_sent = bool("):
-            indent = _safe_indent(lines, i)
-            return i, indent
-
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == "_handle_message_with_agent":
-            returns = [
-                n
-                for n in ast.walk(node)
-                if isinstance(n, ast.Return)
-                and isinstance(n.value, ast.Name)
-                and n.value.id == "response"
-                and n.lineno is not None
-            ]
-            if returns:
-                target = max(returns, key=lambda x: x.lineno)
-                lineno = target.lineno - 1
-                indent = _safe_indent(lines, lineno)
-                return lineno, indent
-    return None
-
-
-def _find_handler_abort(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
-    for i, line in enumerate(lines):
-        if "Discarding stale agent result" in line:
-            for j in range(i + 1, min(i + 20, len(lines))):
-                if lines[j].strip() == "return None":
-                    indent = _safe_indent(lines, j)
-                    return j, indent
-            break
-    return None
-
-
-def _find_interrupt_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
-    for i, line in enumerate(lines):
-        if "Restart typing indicator so the user sees activity" in line:
-            indent = _safe_indent(lines, i)
-            return i, indent
-    return None
-
-
-def _find_followup_complete_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
-    for i, line in enumerate(lines):
-        if line.strip() == 'was_interrupted = result.get("interrupted")':
-            return i, _safe_indent(lines, i)
-    return None
-
-
-def _find_followup_result_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
-    for i, line in enumerate(lines):
-        if line.strip() == "return _preserve_queued_followup_history_offset(result, followup_result)":
-            return i, _safe_indent(lines, i)
-    return None
-
-
-def _find_reasoning_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
-    for i, line in enumerate(lines):
-        if line.strip() == "agent.reasoning_config = reasoning_config":
-            return i + 1, _safe_indent(lines, i)
-    return None
-
-
-def _find_background_review_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
-    for i, line in enumerate(lines):
-        if line.strip() == "agent.background_review_callback = _bg_review_send":
-            return i + 1, _safe_indent(lines, i)
-    return None
-
-
-def _find_bg_deliver_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
-    for i, line in enumerate(lines):
-        if line.strip() == "images, text_content = adapter.extract_images(response)":
-            return i + 1, _safe_indent(lines, i)
-    return None
-
-
-def _find_bg_watcher_branch(lines: list[str], trigger: str) -> tuple[int, str] | None:
-    """定位 _run_process_watcher 内 watcher 通知分支（finished / running）。
-
-    两处结构相同：先 ``message_text = (...)``（含 trigger 字符串），
-    再 ``adapter = None`` → for 找 adapter → ``if adapter and chat_id:`` → adapter.send。
-    返回 ``adapter = None`` 那一行的索引 + 缩进（hook 注入于此行前，
-    并把紧随其后的 ``if adapter and chat_id:`` 改写加 ``_hermes_lark_bg_handled`` 守卫）。
-    """
-    trig_idx = None
-    for i, line in enumerate(lines):
-        if trigger in line:
-            trig_idx = i
-            break
-    if trig_idx is None:
-        return None
-    # 从 trigger 往下找 adapter = None（应在 30 行内）。
-    for j in range(trig_idx, min(trig_idx + 40, len(lines))):
-        if lines[j].strip() == "adapter = None":
-            indent = _safe_indent(lines, j)
-            return j, indent
-    return None
-
-
-def _guard_line_for_branch(lines: list[str], inject_idx: int) -> int | None:
-    """在 inject_idx（adapter=None）之后找要改写的 ``if adapter and chat_id:`` 行索引."""
-    for j in range(inject_idx, min(inject_idx + 30, len(lines))):
-        if lines[j].strip() == "if adapter and chat_id:":
-            return j
-    return None
-
-
-def _apply_bg_watcher_guard(lines: list[str], trigger: str) -> list[str]:
-    """把 trigger 分支里原 ``if adapter and chat_id:`` 改写为
-    ``if adapter and chat_id and not _hermes_lark_bg_handled:``.
-
-    hook 已注入并初始化 ``_hermes_lark_bg_handled``，handled 时此处跳过原 adapter.send
-    纯文本发送（cheerwhy 已接管发卡片）。只改第一个匹配行（本分支的）。
-    """
-    trig_idx = None
-    for i, line in enumerate(lines):
-        if trigger in line:
-            trig_idx = i
-            break
-    if trig_idx is None:
-        return lines
-    for j in range(trig_idx, min(trig_idx + 60, len(lines))):
-        if lines[j].strip() == "if adapter and chat_id:":
-            indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
-            lines[j] = f"{indent}if adapter and chat_id and not _hermes_lark_bg_handled:\n"
-            return lines
-    return lines
-
-
-def _safe_indent(lines: list[str], lineno: int) -> str:
-    """获取缩进，跳过空行."""
-    for i in range(lineno, -1, -1):
-        if 0 <= i < len(lines) and lines[i].strip():
-            return lines[i][: len(lines[i]) - len(lines[i].lstrip())]
-    for i in range(lineno + 1, len(lines)):
-        if lines[i].strip():
-            return lines[i][: len(lines[i]) - len(lines[i].lstrip())]
-    return ""
+# ════════════════════════════════════════════════════════════════════════════
+# CronPatcher — cron/scheduler_delivery.py（0.21 拆出）或旧 scheduler.py
+# ════════════════════════════════════════════════════════════════════════════
 
 
 class CronPatcher:
-    """注入 CRON_DELIVER hook 到 cron/scheduler.py 的 _deliver_result."""
+    """注入 CRON_DELIVER hook 到 cron 的 _deliver_result（0.21+ 在 scheduler_delivery.py）。"""
 
     def __init__(self, cron_path: Path | None = None) -> None:
         self.cron_path = cron_path or _default_cron_path()
         if not self.cron_path.exists():
-            tried = ", ".join(str(r) for r in _code_roots())
-            raise PatcherError(
-                f"cron/scheduler.py not found: {self.cron_path} "
-                f"(tried: {tried}). "
-                f"Set HERMES_HOME to the dir containing hermes-agent/ and rerun."
-            )
+            # 回退旧布局（升级前残留的 scheduler.py 单文件形态）
+            legacy = _resolve_module_path("cron.scheduler", _code_roots())
+            if legacy.exists() and "delivered = False" in legacy.read_text(encoding="utf-8", errors="ignore"):
+                self.cron_path = legacy
+                self.legacy = True
+            else:
+                tried = ", ".join(str(r) for r in _code_roots())
+                raise PatcherError(
+                    f"cron delivery file not found: {self.cron_path} "
+                    f"(tried: {tried}). Set HERMES_HOME to the dir containing hermes-agent/ and rerun."
+                )
+        else:
+            self.legacy = False
 
     def is_patched(self) -> bool:
         return MK_CRON_DELIVER in self.cron_path.read_text(encoding="utf-8")
 
     def verify_target(self) -> None:
         content = self.cron_path.read_text(encoding="utf-8")
-        if "delivered = False" not in content:
-            raise PatcherError("Cannot find 'delivered = False' anchor in scheduler.py")
+        if "def _deliver_result" not in content:
+            raise PatcherError("Cannot find _deliver_result anchor in cron delivery file")
         if "cleaned_delivery_content" not in content:
-            raise PatcherError("Cannot find 'cleaned_delivery_content' in scheduler.py")
+            raise PatcherError("Cannot find 'cleaned_delivery_content' in cron delivery file")
+        if self.legacy:
+            if "delivered = False" not in content:
+                raise PatcherError("Cannot find 'delivered = False' anchor in scheduler.py")
+        else:
+            if "for target in targets:" not in content:
+                raise PatcherError("Cannot find 'for target in targets:' in scheduler_delivery.py")
 
     def apply(self) -> None:
         if self.is_patched():
@@ -1141,15 +1528,41 @@ class CronPatcher:
         lines = self.cron_path.read_text(encoding="utf-8").splitlines(keepends=True)
 
         inject_idx = None
-        for i, line in enumerate(lines):
-            if line.strip() == "delivered = False":
-                inject_idx = i
-                break
+        if self.legacy:
+            for i, line in enumerate(lines):
+                if line.strip() == "delivered = False":
+                    inject_idx = i
+                    break
+        else:
+            for i, line in enumerate(lines):
+                if "for target in targets:" in line:
+                    inject_idx = i
+                    break
         if inject_idx is None:
-            raise PatcherError("Cannot find 'delivered = False' anchor")
+            raise PatcherError("Cannot find cron injection anchor")
 
         indent = _safe_indent(lines, inject_idx)
+        if not self.legacy:
+            # 新版注入在 for 循环体起点：hook 需要循环体缩进（for 缩进 + 4）。
+            indent = indent + "    "
         hook = _cron_deliver_hook(indent)
+        # 新版：hook 引用了 _hermes_lark_cron_target_feishu helper —— 需要模块级注入一次。
+        if not self.legacy:
+            content = "".join(lines)
+            if "_hermes_lark_cron_target_feishu" not in content:
+                helper = (
+                    "\n\ndef _hermes_lark_cron_target_feishu(target) -> bool:\n"
+                    "    try:\n"
+                    "        plat = target.get('platform')\n"
+                    "        if plat is None:\n"
+                    "            return False\n"
+                    "        val = getattr(plat, 'value', plat)\n"
+                    "        return str(val).lower() in ('feishu', 'lark')\n"
+                    "    except Exception:\n"
+                    "        return False\n"
+                )
+                content += helper
+                lines = content.splitlines(keepends=True)
         lines[inject_idx + 1 : inject_idx + 1] = hook.splitlines(keepends=True)
         _atomic_write(self.cron_path, "".join(lines))
 
@@ -1158,6 +1571,28 @@ class CronPatcher:
         if MK_CRON_DELIVER not in content:
             return
         content = _remove_block(content, MK_CRON_DELIVER, MK_CRON_DELIVER_END)
+        if not self.legacy:
+            # 同步移除 apply 追加到文件尾的 platform-helper（精确匹配整段，防误删同名用户代码）。
+            helper_tail = (
+                "\n\ndef _hermes_lark_cron_target_feishu(target) -> bool:\n"
+                "    try:\n"
+                "        plat = target.get('platform')\n"
+                "        if plat is None:\n"
+                "            return False\n"
+                "        val = getattr(plat, 'value', plat)\n"
+                "        return str(val).lower() in ('feishu', 'lark')\n"
+                "    except Exception:\n"
+                "        return False\n"
+            )
+            if helper_tail in content:
+                content = content.replace(helper_tail, "")
+            # 兜底：单行形态残留（历史版本可能写过不同格式）
+            content = re.sub(
+                r"\n\ndef _hermes_lark_cron_target_feishu\(target\).*?\n    except Exception:\n        return False\n",
+                "",
+                content,
+                flags=re.DOTALL,
+            )
         _atomic_write(self.cron_path, content)
 
     def restore(self) -> None:
