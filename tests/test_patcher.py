@@ -220,6 +220,21 @@ class TestApplyRemove:
             assert begin in content, f"Missing marker: {begin}"
             assert end in content, f"Missing marker: {end}"
 
+    def test_apply_injects_adapter_init_after_startup_emit(self, run_copy: Path) -> None:
+        """ADAPTER_INIT 注入点在 gateway:startup emit 之后（adapter 全 connect 完）."""
+        patcher = _patcher(run_copy)
+        patcher.apply()
+        content = run_copy.read_text(encoding="utf-8")
+        assert "# HERMES_LARK_ADAPTER_INIT_BEGIN" in content
+        assert "patch_feishu_adapter" in content
+        assert "# HERMES_LARK_ADAPTER_INIT_END" in content
+        # 注入块必须在 gateway:startup emit 语句之后
+        init_pos = content.index("# HERMES_LARK_ADAPTER_INIT_BEGIN")
+        emit_pos = content.index('self.hooks.emit("gateway:startup"')
+        assert init_pos > emit_pos
+        # 注入后的 run.py 仍是合法 Python
+        ast.parse(content)
+
     def test_apply_produces_valid_python(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
         patcher.apply()
@@ -320,6 +335,72 @@ class TestApplyRemove:
         assert run_copy.read_text(encoding="utf-8") == original
 
 
+class TestBgWatcherInjection:
+    """注入点 12（background watcher text-only 通知覆盖）拆成 finished/running 两处."""
+
+    def test_apply_injects_both_bg_watcher_markers(self, run_copy: Path) -> None:
+        patcher = _patcher(run_copy)
+        patcher.apply()
+        content = run_copy.read_text(encoding="utf-8")
+        assert "# HERMES_LARK_BG_WATCHER_FINISHED_BEGIN" in content
+        assert "# HERMES_LARK_BG_WATCHER_FINISHED_END" in content
+        assert "# HERMES_LARK_BG_WATCHER_RUNNING_BEGIN" in content
+        assert "# HERMES_LARK_BG_WATCHER_RUNNING_END" in content
+
+    def test_apply_injects_on_bg_watcher_notify_calls(self, run_copy: Path) -> None:
+        patcher = _patcher(run_copy)
+        patcher.apply()
+        content = run_copy.read_text(encoding="utf-8")
+        # 两处注入点各 import + call，≥4 处引用（reinstall 脚本也检查这个阈值）
+        assert content.count("on_bg_watcher_notify") >= 4
+
+    def test_apply_rewrites_both_send_guards(self, run_copy: Path) -> None:
+        patcher = _patcher(run_copy)
+        patcher.apply()
+        content = run_copy.read_text(encoding="utf-8")
+        # finished + running 两处 if adapter and chat_id: 都改成带 _hermes_lark_bg_handled 守卫
+        assert content.count("if adapter and chat_id and not _hermes_lark_bg_handled:") == 2
+        # hook 块内初始化 _hermes_lark_bg_handled = False（两处）
+        assert content.count("_hermes_lark_bg_handled = False") == 2
+
+    def test_apply_finished_guard_before_send(self, run_copy: Path) -> None:
+        """finished 分支：hook 注入在 adapter.send 之前（handled 时跳过原发送）."""
+        patcher = _patcher(run_copy)
+        patcher.apply()
+        content = run_copy.read_text(encoding="utf-8")
+        begin = content.index("# HERMES_LARK_BG_WATCHER_FINISHED_BEGIN")
+        guard = content.index("and not _hermes_lark_bg_handled", begin)
+        # guard 行所在的 if 在 hook 块之后
+        hook_end = content.index("# HERMES_LARK_BG_WATCHER_FINISHED_END", begin)
+        assert guard > hook_end
+
+    def test_apply_produces_valid_python(self, run_copy: Path) -> None:
+        patcher = _patcher(run_copy)
+        patcher.apply()
+        ast.parse(run_copy.read_text(encoding="utf-8"))
+
+    def test_remove_restores_plain_guards(self, run_copy: Path) -> None:
+        patcher = _patcher(run_copy)
+        patcher.apply()
+        patcher.remove()
+        content = run_copy.read_text(encoding="utf-8")
+        # 还原后无 bg_watcher 标记、无 on_bg_watcher_notify、守卫回到原样
+        assert "HERMES_LARK_BG_WATCHER" not in content
+        assert "on_bg_watcher_notify" not in content
+        assert "and not _hermes_lark_bg_handled" not in content
+
+    def test_apply_then_remove_idempotent(self, run_copy: Path) -> None:
+        patcher = _patcher(run_copy)
+        # 先剥掉 sample 可能携带的旧 patch，记为干净基线
+        if patcher.is_patched():
+            patcher.remove()
+        baseline = run_copy.read_text(encoding="utf-8")
+        for _ in range(3):
+            patcher.apply()
+            patcher.remove()
+        assert run_copy.read_text(encoding="utf-8") == baseline
+
+
 class TestBackupRestore:
     def test_backup_created_on_apply(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
@@ -407,7 +488,7 @@ class TestCronApplyRemove:
         sent = []
 
         def fake_on_cron_deliver(
-            *, chat_id, content, loop, task_name, run_time
+            *, chat_id, content, loop, task_name, run_time, job_id
         ):
             sent.append((chat_id, content, task_name, run_time))
             return True
@@ -494,7 +575,7 @@ class TestOnCronDeliverHook:
             assert result is True
             ctrl.on_cron_deliver.assert_called_once_with(
                 chat_id="c1", content="hello", loop=loop,
-                task_name="", run_time="",
+                task_name="", run_time="", job_id="",
             )
 
 

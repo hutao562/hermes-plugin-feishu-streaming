@@ -22,6 +22,8 @@ from .streaming.text import strip_reasoning_tags
 
 _logger = logging.getLogger("hermes_lark_streaming")
 _CARD_CREATION_WAIT_SEC = 10.0
+_ZOMBIE_SCAN_SEC = 30.0  # 僵尸卡守护扫描间隔
+_ZOMBIE_IDLE_SEC = 300.0  # 非终态 session 无任何流式活动的判定阈值(120→300, 2026-08-06 修误杀: 长回合API思考2分钟无流式事件被误判僵尸)阈值
 
 
 class StreamCardController(StreamingController):
@@ -36,6 +38,7 @@ class StreamCardController(StreamingController):
         self._initialized = False
         self._init_lock = asyncio.Lock()
         self._session_ttl = self._cfg.card_duration_sec
+        self._zombie_started = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._text_fallback_needed: set[str] = set()
         self._text_fallback_aliases: dict[str, set[str]] = {}
@@ -62,6 +65,7 @@ class StreamCardController(StreamingController):
                 )
             )
             self._initialized = True
+            self._start_zombie_guard()
 
     def _get_loop(self) -> asyncio.AbstractEventLoop | None:
         """获取事件循环，缓存以便跨线程复用."""
@@ -230,6 +234,7 @@ class StreamCardController(StreamingController):
 
         if session.segment_state is None:
             return False
+        session.last_activity_at = time.time()
         return self._on_thinking_segment(session, text)
 
     def on_reasoning(self, *, message_id: str | None, text: str, chat_id: str | None = None) -> bool:
@@ -245,6 +250,7 @@ class StreamCardController(StreamingController):
         if session.segment_state is None:
             return False
 
+        session.last_activity_at = time.time()
         session.segment_state.on_reasoning_delta(text)
         self._schedule_flush(session)
         return True
@@ -270,6 +276,7 @@ class StreamCardController(StreamingController):
         if session.segment_state is None:
             return False
 
+        session.last_activity_at = time.time()
         if status in ("running", "started", "tool.started"):
             session.tool_use.record_start(tool_name, detail)
         else:
@@ -294,6 +301,7 @@ class StreamCardController(StreamingController):
         if session.segment_state is None:
             return False
 
+        session.last_activity_at = time.time()
         answer_text = strip_reasoning_tags(text)
         if not answer_text:
             return False
@@ -450,19 +458,31 @@ class StreamCardController(StreamingController):
         loop: asyncio.AbstractEventLoop,
         task_name: str = "",
         run_time: str = "",
+        job_id: str = "",
     ) -> bool:
         """Cron 推送 — 包装为静态卡片发送，成功返回 True."""
+        # 用 gateway.run logger（进 gateway.log），hermes_lark_streaming logger 不进文件
+        _diag = logging.getLogger("gateway.run")
         if not self.enabled or not content or not chat_id:
+            _diag.info(
+                "[cheerwhy-cron] ctrl skip enabled=%s content_len=%d chat=%s",
+                self.enabled, len(content), chat_id[:12] if chat_id else "?",
+            )
             return False
         future = asyncio.run_coroutine_threadsafe(
-            self._do_cron_deliver(chat_id, content, task_name=task_name, run_time=run_time), loop
+            self._do_cron_deliver(chat_id, content, task_name=task_name, run_time=run_time,
+                                  job_id=job_id), loop
         )
         try:
             future.result(timeout=30)
-            _logger.info("cron card delivered: chat=%s len=%d", chat_id[:12], len(content))
+            _diag.info(
+                "[cheerwhy-cron] delivered chat=%s len=%d", chat_id[:12], len(content)
+            )
             return True
         except Exception:
-            _logger.warning("cron card delivery failed", exc_info=True)
+            _diag.warning(
+                "[cheerwhy-cron] delivery failed chat=%s", chat_id[:12], exc_info=True
+            )
             return False
 
     async def on_background_deliver(
@@ -635,7 +655,16 @@ class StreamCardController(StreamingController):
             final_answer = strip_reasoning_tags(answer)
             # 复用 session（跨回合合并）：begin_new_turn 已强制下个 delta 新建 segment，
             # 直接追加（不拼到第一回合 answer 后）；非复用时仅当尚无 ANSWER 才追加
-            if final_answer and (session.reused or not any(
+            # ⚠️ 2026-08-01 修复: 话题/thread 模式下 session.reused 恒为 True, 短路掉去重保护,
+            #    导致流式已建 ANSWER 段后 complete 又无条件追加一遍 → 卡片 answer 重复渲染。
+            #    追加前检查已有 ANSWER 段是否已包含 final_answer, 包含则跳过。
+            already_appended = any(
+                seg.type == SegmentType.ANSWER
+                and seg.text
+                and final_answer in seg.text
+                for seg in session.segment_state.segments
+            )
+            if final_answer and not already_appended and (session.reused or not any(
                 seg.type == SegmentType.ANSWER for seg in session.segment_state.segments
             )):
                 session.segment_state.on_answer_delta(final_answer)
@@ -659,6 +688,48 @@ class StreamCardController(StreamingController):
         session.flush.mark_completed()
         return await self._do_complete_card(session)
 
+    def _start_zombie_guard(self) -> None:
+        """启动僵尸卡守护（幂等）：回合结束但 complete 信号丢失时，
+        强制终止长期无活动的 streaming 卡片，避免永远转省略号。"""
+        if self._zombie_started:
+            return
+        self._zombie_started = True
+        loop = self._get_loop()
+        if loop is None:
+            return
+        self._fire_and_forget(self._zombie_guard_loop(), loop)
+        _logger.info("[cheerwhy-zombie] zombie guard started")
+
+    async def _zombie_guard_loop(self) -> None:
+        """每 30s 扫描非终态 session：超过 _ZOMBIE_IDLE_SEC 无任何流式活动
+        （tool/reasoning/thinking/answer 均无），视为回合已结束但 complete 未送达
+        （Hermes Relay finalization failed 场景），强制终止卡片。"""
+        while True:
+            try:
+                await asyncio.sleep(_ZOMBIE_SCAN_SEC)
+                now = time.time()
+                for mid, session in list(self._sessions.items()):
+                    if session.state.is_terminal:
+                        continue
+                    if session.state == SessionState.IDLE:
+                        continue
+                    last = getattr(session, "last_activity_at", None) or session.created_at
+                    idle = now - last
+                    if idle <= _ZOMBIE_IDLE_SEC:
+                        continue
+                    _logger.warning(
+                        "[cheerwhy-zombie] force-abort stuck card msg=%s state=%s idle=%.0fs card_id=%s",
+                        mid[:12], session.state.value, idle,
+                        getattr(session, "card_id", None),
+                    )
+                    session.state = SessionState.ABORTED
+                    session.flush.mark_completed()
+                    self._complete_session(session)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                _logger.warning("[cheerwhy-zombie] scan error", exc_info=True)
+
     def _prune_stale_sessions(self) -> None:
         now = time.time()
         # 同一 session 注册在 message_id + anchor_id 多个 key 下（见 on_message_started），
@@ -670,7 +741,11 @@ class StreamCardController(StreamingController):
             if mid is None or id(s) in seen:
                 continue
             seen.add(id(s))
-            if now - s.created_at > self._session_ttl:
+            # ⚠️ 2026-08-02 修复：只清「终态」stale session。之前不管状态直接清，
+            # 长回合（>card_ttl_sec，如 23 分钟的多轮工具回合）的活跃 session 被误杀 →
+            # 后续 delta/complete 全部 NO session → 流式卡片永远停在运行中（孤儿卡闪省略号）。
+            # 活跃 session 应由 complete/abort 流程自行收尾，TTL 只负责回收已完成残留。
+            if now - s.created_at > self._session_ttl and s.state.is_terminal:
                 stale.append(mid)
         for mid in stale:
             _logger.warning("pruning stale session: msg=%s", mid[:12])

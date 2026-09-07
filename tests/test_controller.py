@@ -107,11 +107,13 @@ def test_prune_stale_sessions_ignores_none_key_and_prunes_valid_key() -> None:
     ctrl = StreamCardController()
     stale_session = SimpleNamespace(
         created_at=time.time() - ctrl._session_ttl - 1,
+        state=SessionState.COMPLETED,
         flush=_DummyFlush(),
         image_resolver=None,
     )
     valid_stale_session = SimpleNamespace(
         created_at=time.time() - ctrl._session_ttl - 1,
+        state=SessionState.COMPLETED,
         flush=_DummyFlush(),
         image_resolver=None,
     )
@@ -123,6 +125,27 @@ def test_prune_stale_sessions_ignores_none_key_and_prunes_valid_key() -> None:
     assert ctrl._sessions[None] is stale_session  # type: ignore[index]
     assert "msg" not in ctrl._sessions
     assert valid_stale_session.flush.completed
+
+
+def test_prune_stale_sessions_keeps_active_long_turn(monkeypatch) -> None:
+    """长回合（活跃 STREAMING session 超 TTL）不应被 prune。
+
+    回归 2026-08-02 生产事故：23 分钟多轮工具回合的活跃 session 被 TTL
+    prune 误杀 → delta/complete 全部 NO session → 流式卡片孤儿（永远闪省略号）。
+    """
+    ctrl = StreamCardController()
+    active = SimpleNamespace(
+        created_at=time.time() - ctrl._session_ttl - 60,
+        state=SessionState.STREAMING,
+        flush=_DummyFlush(),
+        image_resolver=None,
+    )
+    ctrl._sessions["active_msg"] = active  # type: ignore[assignment]
+
+    ctrl._prune_stale_sessions()
+
+    assert "active_msg" in ctrl._sessions
+    assert not active.flush.completed
 
 
 def test_prune_stale_sessions_dedupes_multi_key_session(
@@ -141,6 +164,7 @@ def test_prune_stale_sessions_dedupes_multi_key_session(
         message_id="msg",
         anchor_id="quoted",
         created_at=time.time() - ctrl._session_ttl - 1,
+        state=SessionState.COMPLETED,
         flush=_DummyFlush(),
         image_resolver=None,
     )

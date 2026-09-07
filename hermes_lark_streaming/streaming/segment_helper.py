@@ -77,7 +77,7 @@ def build_add_segment_action(
         element = _build_reasoning_panel(
             " ",
             seg.elapsed_ms,
-            expanded=True,
+            expanded=False,
             element_id=seg.el_id,
             text_element_id=seg.text_el_id,
         )

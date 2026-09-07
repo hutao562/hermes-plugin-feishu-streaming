@@ -696,12 +696,64 @@ class StreamingController:
         return False
 
     async def _do_cron_deliver(
-        self, chat_id: str, content: str, *, task_name: str = "", run_time: str = ""
+        self, chat_id: str, content: str, *, task_name: str = "", run_time: str = "",
+        job_id: str = "",
     ) -> None:
         await self._ensure_init()
         assert self._client is not None
-        card = build_cron_card(content, task_name=task_name, run_time=run_time)
+        image_keys = await self._collect_cron_images(job_id)
+        card = build_cron_card(
+            content, task_name=task_name, run_time=run_time, image_keys=image_keys,
+        )
         await self._client.send_card_to_chat(chat_id, card)
+
+    async def _collect_cron_images(self, job_id: str) -> list[str]:
+        """从最新 cron session 读 agent_messages → collect_image_media → 上传 img_key.
+
+        cron 的 _deliver_result 只拿到 final_response 文本，图只在 agent_messages
+        的 image_generate tool result 里。读最新 session_cron_{job_id}_*.json 拿。
+        """
+        _diag = logging.getLogger("gateway.run")
+        if not job_id or self._client is None:
+            return []
+        try:
+            import json
+
+            from ..config import hermes_home
+            from ..patch import collect_image_media
+            sessions_dir = hermes_home() / "sessions"
+            candidates = sorted(
+                sessions_dir.glob(f"session_cron_{job_id}_*.json"), reverse=True
+            )
+            if not candidates:
+                return []
+            data = json.loads(candidates[0].read_text(encoding="utf-8"))
+            messages = (
+                data if isinstance(data, list)
+                else (data.get("messages") or data.get("agent_messages") or [])
+            )
+            paths = collect_image_media(messages)
+            if not paths:
+                return []
+            keys: list[str] = []
+            for path in paths:
+                try:
+                    key = await self._client.upload_image_file(path)
+                    if key:
+                        keys.append(key)
+                        _diag.info(
+                            "[cheerwhy-cron] image uploaded job=%s path=%s -> %s",
+                            job_id[:12], path[-40:], key)
+                except Exception:
+                    _diag.warning(
+                        "[cheerwhy-cron] image upload failed job=%s path=%s",
+                        job_id[:12], path[-40:], exc_info=True)
+            return keys
+        except Exception:
+            _diag.warning(
+                "[cheerwhy-cron] _collect_cron_images failed job=%s",
+                job_id[:12], exc_info=True)
+            return []
 
     async def _do_background_deliver(
         self,

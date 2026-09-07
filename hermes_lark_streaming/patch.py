@@ -327,20 +327,30 @@ def on_cron_deliver(
     loop: Any = None,
     task_name: str = "",
     run_time: str = "",
+    job_id: str = "",
 ) -> bool:
     """[注入点 10] cron 推送 — 包装为飞书卡片发送."""
+    # 用 cron.scheduler logger（进 agent.log），hermes_lark_streaming logger 不进文件
+    _diag = logging.getLogger("cron.scheduler")
     if loop is None:
+        _diag.info("[cheerwhy-cron] skip loop=None chat=%s", chat_id[:12])
         return False
     try:
         ctrl = get_controller()
         if not ctrl.enabled:
+            _diag.info("[cheerwhy-cron] skip enabled=False chat=%s", chat_id[:12])
             return False
-        return bool(ctrl.on_cron_deliver(
+        _diag.info(
+            "[cheerwhy-cron] call chat=%s content_len=%d", chat_id[:12], len(content)
+        )
+        ok = bool(ctrl.on_cron_deliver(
             chat_id=chat_id, content=content, loop=loop,
-            task_name=task_name, run_time=run_time,
+            task_name=task_name, run_time=run_time, job_id=job_id,
         ))
+        _diag.info("[cheerwhy-cron] result=%s chat=%s", ok, chat_id[:12])
+        return ok
     except Exception as exc:
-        _logger.warning("on_cron_deliver error: %s", exc, exc_info=True)
+        _diag.warning("[cheerwhy-cron] error: %s", exc, exc_info=True)
         return False
 
 

@@ -7,7 +7,7 @@ import re
 
 _logger = logging.getLogger("hermes_lark_streaming")
 
-_MAX_CARD_TABLES = 5
+_MAX_CARD_TABLES = 8
 _MAX_CHUNK_CHARS = 2400
 
 __all__ = [

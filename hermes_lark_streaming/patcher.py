@@ -28,12 +28,14 @@ _HOOK_NAMES = [
     "FOLLOWUP_RESULT",
     "TOOL",
     "ANSWER",
+    "ANSWER_GUARD",
     "THINKING",
     "REASONING",
     "BACKGROUND_REVIEW",
     "ABORT",
     "INTERRUPT",
     "BG_DELIVER",
+    "ADAPTER_INIT",
 ]
 MARKERS: list[tuple[str, str]] = [(f"# {PREFIX}_{n}_BEGIN", f"# {PREFIX}_{n}_END") for n in _HOOK_NAMES]
 
@@ -44,12 +46,29 @@ MK_FOLLOWUP_COMPLETE, MK_FOLLOWUP_COMPLETE_END = MARKERS[3]
 MK_FOLLOWUP_RESULT, MK_FOLLOWUP_RESULT_END = MARKERS[4]
 MK_TOOL, MK_TOOL_END = MARKERS[5]
 MK_ANSWER, MK_ANSWER_END = MARKERS[6]
-MK_THINKING, MK_THINKING_END = MARKERS[7]
-MK_REASONING, MK_REASONING_END = MARKERS[8]
-MK_BACKGROUND_REVIEW, MK_BACKGROUND_REVIEW_END = MARKERS[9]
-MK_ABORT, MK_ABORT_END = MARKERS[10]
-MK_INTERRUPT, MK_INTERRUPT_END = MARKERS[11]
-MK_BG_DELIVER, MK_BG_DELIVER_END = MARKERS[12]
+MK_ANSWER_GUARD, MK_ANSWER_GUARD_END = MARKERS[7]
+MK_THINKING, MK_THINKING_END = MARKERS[8]
+MK_REASONING, MK_REASONING_END = MARKERS[9]
+MK_BACKGROUND_REVIEW, MK_BACKGROUND_REVIEW_END = MARKERS[10]
+MK_ABORT, MK_ABORT_END = MARKERS[11]
+MK_INTERRUPT, MK_INTERRUPT_END = MARKERS[12]
+MK_BG_DELIVER, MK_BG_DELIVER_END = MARKERS[13]
+MK_ADAPTER_INIT, MK_ADAPTER_INIT_END = MARKERS[14]
+
+# bg_watcher 注入点 12（background watcher text-only 通知覆盖）拆成两处独立 marker：
+# ① finished（进程完成通知）② running（still-running 进度推送）。两处都在
+# _run_process_watcher 内，走 adapter.send 纯文本，绕过 cheerwhy 的 14 个 hook。
+MK_BG_WATCHER_FINISHED = f"# {PREFIX}_BG_WATCHER_FINISHED_BEGIN"
+MK_BG_WATCHER_FINISHED_END = f"# {PREFIX}_BG_WATCHER_FINISHED_END"
+MK_BG_WATCHER_RUNNING = f"# {PREFIX}_BG_WATCHER_RUNNING_BEGIN"
+MK_BG_WATCHER_RUNNING_END = f"# {PREFIX}_BG_WATCHER_RUNNING_END"
+
+# bg_watcher 注入点 12 拆成两处（finished / running），加进 MARKERS 让 Patcher 统一管理。
+_BG_WATCHER_PAIRS: tuple[tuple[str, str], ...] = (
+    (MK_BG_WATCHER_FINISHED, MK_BG_WATCHER_FINISHED_END),
+    (MK_BG_WATCHER_RUNNING, MK_BG_WATCHER_RUNNING_END),
+)
+MARKERS.extend(_BG_WATCHER_PAIRS)
 
 _BACKUP_SUFFIX = ".hermes_lark.bak"
 
@@ -197,6 +216,9 @@ _ANCHOR_CHECKS: list[tuple[str, tuple[str, ...], str]] = [
     ("images, text_content = adapter.extract_images(response)", (), "background deliver"),
     ("_already_sent = bool(", (), "complete"),
     ("Discarding stale agent result", (), "abort"),
+    ('self.hooks.emit("gateway:startup"', (), "gateway startup emit"),
+    ("finished with exit code", (), "background watcher finished"),
+    ("is still running~", (), "background watcher running"),
 ]
 
 
@@ -328,10 +350,10 @@ def _tool_hook(indent: str) -> str:
         [
             "try:",
             "    from hermes_lark_streaming.patch import on_tool_updated",
-            "    if _run_still_current() and event_type in ('tool.started', 'tool.completed'):",
+            "    if self._ctx._run_still_current() and event_type in ('tool.started', 'tool.completed'):",
             "        if on_tool_updated(",
-            "            message_id=event_message_id,",
-            "            chat_id=source.chat_id,",
+            "            message_id=self._ctx.event_message_id,",
+            "            chat_id=self._ctx.source.chat_id,",
             "            tool_name=tool_name or '',",
             "            status='started' if event_type == 'tool.started' else 'completed',",
             "            detail=preview or '',",
@@ -352,12 +374,47 @@ def _answer_hook(indent: str) -> str:
             "try:",
             "    from hermes_lark_streaming.patch import on_answer_delta",
             (
-                "    if text and _run_still_current() and on_answer_delta("
-                "message_id=event_message_id, chat_id=source.chat_id, text=text):"
+                "    if text and self._ctx._run_still_current() and on_answer_delta("
+                "message_id=self._ctx.event_message_id, chat_id=self._ctx.source.chat_id, text=text):"
             ),
             "        return",
             "except Exception:",
             "    pass",
+        ],
+    )
+
+
+def _answer_guard_hook(indent: str) -> str:
+    """兜底注入：在 agent.stream_delta_callback 赋值前包一层 wrapper。
+
+    Hermes 新版把 _stream_delta_cb 拆成两个分支（原生流式分支 + TTS-only 分支），
+    原 ANSWER 注入只落在 TTS-only 分支；当 display.platforms.feishu.streaming=false
+    且未开流式 TTS 时两个分支都不执行 → _stream_delta_cb 保持 None → on_answer_delta
+    永不调用 → 回答文本不进卡片（2026-08-01 实测）。
+
+    此注入点不依赖任何 Hermes 原生分支：无论 _stream_delta_cb 是否为 None，
+    都包一层 wrapper 先调 on_answer_delta（进卡片），卡片处理了就不再走原生
+    callback（同时根治 streaming=true 时的双发）。
+    """
+    return _make_hook(
+        indent,
+        MK_ANSWER_GUARD,
+        MK_ANSWER_GUARD_END,
+        [
+            "_hermes_lark_orig_delta_cb = _stream_delta_cb",
+            "def _hermes_lark_guarded_delta_cb(text):",
+            "    try:",
+            "        from hermes_lark_streaming.patch import on_answer_delta",
+            (
+                "        if text and self._ctx._run_still_current() and on_answer_delta("
+                "message_id=self._ctx.event_message_id, chat_id=self._ctx.source.chat_id, text=text):"
+            ),
+            "            return",
+            "    except Exception:",
+            "        pass",
+            "    if _hermes_lark_orig_delta_cb is not None:",
+            "        _hermes_lark_orig_delta_cb(text)",
+            "_stream_delta_cb = _hermes_lark_guarded_delta_cb",
         ],
     )
 
@@ -370,8 +427,8 @@ def _thinking_hook(indent: str) -> str:
         [
             "try:",
             "    from hermes_lark_streaming.patch import on_thinking_delta",
-            "    if (text and not already_streamed and _run_still_current()",
-            "            and on_thinking_delta(message_id=event_message_id, chat_id=source.chat_id, text=text)):",
+            "    if (text and not already_streamed and self._ctx._run_still_current()",
+            "            and on_thinking_delta(message_id=self._ctx.event_message_id, chat_id=self._ctx.source.chat_id, text=text)):",
             "        return",
             "except Exception:",
             "    pass",
@@ -386,10 +443,10 @@ def _reasoning_hook(indent: str) -> str:
         MK_REASONING_END,
         [
             "def _reasoning_cb(text):",
-            "    if text and _run_still_current():",
+            "    if text and self._ctx._run_still_current():",
             "        try:",
             "            from hermes_lark_streaming.patch import on_reasoning_delta",
-            "            on_reasoning_delta(message_id=event_message_id, chat_id=source.chat_id, text=text)",
+            "            on_reasoning_delta(message_id=self._ctx.event_message_id, chat_id=self._ctx.source.chat_id, text=text)",
             "        except Exception:",
             "            pass",
             "agent.reasoning_callback = _reasoning_cb",
@@ -491,6 +548,7 @@ def _cron_deliver_hook(indent: str) -> str:
             "            loop=loop,",
             "            task_name=job.get('name', ''),",
             "            run_time=job.get('next_run_at', ''),",
+            "            job_id=job.get('id', ''),",
             "        ):",
             "            _hermes_lark_cron_seen.add(_hermes_lark_cron_key)",
             "            delivered = True",
@@ -520,6 +578,64 @@ def _bg_deliver_hook(indent: str) -> str:
             "            text_content = ''",
             "            if not images and not media_files:",
             "                return",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
+def _adapter_init_hook(indent: str) -> str:
+    # 在 gateway:startup emit 之后 patch（所有 adapter 已 connect，event_handler 已建）。
+    # 此时 self.adapters 已填充，patch 函数能拿到 feishu 实例去替换其 card-action
+    # processor.f（绕过 lark SDK 在 register_p2_card_action_trigger 时捕获的旧引用）。
+    return _make_hook(
+        indent,
+        MK_ADAPTER_INIT,
+        MK_ADAPTER_INIT_END,
+        [
+            "try:",
+            "    from hermes_lark_streaming.clarify import patch_feishu_adapter as _hermes_lark_clarify_patch",
+            "    _hermes_lark_clarify_patch(self.adapters)",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
+def _bg_watcher_finished_hook(indent: str) -> str:
+    # 注入点 12a：_run_process_watcher 的 "finished with exit code" 分支。
+    # 该分支默认 adapter.send 纯文本通知进程完成；cheerwhy 接管：有活跃 agent
+    # session → 过滤冗余通知；否则发 background card。handled 时跳过原 adapter.send。
+    return _make_hook(
+        indent,
+        MK_BG_WATCHER_FINISHED,
+        MK_BG_WATCHER_FINISHED_END,
+        [
+            "_hermes_lark_bg_handled = False",
+            "try:",
+            "    if platform_name.lower() in ('feishu', 'lark'):",
+            "        from hermes_lark_streaming.patch import on_bg_watcher_notify",
+            "        if await on_bg_watcher_notify(chat_id=chat_id, content=message_text):",
+            "            _hermes_lark_bg_handled = True",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
+def _bg_watcher_running_hook(indent: str) -> str:
+    # 注入点 12b：_run_process_watcher 的 "is still running~" 进度推送分支。同 finished。
+    return _make_hook(
+        indent,
+        MK_BG_WATCHER_RUNNING,
+        MK_BG_WATCHER_RUNNING_END,
+        [
+            "_hermes_lark_bg_handled = False",
+            "try:",
+            "    if platform_name.lower() in ('feishu', 'lark'):",
+            "        from hermes_lark_streaming.patch import on_bg_watcher_notify",
+            "        if await on_bg_watcher_notify(chat_id=chat_id, content=message_text):",
+            "            _hermes_lark_bg_handled = True",
             "except Exception:",
             "    pass",
         ],
@@ -644,6 +760,11 @@ class Patcher:
         self.verify_target()
         content = self.run_path.read_text(encoding="utf-8")
         if self.is_patched():
+            # 重新打补丁：还原 bg_watcher 改写的守卫行，再移除所有 marker 块。
+            content = content.replace(
+                "if adapter and chat_id and not _hermes_lark_bg_handled:",
+                "if adapter and chat_id:",
+            )
             for begin, end in self.MARKERS:
                 content = _remove_block(content, begin, end)
         else:
@@ -655,6 +776,12 @@ class Patcher:
         content = self.run_path.read_text(encoding="utf-8")
         if not any(begin in content for begin, _ in self.MARKERS):
             return
+        # 先还原 bg_watcher 改写的守卫行（只匹配带 _hermes_lark_bg_handled 的），
+        # 再移除所有 marker 块。
+        content = content.replace(
+            "if adapter and chat_id and not _hermes_lark_bg_handled:",
+            "if adapter and chat_id:",
+        )
         for begin, end in self.MARKERS:
             content = _remove_block(content, begin, end)
         _atomic_write(self.run_path, content)
@@ -684,10 +811,14 @@ class Patcher:
             ("interrupt", "interrupt", _find_interrupt_site(tree, lines)),
             ("tool", "tool", _find_func_body(tree, lines, "progress_callback")),
             ("answer", "answer", _find_func_body(tree, lines, "_stream_delta_cb")),
+            ("answer_guard", "answer_guard", _find_stream_delta_assign(tree, lines)),
             ("thinking", "thinking", _find_func_body(tree, lines, "_interim_assistant_cb")),
             ("reasoning", "reasoning", _find_reasoning_site(tree, lines)),
             ("background_review", "background_review", _find_background_review_site(tree, lines)),
             ("bg_deliver", "bg_deliver", _find_bg_deliver_site(tree, lines)),
+            ("adapter_init", "adapter_init", _find_adapter_init_site(tree, lines)),
+            ("bg_watcher_finished", "bg_watcher_finished", _find_bg_watcher_branch(lines, "finished with exit code")),
+            ("bg_watcher_running", "bg_watcher_running", _find_bg_watcher_branch(lines, "is still running~")),
         ]
 
         sites: list[tuple[int, str, str]] = []
@@ -710,14 +841,27 @@ class Patcher:
             "interrupt": _interrupt_hook,
             "tool": _tool_hook,
             "answer": _answer_hook,
+            "answer_guard": _answer_guard_hook,
             "thinking": _thinking_hook,
             "reasoning": _reasoning_hook,
             "background_review": _background_review_hook,
             "bg_deliver": _bg_deliver_hook,
+            "adapter_init": _adapter_init_hook,
+            "bg_watcher_finished": _bg_watcher_finished_hook,
+            "bg_watcher_running": _bg_watcher_running_hook,
         }
         for idx, indent, fn_name in sites:
             hook = _HOOK_FNS[fn_name](indent)
             lines[idx:idx] = hook.splitlines(keepends=True)
+
+        # bg_watcher 两处：插入的 hook 设了 _hermes_lark_bg_handled，需把原
+        # ``if adapter and chat_id:`` 守卫改成 ``... and not _hermes_lark_bg_handled``
+        # 以跳过原 adapter.send（handled=True 时不重复发纯文本）。两处都要在 hook
+        # 注入点之前初始化 _hermes_lark_bg_handled=False。
+        content = "".join(lines)
+        lines = content.splitlines(keepends=True)
+        lines = _apply_bg_watcher_guard(lines, "finished with exit code")
+        lines = _apply_bg_watcher_guard(lines, "is still running~")
 
         return "".join(lines)
 
@@ -738,6 +882,69 @@ def _find_func_body(tree: ast.Module, lines: list[str], name: str) -> tuple[int,
                 lineno = body[start].lineno - 1
                 indent = _safe_indent(lines, lineno)
                 return lineno, indent
+    return None
+
+
+def _find_stream_delta_assign(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    """定位 ``agent.stream_delta_callback = _stream_delta_cb`` 赋值行。
+
+    用 AST 找赋值语句（比字符串匹配稳，可跳过注释/字符串里的同名文本），
+    返回该行（0-indexed）与缩进，注入点插在这一行之前。
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Attribute):
+            continue
+        attr = node.targets[0]
+        if attr.attr != "stream_delta_callback":
+            continue
+        value = node.value
+        if not (isinstance(value, ast.Name) and value.id == "_stream_delta_cb"):
+            continue
+        lineno = node.lineno - 1
+        indent = _safe_indent(lines, lineno)
+        return lineno, indent
+    return None
+
+
+def _find_adapter_init_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    """Locate the ``gateway:startup`` emit in start() — AFTER all adapters connect.
+
+    Returns the line index + indent right after the emit STATEMENT, where the
+    hook can access ``self.adapters`` (all adapters connected, event handlers
+    built). Must insert after the full ``await self.hooks.emit("gateway:startup",
+    {...})`` statement — the call spans multiple lines and the dict's inner ``)``
+    must not be mistaken for the statement end.
+    """
+    start_node: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "start":
+            start_node = node
+            break
+    if start_node is None:
+        return None
+
+    # Walk start()'s direct statements to find the Expr containing the emit call.
+    # Using AST end_lineno gives the true statement end (robust to nested parens).
+    for stmt in ast.walk(start_node):
+        if not isinstance(stmt, ast.Await):
+            continue
+        call = stmt.value
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)):
+            continue
+        if call.func.attr != "emit":
+            continue
+        # Check first arg is the "gateway:startup" string
+        if not (call.args and isinstance(call.args[0], ast.Constant) and call.args[0].value == "gateway:startup"):
+            continue
+        end = stmt.end_lineno or call.lineno
+        # Insert on the line AFTER the statement ends.
+        insert_line = end  # 0-indexed = end_lineno (1-indexed)
+        if insert_line >= len(lines):
+            insert_line = len(lines) - 1
+        indent = _safe_indent(lines, insert_line)
+        return insert_line, indent
     return None
 
 
@@ -837,6 +1044,59 @@ def _find_bg_deliver_site(tree: ast.Module, lines: list[str]) -> tuple[int, str]
         if line.strip() == "images, text_content = adapter.extract_images(response)":
             return i + 1, _safe_indent(lines, i)
     return None
+
+
+def _find_bg_watcher_branch(lines: list[str], trigger: str) -> tuple[int, str] | None:
+    """定位 _run_process_watcher 内 watcher 通知分支（finished / running）。
+
+    两处结构相同：先 ``message_text = (...)``（含 trigger 字符串），
+    再 ``adapter = None`` → for 找 adapter → ``if adapter and chat_id:`` → adapter.send。
+    返回 ``adapter = None`` 那一行的索引 + 缩进（hook 注入于此行前，
+    并把紧随其后的 ``if adapter and chat_id:`` 改写加 ``_hermes_lark_bg_handled`` 守卫）。
+    """
+    trig_idx = None
+    for i, line in enumerate(lines):
+        if trigger in line:
+            trig_idx = i
+            break
+    if trig_idx is None:
+        return None
+    # 从 trigger 往下找 adapter = None（应在 30 行内）。
+    for j in range(trig_idx, min(trig_idx + 40, len(lines))):
+        if lines[j].strip() == "adapter = None":
+            indent = _safe_indent(lines, j)
+            return j, indent
+    return None
+
+
+def _guard_line_for_branch(lines: list[str], inject_idx: int) -> int | None:
+    """在 inject_idx（adapter=None）之后找要改写的 ``if adapter and chat_id:`` 行索引."""
+    for j in range(inject_idx, min(inject_idx + 30, len(lines))):
+        if lines[j].strip() == "if adapter and chat_id:":
+            return j
+    return None
+
+
+def _apply_bg_watcher_guard(lines: list[str], trigger: str) -> list[str]:
+    """把 trigger 分支里原 ``if adapter and chat_id:`` 改写为
+    ``if adapter and chat_id and not _hermes_lark_bg_handled:``.
+
+    hook 已注入并初始化 ``_hermes_lark_bg_handled``，handled 时此处跳过原 adapter.send
+    纯文本发送（cheerwhy 已接管发卡片）。只改第一个匹配行（本分支的）。
+    """
+    trig_idx = None
+    for i, line in enumerate(lines):
+        if trigger in line:
+            trig_idx = i
+            break
+    if trig_idx is None:
+        return lines
+    for j in range(trig_idx, min(trig_idx + 60, len(lines))):
+        if lines[j].strip() == "if adapter and chat_id:":
+            indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
+            lines[j] = f"{indent}if adapter and chat_id and not _hermes_lark_bg_handled:\n"
+            return lines
+    return lines
 
 
 def _safe_indent(lines: list[str], lineno: int) -> str:

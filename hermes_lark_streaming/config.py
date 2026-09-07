@@ -40,6 +40,26 @@ class Config:
         return bool(sec.get("panel_expanded", False))
 
     @property
+    def clarify_inline(self) -> bool:
+        """是否启用飞书 clarify 内联单选按钮卡（默认 True）.
+
+        关闭后退回 base.py 的数字列表 text fallback —— 用户手打数字回复.
+        patcher 在 gateway start() 的 connect loop 之前读此项决定是否 patch.
+        """
+        sec = self._streaming_sec()
+        return bool(sec.get("clarify_inline", True))
+
+    @property
+    def self_heal(self) -> bool:
+        """是否启用启动时自愈（默认 True）.
+
+        网关启动时检测 run.py 的 AST hook 是否被 hermes 升级抹掉，是则原地重打 +
+        触发 restart 让补丁版重新加载。关闭后退回手动 reinstall_after_upgrade.sh.
+        """
+        sec = self._streaming_sec()
+        return bool(sec.get("self_heal", True))
+
+    @property
     def show_reasoning(self) -> bool:
         """是否展示推理过程（display.platforms.feishu.show_reasoning → display.show_reasoning）.
 
@@ -134,7 +154,7 @@ class Config:
 
     @staticmethod
     def _default_footer_fields() -> list[list[str]]:
-        return [["status", "elapsed", "model"], ["context", "tokens"]]
+        return [["elapsed", "model", "context"]]
 
     @property
     def env_app_id(self) -> str:
