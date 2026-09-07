@@ -397,6 +397,7 @@ def _followup_result_hook(indent: str) -> str:
 
 
 def _tool_hook(indent: str) -> str:
+    # 旧版（legacy 单文件 run.py）：注入 progress_callback 函数体（有形参）。
     return _make_hook(
         indent,
         MK_TOOL,
@@ -415,6 +416,41 @@ def _tool_hook(indent: str) -> str:
             "            return",
             "except Exception:",
             "    pass",
+        ],
+    )
+
+
+def _tool_hook_v2(indent: str) -> str:
+    """新版：包 agent.tool_progress_callback（_wire_turn_agent_callbacks 方法尾）。
+
+    Hermes 已在 1101 行把 ``agent.tool_progress_callback = ctx.progress_callback``
+    （bound method），此处读取后包 wrapper 再赋回：先调 on_tool_updated 进卡片，
+    True=卡片吞了（不再走原生工具消息）；False 则 fallback 原 callback。
+    方法体形态与 legacy 函数体形态不同——不能在方法体里引用 event_type 形参。
+    """
+    return _make_hook(
+        indent,
+        MK_TOOL,
+        MK_TOOL_END,
+        [
+            "_hermes_lark_orig_tool_cb = agent.tool_progress_callback",
+            "def _hermes_lark_tool_wrapper(event_type, tool_name=None, preview=None, args=None, **kwargs):",
+            "    try:",
+            "        from hermes_lark_streaming.patch import on_tool_updated",
+            "        if self._ctx._run_still_current() and event_type in ('tool.started', 'tool.completed'):",
+            "            if on_tool_updated(",
+            "                message_id=self._ctx.event_message_id,",
+            "                chat_id=self._ctx.source.chat_id,",
+            "                tool_name=tool_name or '',",
+            "                status='started' if event_type == 'tool.started' else 'completed',",
+            "                detail=preview or '',",
+            "            ):",
+            "                return",
+            "    except Exception:",
+            "        pass",
+            "    if _hermes_lark_orig_tool_cb is not None:",
+            "        _hermes_lark_orig_tool_cb(event_type, tool_name=tool_name, preview=preview, args=args, **kwargs)",
+            "agent.tool_progress_callback = _hermes_lark_tool_wrapper",
         ],
     )
 
@@ -466,6 +502,7 @@ def _answer_guard_hook(indent: str) -> str:
 
 
 def _thinking_hook(indent: str) -> str:
+    # 旧版（legacy）：注入 _interim_assistant_cb 函数体（有形参 text/already_streamed）。
     return _make_hook(
         indent,
         MK_THINKING,
@@ -479,6 +516,36 @@ def _thinking_hook(indent: str) -> str:
             "        return",
             "except Exception:",
             "    pass",
+        ],
+    )
+
+
+def _thinking_hook_v2(indent: str) -> str:
+    """新版：包 agent.interim_assistant_callback（_wire_turn_agent_callbacks 方法尾）。
+
+    Hermes 在 1104 行可能把 interim_assistant_callback 设为 None（want_interim
+    关闭）。wrapper 无条件赋值：interim 文本先进卡片（on_thinking_delta），
+    卡片吞了就 return；否则 fallback 原 callback（None 时不调）。
+    方法体形态与 legacy 函数体形态不同——不能在方法体里引用 text 形参。
+    """
+    return _make_hook(
+        indent,
+        MK_THINKING,
+        MK_THINKING_END,
+        [
+            "_hermes_lark_orig_interim_cb = agent.interim_assistant_callback",
+            "def _hermes_lark_interim_wrapper(text, *, already_streamed=False):",
+            "    try:",
+            "        from hermes_lark_streaming.patch import on_thinking_delta",
+            "        if (text and not already_streamed and self._ctx._run_still_current()",
+            "                and on_thinking_delta(message_id=self._ctx.event_message_id,",
+            "                                      chat_id=self._ctx.source.chat_id, text=text)):",
+            "            return",
+            "    except Exception:",
+            "        pass",
+            "    if _hermes_lark_orig_interim_cb is not None:",
+            "        _hermes_lark_orig_interim_cb(text, already_streamed=already_streamed)",
+            "agent.interim_assistant_callback = _hermes_lark_interim_wrapper",
         ],
     )
 
@@ -1404,11 +1471,13 @@ class Patcher:
         elif name == "run_turn_runner.py":
             sites = [
                 # 5 个流式 hook 收敛到 _wire_turn_agent_callbacks 方法尾（after）。
+                # ⚠️ TOOL/THINKING 必须用 *_v2 wrapper 形态（方法体无 event_type/text
+                # 形参，旧函数体形态会 NameError 被 except 吞掉 → hook 静默失效）。
                 ("reasoning", "after", _find_runner_wire_site(tree, lines), _reasoning_hook),
-                ("thinking", "after", _find_runner_wire_site(tree, lines), _thinking_hook),
+                ("thinking", "after", _find_runner_wire_site(tree, lines), _thinking_hook_v2),
                 ("answer_guard", "after", _find_runner_wire_site(tree, lines), _answer_guard_hook),
                 ("answer", "after", _find_runner_wire_site(tree, lines), _answer_hook),
-                ("tool", "after", _find_runner_wire_site(tree, lines), _tool_hook),
+                ("tool", "after", _find_runner_wire_site(tree, lines), _tool_hook_v2),
                 (
                     "background_review",
                     "after",
