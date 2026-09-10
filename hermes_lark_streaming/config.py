@@ -26,6 +26,8 @@ class Config:
 
     def __init__(self) -> None:
         self._raw: dict[str, Any] | None = None
+        # (mtime_ns, size) -> 解析结果；_reload 每次被调用都可能命中这条缓存。
+        self._reload_cache: tuple[tuple[int, int], dict[str, Any]] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -211,9 +213,30 @@ class Config:
         return self._raw
 
     def _reload(self) -> dict[str, Any]:
-        """从磁盘重新读取配置（不更新缓存），供运行时可变的配置项使用."""
+        """从磁盘重新读取配置（结果按 mtime+size 缓存）.
+
+        供运行时可变的配置项使用（如 ``/reasoning`` 改 ``display.show_reasoning``）——
+        保留"文件一变就生效"的语义，但**不能每次调用都完整解析 YAML**：本方法在
+        每个 reasoning delta 上都会被调用，21KB config.yaml 的纯 Python YAML 解析
+        单次约 28ms，会把整轮生成拖成一核满载（实测把飞书侧生成速度从 ~200 t/s
+        压到 ~45 t/s）。mtime+size 命中时只花一次 stat（~30µs）。
+        """
         path = _config_path()
-        if path.exists():
+        try:
+            st = path.stat()
+            key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return {}
+        cached = self._reload_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
             text = path.read_text(encoding="utf-8")
-            return yaml.safe_load(text) or {}
-        return {}
+            data = yaml.safe_load(text)
+        except Exception:
+            # 读到写一半的文件（如 /reasoning 正在写）→ 不缓存，等下次重试。
+            return cached[1] if cached is not None else {}
+        if not isinstance(data, dict):
+            data = {}
+        self._reload_cache = (key, data)
+        return data
