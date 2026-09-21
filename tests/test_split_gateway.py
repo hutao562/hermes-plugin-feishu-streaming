@@ -63,6 +63,7 @@ def hooks(monkeypatch):
         "_hermes_lark_completion_id", kw["message_id"]))
     hooks.get_controller = Mock(return_value=NS(
         enabled=True, _sessions={key: object() for key in ("inbound", "first", "second")},
+        has_chat_card=Mock(return_value=False),
     ))
     monkeypatch.setitem(sys.modules, "hermes_lark_streaming.patch", hooks)
     return hooks
@@ -128,7 +129,7 @@ def test_card_turn_reserves_text_transport_and_preserves_tts(patched, hooks, mon
     assert ctx.stream_consumer_holder == [None]
     assert callable(delta)  # also when BOTH native consumers are off
     delta("text")
-    hooks.on_answer_delta.assert_called_once_with(message_id="inbound", text="text")
+    hooks.on_answer_delta.assert_called_once_with(message_id="inbound", chat_id="chat", text="text")
     stream.on_delta.assert_not_called()
     assert voice.on_delta.call_count == int(tts)
     assert want_interim is True
@@ -148,6 +149,39 @@ def test_other_platform_retains_none_delta(patched, hooks):
     hooks.on_answer_delta.assert_not_called()
 
 
+def test_busy_redirect_reuses_chat_card_when_message_id_switches(patched, hooks):
+    """busy redirect：inbound_message_id 切到新消息（不在 _sessions），按 chat 复用原回合卡片."""
+    hooks.on_answer_delta.return_value = True
+    ctx = context(inbound_message_id="redirected")
+    controller = hooks.get_controller.return_value
+    controller._sessions = {}
+    controller.has_chat_card = Mock(return_value=True)
+    owner = NS(_ctx=ctx, _runner=NS(config=NS(streaming=object())))
+    _, delta, _, want_interim = method(patched, "run_turn_runner.py", "_setup_stream_consumer")(owner, "feishu")
+    assert callable(delta)
+    assert want_interim is True
+    delta("correction")
+    hooks.on_answer_delta.assert_called_once_with(message_id="redirected", chat_id="chat", text="correction")
+
+
+def test_no_chat_card_falls_back_to_native_stream(patched, hooks, monkeypatch):
+    """新消息既无 session 也无可复用卡片 → 保持原生流（纯文本兜底）."""
+    stream = Mock()
+    monkeypatch.setitem(sys.modules, "gateway.stream_consumer", NS(GatewayStreamConsumer=Mock(return_value=stream)))
+    ctx = context(inbound_message_id="stranger", resolve_display_setting=lambda *a: True)
+    controller = hooks.get_controller.return_value
+    controller._sessions = {}
+    controller.has_chat_card = Mock(return_value=False)
+    owner = NS(_ctx=ctx, _runner=NS(config=NS(streaming=NS(enabled=True, transport="auto")),
+                                    _adapter_for_source=lambda _: object(),
+                                    _build_stream_consumer_config=lambda *a, **k: ({}, None)))
+    consumer, delta, _, _ = method(patched, "run_turn_runner.py", "_setup_stream_consumer")(owner, "feishu")
+    assert consumer is stream
+    delta("native text")
+    stream.on_delta.assert_called_once_with("native text")
+    hooks.on_answer_delta.assert_not_called()
+
+
 @pytest.mark.parametrize("owned", [True, False])
 def test_tool_logs_exactly_once_and_keeps_native_fallback(patched, hooks, owned):
     hooks.on_tool_updated.return_value = owned
@@ -160,8 +194,8 @@ def test_tool_logs_exactly_once_and_keeps_native_fallback(patched, hooks, owned)
     assert ctx.log_queue.qsize() == 1
     assert 'terminal: "preview"' in ctx.log_queue.get()
     assert owner._progress_emit.call_count == int(not owned)
-    hooks.on_tool_updated.assert_called_once_with(message_id="inbound", tool_name="terminal",
-                                                  status="started", detail="preview")
+    hooks.on_tool_updated.assert_called_once_with(message_id="inbound", chat_id="chat",
+                                                  tool_name="terminal", status="started", detail="preview")
     ctx.progress_queue = None
     progress(owner, "tool.completed", "terminal")
     assert hooks.on_tool_updated.call_count == 2
@@ -446,7 +480,7 @@ def test_card_interim_rejection_does_not_start_native_delivery(patched, hooks, m
     assert enabled
     interim("thought")
     stream.on_commentary.assert_not_called()
-    hooks.on_thinking_delta.assert_called_once_with(message_id="inbound", text="thought")
+    hooks.on_thinking_delta.assert_called_once_with(message_id="inbound", chat_id="chat", text="thought")
     interim("boundary", already_streamed=True)
     stream.on_segment_break.assert_not_called()
     assert hooks.on_thinking_delta.call_count == 1
@@ -485,7 +519,7 @@ def test_card_interim_preserves_tts_boundaries(hooks, revision, card_error):
     ctx._run_still_current.return_value = False
     interim("stale")
     assert voice.on_delta.call_count == 5
-    hooks.on_thinking_delta.assert_called_once_with(message_id="inbound", text="commentary")
+    hooks.on_thinking_delta.assert_called_once_with(message_id="inbound", chat_id="chat", text="commentary")
 
 
 @pytest.mark.asyncio

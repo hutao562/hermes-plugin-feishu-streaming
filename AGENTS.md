@@ -132,7 +132,8 @@ Card templates (cardkit/)
 - `streaming/session.py`：加 `reused: bool` 字段
 - `streaming/flush.py`：加 `reset_for_reactivate()`（撤销 `mark_completed`，重置 `_completed`/`_flush_in_progress`/timer）
 - `streaming/controller.py`：`_do_complete_card` finally 改为 **COMPLETED 不立即 cleanup**（`if session.state != COMPLETED: cleanup`）——保留供 background 复用，靠 `_prune_stale_sessions` TTL 清理。**关键 bug 修复**：原 `if not reused: cleanup` 因首回合完成时 `reused=False` 会立即清掉 session，background 回合 `_find_session_by_chat` 找不到
-- `patcher.py`：delta hook（`_tool_hook`/`_answer_hook`/`_thinking_hook`/`_reasoning_hook`）+ `_complete_hook` 加 `chat_id=source.chat_id`（这些 hook 注入在 `_run_agent_inner` 的闭包 callback，`source` 是形参，能直接读 `source.chat_id`）
+- `patcher.py`：单体版 delta hook（`_tool_hook`/`_answer_hook`/`_thinking_hook`/`_reasoning_hook`）+ `_complete_hook` 加 `chat_id` 透传
+- `split_gateway.py`（**split 布局的真正注入源，2026-09-21 踩坑**）：上游拆分网关合并后 delta/tool hook 实际由 `split_gateway.py` 的 `guarded("TOOL"/"ANSWER")` 模板生成——合并时 fork 的 chat_id 透传在这丢了（症状：日志 `delta NO session ... chat=`（空），busy redirect 回合整段走纯文本跑出卡片外）。已修：TOOL/ANSWER/THINKING 调用带 `chat_id=ctx.source.chat_id`，ANSWER 门加 `or _lark_ctrl.has_chat_card(ctx.source.chat_id)`（redirect 会切 `inbound_message_id`，message_id 查不到原回合卡片时按 chat 命中）；`controller.has_chat_card` 是无副作用门查询，重激活仍由 `_resolve_session` 做。**以后同步上游 split_gateway 代码时必须检查这几个 hook 的 chat_id 还在**
 - `patch.py`：delta 函数（`on_answer_delta` 等）加 `chat_id` 透传给 controller + `message_id` 类型放宽 `str | None`
 
 **踩坑**：曾试合成 message_id `bg_proc_{session_id}` 给 background 回合，但飞书 API 拒绝（message_id 必须 `om_xxx`）→ 改成按 chat 复用（不创建新卡，避开 API 校验）。
