@@ -332,12 +332,13 @@ class TestSourceDir:
 
 
 class TestVenvHasPlugin:
-    def test_venv_has_plugin_no_python_returns_false(self) -> None:
-        """没有 hermes python → 返回 False."""
+    def test_venv_has_plugin_no_python_falls_back_to_sys_executable(self) -> None:
+        """hermes python 定位不到 → 用 sys.executable 兜底（self-heal 跑在 gateway 进程内）."""
         from hermes_lark_streaming._source import venv_has_plugin
 
         with patch("hermes_lark_streaming.patcher.hermes_python", return_value=None):
-            assert venv_has_plugin() is False
+            # fork 语义：兜底解释器即当前 venv 的 python（editable 安装可见）→ True
+            assert venv_has_plugin() is True
 
     def test_venv_has_plugin_uses_neutral_cwd(self) -> None:
         """子进程 cwd 设为 /，避免 sys.path[0]='' 误判（gateway cwd 干扰）."""

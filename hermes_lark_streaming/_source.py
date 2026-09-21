@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import sys
 from pathlib import Path
 
 _logger = logging.getLogger("hermes_lark_streaming")
@@ -54,24 +55,34 @@ def venv_has_plugin(py: Path | None = None) -> bool:
     用子进程跑 ``find_spec``，**不依赖当前 cwd** —— gateway 进程 cwd 在 ``~/.hermes``，
     直接在本进程 import 会因 ``sys.path[0]=''`` 误判（源码目录恰好是 cwd 时假阳性）。
     子进程 cwd 设为无关目录（``/``）消除该干扰。
+
+    ``py`` 定位失败时（gateway 进程 PATH 里没有 hermes CLI）用 ``sys.executable``
+    兜底：self-heal 就在 gateway 进程内跑，它自己就是 hermes venv 的解释器。
     """
     if py is None:
         from .patcher import hermes_python
 
         py = hermes_python()
-    if py is None:
-        return False
-    try:
-        result = subprocess.run(
-            [str(py), "-c", "import importlib.util; import sys; "
-                            "sys.exit(0 if importlib.util.find_spec('hermes_lark_streaming') else 1)"],
-            capture_output=True,
-            cwd="/",  # 中立 cwd，避免 sys.path[0]='' 误判
-            timeout=15,
-        )
-        return result.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+    candidates = [py] if py is not None else []
+    candidates.append(Path(sys.executable))
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen or not candidate.exists():
+            continue
+        seen.add(candidate)
+        try:
+            result = subprocess.run(
+                [str(candidate), "-c", "import importlib.util; import sys; "
+                                       "sys.exit(0 if importlib.util.find_spec('hermes_lark_streaming') else 1)"],
+                capture_output=True,
+                cwd="/",  # 中立 cwd，避免 sys.path[0]='' 误判
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            return True
+    return False
 
 
 def reinstall_into_venv(py: Path | None = None) -> bool:
