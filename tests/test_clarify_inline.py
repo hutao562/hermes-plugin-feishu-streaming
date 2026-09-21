@@ -483,6 +483,95 @@ class TestPatchFeishuAdapter:
 
 
 # ---------------------------------------------------------------------------
+# 多 profile（多路复用 gateway）—— 每个 profile 一个 FeishuAdapter 类对象
+# ---------------------------------------------------------------------------
+
+def _install_two_fake_adapter_modules(cls_main: type, cls_family: type) -> None:
+    """模拟多路复用单进程：两个 hermes_plugins.feishu_platform* 模块实例."""
+    import sys
+    for name in ("hermes_plugins",):
+        if name not in sys.modules:
+            sys.modules[name] = types_module(name)
+    for modname, cls in (
+        ("hermes_plugins.feishu_platform.adapter", cls_main),
+        ("hermes_plugins.feishu_platform__home_deadbeef.adapter", cls_family),
+    ):
+        parts = modname.split(".")
+        for i in range(1, len(parts)):
+            parent = ".".join(parts[:i])
+            if parent not in sys.modules:
+                sys.modules[parent] = types_module(parent)
+        mod = types_module(modname)
+        mod.FeishuAdapter = cls  # type: ignore[attr-defined]
+        sys.modules[modname] = mod
+
+
+class TestMultiplexMultiProfile:
+    """多路复用 gateway 下，两个 profile 的 adapter 都要被 patch。"""
+
+    def teardown_method(self) -> None:
+        _cleanup_fake_modules()
+
+    def test_finds_all_adapter_classes(self) -> None:
+        cls_main = _make_fake_adapter()
+        cls_family = _make_fake_adapter()
+        _install_two_fake_adapter_modules(cls_main, cls_family)
+
+        classes = clarify._find_feishu_adapter_classes()
+        assert cls_main in classes
+        assert cls_family in classes
+        assert len(classes) >= 2
+
+    def test_patches_send_clarify_on_every_profile(self) -> None:
+        """send_clarify 必须 patch 到每个 profile 的类上，不只第一个。"""
+        cls_main = _make_fake_adapter()
+        cls_family = _make_fake_adapter()
+        _install_two_fake_adapter_modules(cls_main, cls_family)
+
+        with patch("hermes_lark_streaming.clarify.Config") as cfg:
+            cfg.return_value.clarify_inline = True
+            clarify.patch_feishu_adapter({})  # 无实例也能验证类 patch
+
+        assert getattr(cls_main.send_clarify, clarify._PATCH_MARK, False) is True  # type: ignore[attr-defined]
+        assert getattr(cls_family.send_clarify, clarify._PATCH_MARK, False) is True  # type: ignore[attr-defined]
+
+    def test_patches_processors_on_every_profile_instance(self) -> None:
+        """两个 profile 的 adapter 实例（摊平 list）processor.f 都要被替换。"""
+        cls_main = _make_fake_adapter()
+        cls_family = _make_fake_adapter()
+        _install_two_fake_adapter_modules(cls_main, cls_family)
+
+        procs = [_make_processor_mock(), _make_processor_mock()]
+        originals = [p.f for p in procs]
+        inst_main = _make_adapter_instance(cls_main, procs[0])
+        inst_family = _make_adapter_instance(cls_family, procs[1])
+
+        with patch("hermes_lark_streaming.clarify.Config") as cfg:
+            cfg.return_value.clarify_inline = True
+            clarify.patch_feishu_adapter([inst_main, inst_family])
+
+        for proc, original in zip(procs, originals, strict=True):
+            assert proc.f is not original
+            assert getattr(proc.f, clarify._PATCH_MARK, False) is True
+
+    def test_idempotent_across_profiles(self) -> None:
+        cls_main = _make_fake_adapter()
+        cls_family = _make_fake_adapter()
+        _install_two_fake_adapter_modules(cls_main, cls_family)
+        proc_main, proc_family = _make_processor_mock(), _make_processor_mock()
+        inst_main = _make_adapter_instance(cls_main, proc_main)
+        inst_family = _make_adapter_instance(cls_family, proc_family)
+        instances = [inst_main, inst_family]
+
+        with patch("hermes_lark_streaming.clarify.Config") as cfg:
+            cfg.return_value.clarify_inline = True
+            clarify.patch_feishu_adapter(instances)
+            first = (proc_main.f, proc_family.f, cls_main.send_clarify, cls_family.send_clarify)
+            clarify.patch_feishu_adapter(instances)
+            assert (proc_main.f, proc_family.f, cls_main.send_clarify, cls_family.send_clarify) == first
+
+
+# ---------------------------------------------------------------------------
 # send_clarify — end-to-end-ish with mocked adapter
 # ---------------------------------------------------------------------------
 

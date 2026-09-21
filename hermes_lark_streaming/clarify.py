@@ -421,7 +421,13 @@ def patch_feishu_adapter(adapters: Any) -> None:
         ``event_handler._callback_processor_map["p2.card.action.trigger"].f``
         （绑定方法快照）—— 直接替换该 processor 的 ``.f``，绕过快照。
 
-    ``adapters`` 是 gateway runner 的 ``self.adapters`` dict（Platform → 实例）。
+    ``adapters`` 是 gateway runner 的 ``self.adapters`` dict（Platform → 实例），
+    或多路复用下所有 profile 的 adapter 实例集合（list / dict 均可）。
+
+    多 profile（多路复用 gateway）：``sys.modules`` 里每个 profile 各有一个
+    FeishuAdapter 类对象，**逐个** patch ``send_clarify``；卡片回调 processor 按
+    实例替换（``_iter_feishu_adapters`` 的 duck-typing 兜底本就覆盖所有
+    FeishuAdapter 实例）。
     """
     try:
         if not Config().clarify_inline:
@@ -431,41 +437,49 @@ def patch_feishu_adapter(adapters: Any) -> None:
             "[clarify] failed to read clarify_inline config; defaulting to enabled"
         )
 
-    FeishuAdapter = _find_feishu_adapter_class()
-    if FeishuAdapter is None:
+    feishu_classes = _find_feishu_adapter_classes()
+    if not feishu_classes:
         _logger.info("[clarify] FeishuAdapter class not found; skipping clarify patch")
         return
 
-    # 1) patch send_clarify 类方法（运行时实例通过类属性查找命中）
-    send_patched = False
-    try:
-        current_send = getattr(FeishuAdapter, "send_clarify", None)
-        if not getattr(current_send, _PATCH_MARK, False):
-            setattr(_send_clarify, _PATCH_MARK, True)
-            FeishuAdapter.send_clarify = _send_clarify  # type: ignore[assignment]
-            send_patched = True
-    except Exception:
-        _logger.warning("[clarify] send_clarify patch failed", exc_info=True)
+    # 1) 每个 profile 的 FeishuAdapter 类都 patch send_clarify
+    #    （运行时实例通过自己类的属性查找命中）
+    patched_classes: list[str] = []
+    for feishu_cls in feishu_classes:
+        try:
+            current_send = getattr(feishu_cls, "send_clarify", None)
+            if not getattr(current_send, _PATCH_MARK, False):
+                setattr(_send_clarify, _PATCH_MARK, True)
+                feishu_cls.send_clarify = _send_clarify  # type: ignore[assignment]
+                patched_classes.append(getattr(feishu_cls, "__module__", "?"))
+        except Exception:
+            _logger.warning(
+                "[clarify] send_clarify patch failed for %s",
+                getattr(feishu_cls, "__module__", "?"),
+                exc_info=True,
+            )
 
     # 2) 替换每个 feishu 实例的 card-action processor.f
-    instances_patched = _patch_card_action_processors(adapters, FeishuAdapter)
+    instances_patched = _patch_card_action_processors(adapters, feishu_classes)
 
-    if send_patched or instances_patched:
+    if patched_classes or instances_patched:
         _logger.info(
-            "[clarify] patched: send_clarify=%s card_action_instances=%d module=%s",
-            send_patched, instances_patched, getattr(FeishuAdapter, "__module__", "?"),
+            "[clarify] patched: send_clarify classes=%s card_action_instances=%d",
+            patched_classes, instances_patched,
         )
-    elif not send_patched:
+    else:
         _logger.debug("[clarify] already patched (send_clarify + processors)")
 
 
-def _patch_card_action_processors(adapters: Any, feishu_cls: type) -> int:
+def _patch_card_action_processors(adapters: Any, feishu_cls: Any) -> int:
     """Replace ``processor.f`` on each feishu adapter's card-action handler.
 
     SDK 在 ``connect()`` 时把 ``adapter._on_card_action_trigger``（绑定方法）
     快照进 ``event_handler._callback_processor_map["p2.card.action.trigger"].f``。
     覆盖类属性已无法影响这个快照 —— 直接换 processor 的 ``.f`` 指向我们的
     wrapper，wrapper 闭包持有原 ``adapter`` 以调回原逻辑。
+
+    ``feishu_cls`` 可以是单个类或类的集合（多路复用下每个 profile 一个类）。
     """
     count = 0
     for adapter in _iter_feishu_adapters(adapters, feishu_cls):
@@ -523,8 +537,16 @@ def _make_card_action_wrapper(adapter: Any, original: Callable[..., Any]) -> Cal
     return wrapper
 
 
-def _iter_feishu_adapters(adapters: Any, feishu_cls: type) -> list[Any]:
-    """Yield feishu adapter instances from the gateway's adapters mapping."""
+def _iter_feishu_adapters(adapters: Any, feishu_cls: Any) -> list[Any]:
+    """Yield feishu adapter instances from the gateway's adapters mapping.
+
+    ``adapters`` 可以是 Platform→实例 的 mapping，也可以是实例集合（多路复用下
+    把各 profile 的 adapter 摊平成一个 list 传进来）。
+    ``feishu_cls`` 可以是单个类或类的集合。
+    """
+    feishu_classes = (
+        list(feishu_cls) if isinstance(feishu_cls, (list, tuple, set)) else [feishu_cls]
+    )
     result: list[Any] = []
     if not adapters:
         _logger.warning("[clarify] adapters is empty/None")
@@ -537,7 +559,7 @@ def _iter_feishu_adapters(adapters: Any, feishu_cls: type) -> list[Any]:
     for value in values:
         # isinstance may fail if feishu_cls is a stale shadow — also match by
         # class name + presence of _on_card_action_trigger as a fallback.
-        is_match = isinstance(value, feishu_cls)
+        is_match = any(isinstance(value, cls) for cls in feishu_classes)
         if not is_match:
             cls = type(value)
             if cls.__name__ == "FeishuAdapter" and hasattr(cls, "_on_card_action_trigger"):
@@ -549,22 +571,26 @@ def _iter_feishu_adapters(adapters: Any, feishu_cls: type) -> list[Any]:
             "[clarify] no feishu adapter found in %d values (types=%s, looking for %s)",
             len(values),
             [type(v).__name__ for v in values],
-            feishu_cls.__name__,
+            [getattr(c, "__name__", repr(c)) for c in feishu_classes],
         )
     return result
 
 
-def _find_feishu_adapter_class() -> Any:
-    """运行时从 sys.modules 扫描真正的 FeishuAdapter 类.
+def _find_feishu_adapter_classes() -> list[Any]:
+    """运行时从 sys.modules 扫描**所有** FeishuAdapter 类.
 
-    hermes plugin loader 把 ``plugins/platforms/feishu`` 加载成
-    ``hermes_plugins.feishu_platform``（slug 派生），和源码 import 路径不同。
-    扫 sys.modules 里所有名为 ``FeishuAdapter`` 且有 ``_on_card_action_trigger``
-    的类，命中真身。找不到则回退直接 import（开发/测试环境）。
+    多路复用 gateway 单进程内，每个 profile 各有一份 feishu 平台插件模块实例
+    （``hermes_plugins.feishu_platform.adapter``（默认 profile）与
+    ``hermes_plugins.feishu_platform__home_<hash>.adapter``（secondary profile）），
+    它们是**不同的类对象**——只 patch 一个，另一个 profile 的 clarify 就静默退化
+    成纯文本 fallback。这里全部返回（按身份去重），让调用方逐个 patch。
+
+    排序：``hermes_plugins.*``（loader slug）优先，源码路径影子类排后。
     """
     import sys
 
     candidates: list[Any] = []
+    seen: set[int] = set()
     # Snapshot names first — getattr on a module may trigger lazy imports that
     # mutate sys.modules mid-iteration.
     names = [n for n in list(sys.modules) if "feishu" in n.lower() and "adapter" in n.lower()]
@@ -576,17 +602,24 @@ def _find_feishu_adapter_class() -> Any:
             cls = getattr(mod, "FeishuAdapter", None)
         except Exception:
             continue
-        if isinstance(cls, type) and hasattr(cls, "_on_card_action_trigger"):
+        if isinstance(cls, type) and hasattr(cls, "_on_card_action_trigger") and id(cls) not in seen:
+            seen.add(id(cls))
             candidates.append(cls)
 
     if candidates:
-        for cls in candidates:
-            if "hermes_plugins" in getattr(cls, "__module__", ""):
-                return cls
-        return candidates[0]
+        candidates.sort(
+            key=lambda cls: "hermes_plugins" not in getattr(cls, "__module__", "")
+        )
+        return candidates
 
     try:
         from plugins.platforms.feishu.adapter import FeishuAdapter  # type: ignore[import-not-found]
-        return FeishuAdapter
+        return [FeishuAdapter]
     except Exception:
-        return None
+        return []
+
+
+def _find_feishu_adapter_class() -> Any:
+    """返回第一个候选类（兼容旧调用；多 profile 场景请用 _find_feishu_adapter_classes）。"""
+    classes = _find_feishu_adapter_classes()
+    return classes[0] if classes else None
