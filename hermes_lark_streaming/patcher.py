@@ -667,17 +667,6 @@ def _clarify_hook(indent: str) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def _safe_indent(lines: list[str], lineno: int) -> str:
-    """获取缩进，跳过空行."""
-    for i in range(lineno, -1, -1):
-        if 0 <= i < len(lines) and lines[i].strip():
-            return lines[i][: len(lines[i]) - len(lines[i].lstrip())]
-    for i in range(lineno + 1, len(lines)):
-        if lines[i].strip():
-            return lines[i][: len(lines[i]) - len(lines[i].lstrip())]
-    return ""
-
-
 def _adapter_init_hook(indent: str) -> str:
     # 在 gateway:startup emit 之后 patch（所有 adapter 已 connect，event_handler 已建）。
     return _make_hook(
@@ -772,7 +761,7 @@ def _inject_adapter_init(content: str) -> str:
             and isinstance(node.value.args[0], ast.Constant)
             and node.value.args[0].value == "gateway:startup"
         ):
-            idx = node.end_lineno  # 0-based 下一条语句行号
+            idx = node.end_lineno or node.lineno  # 0-based 下一条语句行号
             indent = _safe_indent(lines, idx)
             lines[idx:idx] = _adapter_init_hook(indent).splitlines(keepends=True)
             return "".join(lines)
@@ -796,7 +785,7 @@ def _inject_heartbeat(content: str) -> str:
                     and isinstance(stmt.targets[0], ast.Name)
                     and stmt.targets[0].id == "_heartbeat_text"
                 ):
-                    idx = stmt.end_lineno
+                    idx = stmt.end_lineno or stmt.lineno
                     indent = _safe_indent(lines, idx)
                     lines[idx:idx] = _heartbeat_hook(indent).splitlines(keepends=True)
                     return "".join(lines)
@@ -833,7 +822,7 @@ def _inject_turn_registry(content: str) -> str:
             and node.name == "_wire_turn_agent_callbacks"
         ):
             last = node.body[-1]
-            idx = last.end_lineno
+            idx = last.end_lineno or last.lineno
             indent = _safe_indent(lines, idx)
             lines[idx:idx] = _turn_registry_hook(indent).splitlines(keepends=True)
             return "".join(lines)

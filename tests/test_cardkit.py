@@ -117,8 +117,9 @@ class TestDowngradeTables:
         assert _downgrade_tables(text) == text
 
     def test_over_limit_downgraded(self) -> None:
+        # fork 阈值 _MAX_CARD_TABLES=8：9 个表格起降级
         table = "| A | B |\n|---|---|\n| 1 | 2 |"
-        text = "\n\n".join([table] * 6)
+        text = "\n\n".join([table] * 9)
         result = _downgrade_tables(text)
         assert result.count("```") >= 2  # 超限表格被包装为代码块
 
@@ -207,11 +208,9 @@ class TestBuildFooterElements:
         assert len(result) >= 2  # hr + markdown 元素
         assert "Completed" in result[1]["content"]
 
-    def test_empty_data_renders_default_status(self) -> None:
-        # 默认字段包含 "status"，总是会渲染
-        result = _build_footer_elements({})
-        assert len(result) >= 2
-        assert "Completed" in result[1]["content"]
+    def test_empty_data_renders_nothing_with_local_default_fields(self) -> None:
+        # fork 默认字段为 elapsed/model/context（不含 status）——空数据无渲染
+        assert _build_footer_elements({}) == []
 
     def test_status_error(self) -> None:
         result = _build_footer_elements({}, is_error=True, fields=[["status"]])
