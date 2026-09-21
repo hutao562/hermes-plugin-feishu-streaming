@@ -397,6 +397,15 @@ def _render_footer_field(
             return v, v
         return None, None
 
+    if name == "speed":
+        tps = data.get("tps")
+        if isinstance(tps, (int, float)) and tps > 0:
+            val = f"{tps:.0f} t/s"
+            if show_label:
+                return _T["speed"][0].format(val), _T["speed"][1].format(val)
+            return f"⚡ {val}", f"⚡ {val}"
+        return None, None
+
     if name == "context":
         used = data.get("context_used", 0) or 0
         max_c = data.get("context_max", 0) or 0

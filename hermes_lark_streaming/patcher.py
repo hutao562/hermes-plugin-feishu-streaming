@@ -451,6 +451,15 @@ def _tool_hook_v2(indent: str) -> str:
             "    if _hermes_lark_orig_tool_cb is not None:",
             "        _hermes_lark_orig_tool_cb(event_type, tool_name=tool_name, preview=preview, args=args, **kwargs)",
             "agent.tool_progress_callback = _hermes_lark_tool_wrapper",
+            "try:",
+            "    from hermes_lark_streaming.turn_registry import register as _lark_turn_register",
+            "    _lark_turn_register(",
+            "        message_id=self._ctx.event_message_id,",
+            "        chat_id=self._ctx.source.chat_id,",
+            "        agent=agent,",
+            "    )",
+            "except Exception:",
+            "    pass",
         ],
     )
 

@@ -19,6 +19,7 @@ from .streaming.controller import StreamingController
 from .streaming.segments import SegmentType
 from .streaming.session import CardSession, SessionState
 from .streaming.text import strip_reasoning_tags
+from . import turn_registry
 
 _logger = logging.getLogger("hermes_lark_streaming")
 _CARD_CREATION_WAIT_SEC = 10.0
@@ -702,6 +703,9 @@ class StreamCardController(StreamingController):
             )):
                 session.segment_state.on_answer_delta(final_answer)
 
+        # 模型速度（t/s）：从本回合 agent 的滚动历史算（与 CLI 状态栏同口径）
+        _tps = turn_registry.velocity(message_id=session.message_id, chat_id=session.chat_id)
+        turn_registry.clear(message_id=session.message_id, chat_id=session.chat_id)
         session.footer = {
             "duration": duration,
             "model": model,
@@ -709,6 +713,7 @@ class StreamCardController(StreamingController):
             **({"output_tokens": tokens.get("output_tokens")} if tokens else {}),
             **({"context_used": context.get("used_tokens")} if context else {}),
             **({"context_max": context.get("max_tokens")} if context else {}),
+            **({"tps": _tps} if _tps else {}),
         }
 
     def _complete_session(self, session: CardSession) -> None:
