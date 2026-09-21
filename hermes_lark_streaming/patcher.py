@@ -671,6 +671,9 @@ def _clarify_hook(indent: str) -> str:
 
 def _adapter_init_hook(indent: str) -> str:
     # 在 gateway:startup emit 之后 patch（所有 adapter 已 connect，event_handler 已建）。
+    # 多路复用 gateway：self.adapters 只有默认 profile 的实例，secondary profile 的
+    # adapter 在 self._profile_adapters[profile] 里，必须一并传入，否则 family 等
+    # profile 的 clarify 静默退化成纯文本。
     return _make_hook(
         indent,
         f"# {PREFIX}_ADAPTER_INIT_BEGIN",
@@ -678,7 +681,10 @@ def _adapter_init_hook(indent: str) -> str:
         [
             "try:",
             "    from hermes_lark_streaming.clarify import patch_feishu_adapter as _hermes_lark_clarify_patch",
-            "    _hermes_lark_clarify_patch(self.adapters)",
+            "    _hermes_lark_adapters = list((self.adapters or {}).values())",
+            "    for _hermes_lark_prof_adapters in (getattr(self, '_profile_adapters', None) or {}).values():",
+            "        _hermes_lark_adapters.extend((_hermes_lark_prof_adapters or {}).values())",
+            "    _hermes_lark_clarify_patch(_hermes_lark_adapters)",
             "except Exception:",
             "    pass",
         ],
