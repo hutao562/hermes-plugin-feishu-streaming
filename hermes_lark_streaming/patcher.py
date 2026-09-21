@@ -48,6 +48,8 @@ _EXT_HOOK_NAMES = [
     "BG_WATCHER_RUNNING",    # 旧版 bg watcher 注入形态（仅用于清理历史注入）
     "BG_WATCHER_FINISHED",   # bg watcher 通知接管（现用早返回形态）
     "TURN_REGISTRY",     # 登记本回合 agent，供卡片 footer 计算 t/s
+    # 旧 fork patcher 遗留 marker：功能已由上游 ANSWER wrapper 接管，只清理不再注入
+    "ANSWER_GUARD",
 ]
 EXT_MARKERS: list[tuple[str, str]] = [
     (f"# {PREFIX}_{n}_BEGIN", f"# {PREFIX}_{n}_END") for n in _EXT_HOOK_NAMES
