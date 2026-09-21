@@ -23,6 +23,7 @@ class SessionState(StrEnum):
     IDLE = "idle"
     CREATING = "creating"
     STREAMING = "streaming"
+    CLARIFY_PAUSED = "clarify_paused"
     COMPLETED = "completed"
     FAILED = "failed"
     ABORTED = "aborted"
@@ -45,6 +46,7 @@ class CardSession:
         "card_id",
         "card_msg_id",
         "chat_id",
+        "clarify_pending_split",
         "create_task",
         "created_at",
         "deferred_background_review_closed",
@@ -64,6 +66,7 @@ class CardSession:
         "reused",
         "segment_state",
         "sequence",
+        "session_key",
         "split_disabled",
         "split_index",
         "state",
@@ -79,6 +82,7 @@ class CardSession:
         self.message_id = message_id
         self.anchor_id: str | None = None
         self.chat_id = chat_id
+        self.session_key: str | None = None
         self.create_task: asyncio.Future[Any] | ConcurrentFuture | None = None
         self.state = SessionState.IDLE
         self.card_msg_id: str | None = None
@@ -110,6 +114,7 @@ class CardSession:
         self.element_count: int = 0
         self.split_disabled = False
         self.split_index: int = 0
+        self.clarify_pending_split: bool = False
 
     @property
     def has_card(self) -> bool:
