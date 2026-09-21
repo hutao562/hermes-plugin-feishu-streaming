@@ -120,10 +120,15 @@ def on_message_started(
     chat_id: str,
     anchor_id: str | None = None,
     thread_id: str | None = None,
+    session_key: str | None = None,
 ) -> None:
     """[注入点 1] 函数开头 — message.started."""
     ctrl.on_message_started(
-        message_id=message_id, chat_id=chat_id, anchor_id=anchor_id, thread_id=thread_id,
+        message_id=message_id,
+        chat_id=chat_id,
+        anchor_id=anchor_id,
+        thread_id=thread_id,
+        session_key=session_key,
     )
 
 
@@ -178,6 +183,8 @@ async def on_message_completed_wait(
     ctrl: Any,
     message_id: str | None,
     answer: str = "",
+    is_error: bool = False,
+    reconcile_answer: bool = False,
     duration: float = 0.0,
     model: str = "",
     tokens: dict[str, Any] | None = None,
@@ -190,6 +197,8 @@ async def on_message_completed_wait(
         await ctrl.on_completed_wait(
             message_id=message_id,
             answer=answer,
+            is_error=is_error,
+            reconcile_answer=reconcile_answer,
             duration=duration,
             model=model,
             tokens=tokens,
@@ -216,6 +225,7 @@ async def on_queued_followup_boundary(*, ctrl: Any, message_id: str, result: dic
         await ctrl.on_completed_wait(
             message_id=message_id,
             answer=result.get("final_response") or "",
+            is_error=bool(result.get("failed")),
             duration=0.0,
             model=result.get("model", ""),
             tokens={
@@ -231,6 +241,7 @@ async def on_queued_followup_boundary(*, ctrl: Any, message_id: str, result: dic
     if sent:
         result["response_previewed"] = True
         result["already_sent"] = True
+        result["final_response"] = ""
     else:
         ctrl.consume_text_fallback(message_id)
     return sent
@@ -313,6 +324,18 @@ def on_message_aborted(*, ctrl: Any, message_id: str) -> None:
     ctrl.on_aborted(message_id=message_id)
 
 
+async def on_session_aborted(*, session_key: str) -> bool:
+    """Terminate the active card after Hermes handles a busy-session /stop."""
+    try:
+        ctrl = get_controller()
+        if not ctrl.enabled:
+            return False
+        return bool(await ctrl.on_session_aborted(session_key=session_key))
+    except Exception as exc:
+        _logger.warning("on_session_aborted error: %s", exc, exc_info=True)
+        return False
+
+
 @_safe_hook()
 def on_message_interrupted(
     *,
@@ -321,6 +344,7 @@ def on_message_interrupted(
     new_message_id: str,
     chat_id: str,
     anchor_id: str | None = None,
+    session_key: str | None = None,
 ) -> None:
     """[注入点 9] interrupt 发生 — message.interrupted."""
     ctrl.on_interrupted(
@@ -328,6 +352,7 @@ def on_message_interrupted(
         new_message_id=new_message_id,
         chat_id=chat_id,
         anchor_id=anchor_id,
+        session_key=session_key,
     )
 
 
@@ -343,9 +368,6 @@ def on_cron_deliver(
     """[注入点 10] cron 推送 — 包装为飞书卡片发送."""
     # 用 cron.scheduler logger（进 agent.log），hermes_lark_streaming logger 不进文件
     _diag = logging.getLogger("cron.scheduler")
-    if loop is None:
-        _diag.info("[cheerwhy-cron] skip loop=None chat=%s", chat_id[:12])
-        return False
     try:
         ctrl = get_controller()
         if not ctrl.enabled:
@@ -354,9 +376,10 @@ def on_cron_deliver(
         _diag.info(
             "[cheerwhy-cron] call chat=%s content_len=%d", chat_id[:12], len(content)
         )
+        _extra: dict[str, str] = {"job_id": job_id} if job_id else {}
         ok = bool(ctrl.on_cron_deliver(
             chat_id=chat_id, content=content, loop=loop,
-            task_name=task_name, run_time=run_time, job_id=job_id,
+            task_name=task_name, run_time=run_time, **_extra,
         ))
         _diag.info("[cheerwhy-cron] result=%s chat=%s", ok, chat_id[:12])
         return ok
@@ -411,3 +434,27 @@ async def on_bg_watcher_notify(
     except Exception as exc:
         _logger.warning("on_bg_watcher_notify error: %s", exc, exc_info=True)
         return False
+
+
+@_safe_hook()
+def on_clarify_enter(
+    *,
+    ctrl: Any,
+    message_id: str,
+    chat_id: str | None = None,
+    session_key: str | None = None,
+) -> None:
+    """[注入点 12] clarify_callback 进入 — 暂停 flush 保留当前卡。"""
+    ctrl.on_clarify_enter(message_id=message_id, chat_id=chat_id, session_key=session_key)
+
+
+@_safe_hook()
+def on_clarify_exit(
+    *,
+    ctrl: Any,
+    message_id: str,
+    chat_id: str | None = None,
+    session_key: str | None = None,
+) -> None:
+    """[注入点 12] clarify_callback 退出 — 标记待封卡，等 tool.completed 触发切卡。"""
+    ctrl.on_clarify_exit(message_id=message_id, chat_id=chat_id, session_key=session_key)

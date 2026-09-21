@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
+import os
 import re
 import sys
 from collections.abc import Callable
@@ -47,7 +47,7 @@ def _print_usage() -> None:
     print("Usage: python -m hermes_lark_streaming <command>")
     print()
     print("Commands:")
-    print("  install    Apply AST patch to gateway/run.py and cron/scheduler.py")
+    print("  install    Apply AST hooks to Hermes gateway and cron modules")
     print("  uninstall  Remove AST patch")
     print("  restore    Restore from backup")
     print("  status     Show current patch status")
@@ -314,33 +314,19 @@ def _cmd_install() -> int:
     if patcher is None:
         return 1
 
-    if patcher.is_fully_patched():
-        print("Already patched.")
-    else:
-        print("Verifying target compatibility...")
-        try:
-            patcher.verify_target()
-        except Exception as e:
-            print(f"Verification failed: {e}")
-            return 1
-        print("Target compatible.")
+    from .patcher import install_patchers
 
-        print("Applying patch...")
-        try:
-            patcher.apply()
-        except Exception as e:
-            print(f"Patch failed: {e}")
-            return 1
-        print("Patch applied successfully.")
-
+    patchers: list[Patcher | CronPatcher] = [patcher]
     cron_patcher = _get_cron_patcher()
-    if cron_patcher is not None and not cron_patcher.is_patched():
-        try:
-            cron_patcher.verify_target()
-            cron_patcher.apply()
-            print("Cron hook applied.")
-        except Exception as e:
-            print(f"Cron hook skipped: {e}")
+    if cron_patcher is not None:
+        patchers.append(cron_patcher)
+    print("Verifying and preparing all gateway/cron hooks before writing...")
+    try:
+        install_patchers(patchers)
+    except Exception as e:
+        print(f"Patch failed: {e}")
+        return 1
+    print("Hooks installed. Restart Hermes Gateway to load the changes.")
 
     # 启用插件（entry-point 插件 opt-in，否则 register() 自愈不会被调用）
     try:
@@ -358,6 +344,8 @@ def _cmd_uninstall() -> int:
     if patcher is None:
         return 1
 
+    from .patcher import _write_changes
+
     _uninstall_watchdog()
     try:
         _set_plugin_enabled(False)
@@ -365,21 +353,17 @@ def _cmd_uninstall() -> int:
     except Exception as e:
         print(f"Config disable skipped: {e}")
 
-    cron_patcher = _get_cron_patcher()
-    if cron_patcher is not None and cron_patcher.is_patched():
-        try:
-            cron_patcher.remove()
-            print("Cron hook removed.")
-        except Exception as e:
-            print(f"Cron hook remove failed: {e}")
-
     if not patcher.is_patched():
         print("Not patched.")
         return 0
 
     print("Removing patch...")
     try:
-        patcher.remove()
+        changes = patcher.prepare_remove()
+        cron_patcher = _get_cron_patcher()
+        if cron_patcher is not None:
+            changes.update(cron_patcher.prepare_remove())
+        _write_changes(changes)
     except Exception as e:
         print(f"Remove failed: {e}")
         return 1
@@ -392,17 +376,17 @@ def _cmd_restore() -> int:
     if patcher is None:
         return 1
 
-    cron_patcher = _get_cron_patcher()
-    if cron_patcher is not None:
-        try:
-            cron_patcher.restore()
-            print("Cron hook restored.")
-        except Exception:
-            pass
+    from .patcher import _BACKUP_SUFFIX, _write_changes
 
     print("Restoring from backup...")
     try:
-        patcher.restore()
+        changes = patcher.prepare_restore()
+        cron_patcher = _get_cron_patcher()
+        if cron_patcher is not None:
+            backup = cron_patcher.cron_path.with_suffix(cron_patcher.cron_path.suffix + _BACKUP_SUFFIX)
+            if backup.exists() or cron_patcher.is_patched():
+                changes.update(cron_patcher.prepare_restore())
+        _write_changes(changes)
     except Exception as e:
         print(f"Restore failed: {e}")
         return 1
@@ -418,6 +402,7 @@ def _cmd_status() -> int:
     patched = patcher.is_patched()
     print(f"Patched: {'yes' if patched else 'no'}")
     print(f"Target:  {patcher.run_path}")
+    print(f"Layout:  {'split gateway modules' if patcher.split else 'monolithic gateway'}")
 
     # 插件是否在 venv 可 import（升级重建 venv 会丢 editable 安装 —— 即便 patch 打了
     # gateway 进程也 ImportError，streaming 静默失效。这是最关键的诊断项）。
@@ -434,33 +419,39 @@ def _cmd_status() -> int:
         print(f"Plugin in venv: unknown ({e})")
 
     if patched:
-        from .patcher import Patcher as _PatcherCls
-
-        all_text = ""
-        target_files = list(patcher.targets) if hasattr(patcher, "targets") else [patcher.run_path]
-        for p in target_files:
-            with contextlib.suppress(OSError):
-                all_text += p.read_text(encoding="utf-8") + "\n"
-        for begin, _end in _PatcherCls.MARKERS:
-            found = begin in all_text
-            label = begin.replace("# HERMES_LARK_", "").replace("_BEGIN", "").lower()
-            print(f"  {label}: {'installed' if found else 'missing'}")
-        # 多文件布局：标注各目标文件（新版），便于判断注入落位。
-        if len(target_files) > 1:
-            print(f"  targets({len(target_files)}):")
-            for p in target_files:
-                try:
-                    n = p.read_text(encoding="utf-8").count("HERMES_LARK_") // 2
-                except OSError:
-                    n = 0
-                print(f"    {p.name}: {n} markers")
+        print(f"Fully patched: {'yes' if patcher.is_fully_patched() else 'no'}")
+    for path in patcher.target_paths:
+        if not path.exists():
+            print(f"  {path.name}: MISSING FILE")
+            continue
+        content = path.read_text(encoding="utf-8")
+        labels = [
+            begin.replace("# HERMES_LARK_", "").replace("_BEGIN", "").lower()
+            for begin, _end in patcher.MARKERS if begin in content
+        ]
+        print(f"  {path.name}: {', '.join(labels) if labels else 'no hooks'}")
 
     cron_patcher = _get_cron_patcher()
     if cron_patcher is not None:
         print(f"Cron hook: {'installed' if cron_patcher.is_patched() else 'not installed'}")
+        print(f"Cron target: {cron_patcher.cron_path}")
+        if cron_patcher.is_patched():
+            print(f"Cron fully patched: {'yes' if cron_patcher.is_fully_patched() else 'no'}")
 
     # Check config
     from .config import Config
+
+    # Since Hermes v0.20.6 the CLI runs in a subprocess without the gateway process's
+    # environment, so _get_secret cannot see FEISHU_APP_ID here. Source ~/.hermes/.env
+    # manually; setdefault keeps already-exported variables authoritative.
+    _env_file = Path.home() / ".hermes" / ".env"
+    if _env_file.exists():
+        for _line in _env_file.read_text(encoding="utf-8").splitlines():
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
     cfg = Config()
     print(f"Config streaming.enabled: {cfg.enabled}")
@@ -516,6 +507,10 @@ def _cmd_verify() -> int:
         return 1
 
     print(f"Target: {patcher.run_path}")
+    if patcher.split:
+        print("Layout: split gateway modules")
+        for path in patcher.target_paths[1:]:
+            print(f"  {path}")
     print("Checking compatibility...")
     try:
         patcher.verify_target()

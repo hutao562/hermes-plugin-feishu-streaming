@@ -49,6 +49,7 @@ gateway/run.py (Hermes)
        ├─ on_queued_followup_result   → patch.on_queued_followup_result() (carry deepest completion ID through recursive merge)
        ├─ on_message_completed_wait → controller.on_completed_wait()
        ├─ on_message_aborted    → controller.on_aborted()
+       ├─ on_session_aborted    → controller.on_session_aborted() (busy-session /stop)
        └─ on_background_deliver → controller.on_background_deliver()
   └─ ADAPTER_INIT (injected AFTER gateway:startup emit in start()) → clarify.patch_feishu_adapter(self.adapters)
        └─ patches FeishuAdapter.send_clarify (class method) + replaces SDK card-action processor.f (clarify inline single-select)
@@ -60,6 +61,7 @@ cron/scheduler.py (Hermes)
 StreamCardController (singleton, controller.py)
   ├─ CardSession per message (state machine: IDLE→CREATING→STREAMING→COMPLETED/FAILED/ABORTED)
   │   └─ stream segments: CardSession.segment_state (SegmentState)
+  ├─ _session_keys — Hermes session_key → active CardSession mapping for precise /stop handling
   ├─ _interrupt_map — old_message_id → new_message_id mapping for interrupt redirect
   ├─ FlushController (streaming/flush.py) — throttles CardKit updates (100ms)
   ├─ ToolUseTracker (streaming/tooluse.py) — tracks tool call lifecycle with icon/status mapping
