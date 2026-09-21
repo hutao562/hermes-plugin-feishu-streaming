@@ -162,6 +162,20 @@ class StreamCardController(StreamingController):
             "[cheerwhy-merge] session reactivated msg=%s (cross-turn merge)", session.message_id[:12])
         return True
 
+    def has_chat_card(self, chat_id: str | None) -> bool:
+        """同 chat 是否存在可接流的卡片（STREAMING 或可重激活的 COMPLETED）.
+
+        供注入侧 delta 前置判断：busy redirect 会把 inbound_message_id 切到新消息，
+        原回合卡片按 message_id 查不到时按 chat 兜底命中，避免内容走 Hermes 纯文本。
+        无副作用——真正的重激活仍由 _resolve_session 在首条 delta 时完成。
+        """
+        if not chat_id:
+            return False
+        session = self._find_session_by_chat(chat_id)
+        if session is None:
+            return False
+        return session.state in (SessionState.STREAMING, SessionState.COMPLETED)
+
     def _resolve_session(
         self, message_id: str | None, chat_id: str | None,
     ) -> CardSession | None:

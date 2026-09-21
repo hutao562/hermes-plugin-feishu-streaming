@@ -268,6 +268,7 @@ class TestGeneratedAnswerHook:
         callback = _build_answer_hook_runner(use_turn_context=True)
         ctx = MagicMock()
         ctx.event_message_id = "modern-message"
+        ctx.source.chat_id = "chat"
         ctx._run_still_current.return_value = True
 
         with patch(
@@ -277,7 +278,7 @@ class TestGeneratedAnswerHook:
             result = callback("delta", ctx)
 
         assert result is None
-        on_answer_delta.assert_called_once_with(message_id="modern-message", text="delta")
+        on_answer_delta.assert_called_once_with(message_id="modern-message", chat_id="chat", text="delta")
 
     def test_legacy_scope_consumes_delta(self) -> None:
         callback = _build_answer_hook_runner(use_turn_context=False)
@@ -290,7 +291,7 @@ class TestGeneratedAnswerHook:
             result = callback("delta", "legacy-message", run_still_current)
 
         assert result is None
-        on_answer_delta.assert_called_once_with(message_id="legacy-message", text="delta")
+        on_answer_delta.assert_called_once_with(message_id="legacy-message", chat_id=None, text="delta")
 
     def test_unconsumed_delta_falls_through_to_native_stream(self) -> None:
         callback = _build_answer_hook_runner(use_turn_context=True)
@@ -308,6 +309,7 @@ class TestGeneratedToolHook:
     def test_turn_callbacks_scope_consumes_tool_event_before_ctx_binding(self) -> None:
         ctx = MagicMock()
         ctx.event_message_id = "modern-message"
+        ctx.source.chat_id = "chat"
         ctx._run_still_current.return_value = True
         ctx.log_queue = None
         callback = _build_tool_hook_runner(use_turn_context=True)(ctx)
@@ -321,6 +323,7 @@ class TestGeneratedToolHook:
         assert result is None
         on_tool_updated.assert_called_once_with(
             message_id="modern-message",
+            chat_id="chat",
             tool_name="search",
             status="started",
             detail="query",
@@ -359,6 +362,7 @@ class TestGeneratedToolHook:
         assert result is None
         on_tool_updated.assert_called_once_with(
             message_id="legacy-message",
+            chat_id=None,
             tool_name="search",
             status="completed",
             detail="done",
@@ -531,9 +535,7 @@ class TestApplyRemove:
         assert "message_id=_lark_completion_id" in content
         assert "_lark_message_id = ctx.event_message_id" in content
         assert "_lark_run_current = ctx._run_still_current" in content
-        assert "on_answer_delta(message_id=_lark_message_id" in content
-        assert "on_thinking_delta(message_id=_lark_message_id" in content
-        assert "on_reasoning_delta(message_id=_lark_message_id" in content
+        assert "message_id=_lark_message_id, chat_id=_lark_chat_id" in content
         assert "on_background_deliver(" in content
         assert "_bg_preview = prompt[:60] + ('...' if len(prompt) > 60 else '')" in content
         assert "content=text_content" in content

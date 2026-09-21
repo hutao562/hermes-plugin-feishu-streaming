@@ -106,7 +106,8 @@ def inject_gateway(filename: str, content: str) -> str:
         insert(node, guarded("TOOL", f"""
             from hermes_lark_streaming.patch import on_tool_updated
             if ctx._run_still_current() and event_type in ('tool.started', 'tool.completed'):
-                if on_tool_updated(message_id={identity}, tool_name=tool_name or '',
+                if on_tool_updated(message_id={identity}, chat_id=ctx.source.chat_id,
+                                   tool_name=tool_name or '',
                                    status='started' if event_type == 'tool.started' else 'completed',
                                    detail=preview or ''):
                     return
@@ -126,13 +127,16 @@ def inject_gateway(filename: str, content: str) -> str:
                 # Reserve one text transport until the outer completion hook decides delivery.
                 # Include failed creation sessions: native finish() must not send ahead of the
                 # completion hook clearing already_sent and delivering the full fallback text.
-                if _lark_ctrl.enabled and {identity} in _lark_ctrl._sessions:
+                # has_chat_card：busy redirect 会切换 inbound_message_id（原回合卡片还在流式），
+                # message_id 查不到时按 chat 复用原卡片（跨回合合并语义）。
+                if (_lark_ctrl.enabled and ({identity} in _lark_ctrl._sessions
+                                            or _lark_ctrl.has_chat_card(ctx.source.chat_id))):
                     def _lark_stream_delta(text):
                         if not ctx._run_still_current():
                             return
                         try:
                             if text:
-                                on_answer_delta(message_id={identity}, text=text)
+                                on_answer_delta(message_id={identity}, chat_id=ctx.source.chat_id, text=text)
                         except Exception:
                             logger.debug('Card streaming callback failed', exc_info=True)
                         if stts is not None:
@@ -145,7 +149,7 @@ def inject_gateway(filename: str, content: str) -> str:
                             return
                         try:
                             if text and not already_streamed:
-                                on_thinking_delta(message_id={identity}, text=text)
+                                on_thinking_delta(message_id={identity}, chat_id=ctx.source.chat_id, text=text)
                         except Exception:
                             logger.debug('Card interim callback failed', exc_info=True)
                         if stts is not None:

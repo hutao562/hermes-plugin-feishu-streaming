@@ -151,3 +151,33 @@ def test_reactivate_only_for_completed_state() -> None:
     s_fail.state = SessionState.FAILED
     s_fail.card_id = "c"
     assert ctrl._reactivate_session(s_fail) is False
+
+
+def test_has_chat_card_gate_states() -> None:
+    """has_chat_card：注入侧 delta 门查询——STREAMING/COMPLETED 可接流，FAILED/ABORTED/无卡/无 chat 不可。"""
+    ctrl = StreamCardController()
+    _enable(ctrl)
+
+    import asyncio as _a
+    loop = _a.new_event_loop()
+    from hermes_lark_streaming.streaming.session import CardSession
+
+    s_stream = CardSession("om_s", "oc_gate", loop)
+    s_stream.state = SessionState.STREAMING
+    s_stream.card_id = "c"
+    ctrl._sessions["om_s"] = s_stream
+    ctrl._chat_index["oc_gate"] = "om_s"
+
+    assert ctrl.has_chat_card("oc_gate") is True  # STREAMING → 可接流
+
+    s_stream.state = SessionState.COMPLETED
+    assert ctrl.has_chat_card("oc_gate") is True  # COMPLETED → 可重激活接流
+
+    s_stream.state = SessionState.FAILED
+    assert ctrl.has_chat_card("oc_gate") is False  # FAILED → 不可
+
+    s_stream.state = SessionState.ABORTED
+    assert ctrl.has_chat_card("oc_gate") is False  # ABORTED → 不可
+
+    assert ctrl.has_chat_card(None) is False  # 无 chat_id → 不可
+    assert ctrl.has_chat_card("oc_unknown") is False  # 未知 chat → 不可
