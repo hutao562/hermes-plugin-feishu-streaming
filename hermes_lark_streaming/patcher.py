@@ -1032,15 +1032,17 @@ class Patcher:
                 raise PatcherError(f"Missing split gateway module: {path}")
             content = _clean_hooks(_read_source(path), self.MARKERS)
             if self.split:
-                from .split_gateway import inject_gateway
+                from .split_gateway import GATEWAY_FILES, inject_gateway
 
                 if path == self.run_path:
                     updated = content
-                else:
+                elif path.name in GATEWAY_FILES:
                     updated = inject_gateway(path.name, content)
-                    injector = _LOCAL_INJECTORS.get(path.name)
-                    if injector is not None:
-                        updated = injector(updated)
+                else:
+                    updated = content  # fork 扩展目标（run_startup/run_notifications）
+                injector = _LOCAL_INJECTORS.get(path.name)
+                if injector is not None:
+                    updated = injector(updated)
             else:
                 self._verify_legacy(content)
                 updated = self._inject_all(content)
