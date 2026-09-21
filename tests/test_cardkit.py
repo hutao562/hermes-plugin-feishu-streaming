@@ -237,6 +237,14 @@ class TestBuildFooterElements:
         assert "↑" in result[1]["content"]
         assert "↓" in result[1]["content"]
 
+    def test_speed_displayed(self) -> None:
+        result = _build_footer_elements({"tps": 42.4}, fields=[["speed"]])
+        assert "42 t/s" in result[1]["content"]
+        assert "⚡" in result[1]["content"]
+
+    def test_speed_hidden_without_data(self) -> None:
+        assert _build_footer_elements({}, fields=[["speed"]]) == []
+
     def test_show_label(self) -> None:
         result = _build_footer_elements(
             {"duration": 5},
