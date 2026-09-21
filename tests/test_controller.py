@@ -1999,10 +1999,26 @@ class TestDoCompleteCard:
 
         assert session.segment_state.segments[0].elapsed_ms > 0
         assert session.state == SessionState.COMPLETED
-        # COMPLETED session 不立即 cleanup——保留供 background 回合复用（跨回合合并），靠 TTL
-        assert "msg_fc" in ctrl._sessions
-        ctrl._cleanup("msg_fc")  # 显式清理（模拟 TTL 过期）
+        # 默认（keep_completed_sessions=False，上游语义）：完成即清理
         assert "msg_fc" not in ctrl._sessions
+
+    @pytest.mark.asyncio
+    async def test_finalize_keeps_completed_session_when_configured(self) -> None:
+        ctrl = _setup_ctrl()
+        ctrl._cfg._raw["streaming"]["keep_completed_sessions"] = True
+        session = _make_session("msg_fc_keep")
+        session.state = SessionState.STREAMING
+        session.card_id = "card_fc"
+        session.segment_state.on_reasoning_delta("think")
+        ctrl._sessions["msg_fc_keep"] = session
+
+        await ctrl._do_complete_card(session)
+
+        assert session.state == SessionState.COMPLETED
+        # keep_completed_sessions：COMPLETED session 保留供 background 回合复用（跨回合合并），靠 TTL
+        assert "msg_fc_keep" in ctrl._sessions
+        ctrl._cleanup("msg_fc_keep")  # 显式清理（模拟 TTL 过期）
+        assert "msg_fc_keep" not in ctrl._sessions
 
     @pytest.mark.asyncio
     async def test_no_card_id_skips_close(self) -> None:
