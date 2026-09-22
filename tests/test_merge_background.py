@@ -288,10 +288,11 @@ def test_redirect_opens_new_card_and_routes_completion() -> None:
     with patch.object(ctrl, "_complete_session") as complete_mock:
         ctrl.on_redirect_started(message_id="om_new", chat_id=chat, anchor_id="om_new", session_key="sk")
 
-    # 旧卡：NOTICE 收尾 + 触发完成
+    # 旧卡：NOTICE 收尾 + 触发完成 + 同步置终态（防尾部 delta 插到 NOTICE 后）
     from hermes_lark_streaming.streaming.segments import SegmentType as _ST
     assert old_session.segment_state.segments[-1].type == _ST.NOTICE
     assert "新卡片" in old_session.segment_state.segments[-1].text
+    assert old_session.state == SessionState.COMPLETED
     complete_mock.assert_called_once()
 
     # 路由：old→new 映射 + chat 索引指向新卡 + 新 session 已建

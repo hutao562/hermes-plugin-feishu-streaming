@@ -545,6 +545,9 @@ class StreamCardController(StreamingController):
         if old_session is not None and old_session.has_card and old_session.state == SessionState.STREAMING:
             if old_session.segment_state is not None:
                 old_session.segment_state.add_notice("↪ 任务已按新指令重启，结果见下方新卡片")
+            # 同步置终态：关闭「完成渲染是异步」的窗口，防止缓冲的尾部 delta
+            # 继续挂进旧卡插到 NOTICE 之后（实测会把提示语和「新卡片在下方」隔开）
+            old_session.state = SessionState.COMPLETED
             old_session.flush.mark_completed()
             _gw.info(
                 "[cheerwhy-card] redirect: 旧卡收尾 msg=%s → 新卡 msg=%s",
