@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ from lark_oapi.api.cardkit.v1 import (
     UpdateCardRequestBody,
 )
 from lark_oapi.api.im.v1 import (
+    CreateFileRequest,
+    CreateFileRequestBody,
     CreateImageRequest,
     CreateImageRequestBody,
     CreateMessageRequest,
@@ -37,6 +40,22 @@ from lark_oapi.api.im.v1 import (
 )
 
 from .config import DEFAULT_DOMAIN
+
+_FILE_TYPE_BY_EXT: dict[str, str] = {
+    ".pdf": "pdf",
+    ".doc": "doc",
+    ".docx": "doc",
+    ".xls": "xls",
+    ".xlsx": "xls",
+    ".csv": "xls",
+    ".ppt": "ppt",
+    ".pptx": "ppt",
+    ".mp4": "mp4",
+    ".mov": "mp4",
+    ".opus": "opus",
+    ".ogg": "opus",
+}
+
 
 _logger = logging.getLogger("hermes_lark_streaming")
 
@@ -383,3 +402,54 @@ class FeishuClient:
         except (URLError, OSError):
             _logger.debug("image download failed: %s", url)
             return None
+    async def _upload_file_bytes(self, data: bytes, file_name: str, file_type: str) -> str | None:
+        """上传文件字节到飞书 IM，返回 file_key（失败返回 None，不抛异常）."""
+        file = io.BytesIO(data)
+        builder = CreateFileRequestBody.builder().file_type(file_type).file_name(file_name).file(file)
+        request = CreateFileRequest.builder().request_body(builder.build()).build()
+        resp = await self._client.im.v1.file.acreate(request)
+        if resp.success() and resp.data and getattr(resp.data, "file_key", None):
+            return str(resp.data.file_key)
+        _logger.warning(
+            "file upload failed: code=%s msg=%s file=%s",
+            getattr(resp, "code", None), getattr(resp, "msg", None), file_name,
+        )
+        return None
+
+    async def upload_document(self, file_path: str, *, file_name: str | None = None) -> str | None:
+        """上传本地文档/文件到飞书，返回 file_key（支持 file:// 前缀 / 裸路径）.
+
+        file_type 按扩展名映射（pdf/doc/xls/ppt/mp4/opus），未知扩展名用 stream。
+        """
+        p = file_path[7:] if file_path.startswith("file://") else file_path
+        name = file_name or os.path.basename(p)
+        ext = os.path.splitext(name)[1].lower()
+        file_type = _FILE_TYPE_BY_EXT.get(ext, "stream")
+        try:
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(None, self._read_image_file, p)
+        except Exception:
+            _logger.debug("document upload failed for %s", file_path, exc_info=True)
+            return None
+        if not data:
+            return None
+        return await self._upload_file_bytes(data, name, file_type)
+
+    async def reply_file_by_id(self, message_id: str, file_key: str, file_name: str) -> bool:
+        """以 file 消息回复指定消息（卡片消息），文件落在卡片正下方的会话链里."""
+        request = (
+            ReplyMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                ReplyMessageRequestBody.builder()
+                .msg_type("file")
+                .content(self._dumps({"file_id": file_key}))
+                .build()
+            )
+            .build()
+        )
+        resp = await self._checked_call(
+            "reply_file_by_id",
+            lambda: self._client.im.v1.message.areply(request),
+        )
+        return bool(resp.data and resp.data.message_id)

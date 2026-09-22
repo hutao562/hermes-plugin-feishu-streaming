@@ -1999,7 +1999,9 @@ class TestDoCompleteCard:
 
         assert session.segment_state.segments[0].elapsed_ms > 0
         assert session.state == SessionState.COMPLETED
-        # 默认（keep_completed_sessions=False，上游语义）：完成即清理
+        # 默认（keep_completed_sessions=True，fork 语义）：COMPLETED session 保留供复用
+        assert "msg_fc" in ctrl._sessions
+        ctrl._cleanup("msg_fc")  # 显式清理（模拟 TTL 过期）
         assert "msg_fc" not in ctrl._sessions
 
     @pytest.mark.asyncio
