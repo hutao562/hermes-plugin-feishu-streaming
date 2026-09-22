@@ -436,14 +436,18 @@ class FeishuClient:
         return await self._upload_file_bytes(data, name, file_type)
 
     async def reply_file_by_id(self, message_id: str, file_key: str, file_name: str) -> bool:
-        """以 file 消息回复指定消息（卡片消息），文件落在卡片正下方的会话链里."""
+        """以 file 消息回复指定消息（卡片消息），文件落在卡片正下方的会话链里.
+
+        内容字段用 file_key（与 FeishuAdapter._send_uploaded_file_message 的
+        key_payload 一致——官方文档写 file_id，实测 230001 内容校验失败）。
+        """
         request = (
             ReplyMessageRequest.builder()
             .message_id(message_id)
             .request_body(
                 ReplyMessageRequestBody.builder()
                 .msg_type("file")
-                .content(self._dumps({"file_id": file_key}))
+                .content(self._dumps({"file_key": file_key}))
                 .build()
             )
             .build()
