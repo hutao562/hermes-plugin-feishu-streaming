@@ -50,6 +50,7 @@ _EXT_HOOK_NAMES = [
     "TURN_REGISTRY",     # 登记本回合 agent，供卡片 footer 计算 t/s
     "DOC_DELIVER",       # 文档交付回复到卡片消息下方（飞书卡片无 file 组件）
     "BUSY_ACK",          # busy ack（redirect/queue/steer）提示进卡片状态行
+    "REDIRECT",          # busy redirect 生效点：旧卡收尾 + 为纠正消息开新卡
     # 旧 fork patcher 遗留 marker：功能已由上游 ANSWER wrapper 接管，只清理不再注入
     "ANSWER_GUARD",
 ]
@@ -928,10 +929,56 @@ def _inject_busy_ack(content: str) -> str:
     return "".join(lines)
 
 
+def _redirect_hook(indent: str) -> str:
+    # busy redirect 生效点：旧卡优雅收尾 + 为纠正消息开新卡（steer/queue 不触发）。
+    return _make_hook(
+        indent,
+        f"# {PREFIX}_REDIRECT_BEGIN",
+        f"# {PREFIX}_REDIRECT_END",
+        [
+            "try:",
+            "    if redirected and event.source.platform.value.lower() in ('feishu', 'lark'):",
+            "        from hermes_lark_streaming.patch import on_redirect_started",
+            "        on_redirect_started(",
+            "            message_id=event.message_id,",
+            "            chat_id=event.source.chat_id,",
+            "            anchor_id=event.message_id,",
+            "            session_key=session_key,",
+            "        )",
+            *_hook_exception_lines("redirect"),
+        ],
+    )
+
+
+def _inject_redirect(content: str) -> str:
+    """run_busy.py：_handle_active_session_busy_message 的 redirect 解析赋值之后插入。"""
+    tree = ast.parse(content)
+    lines = content.splitlines(keepends=True)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Tuple)
+            and [getattr(t, "id", None) for t in node.targets[0].elts] == ["effective_mode", "redirected"]
+        ):
+            idx = node.end_lineno or node.lineno
+            indent = _safe_indent(lines, idx)
+            lines[idx:idx] = _redirect_hook(indent).splitlines(keepends=True)
+            return "".join(lines)
+    _logger.warning("run_busy.py: redirect resolution assignment not found — skipping REDIRECT")
+    return content
+
+
 def _inject_notifications_ext(content: str) -> str:
     """run_notifications.py 的 fork 扩展集合：bg watcher 接管 + 文档交付进卡。"""
     content = _inject_bg_watcher(content)
     return _inject_doc_deliver(content)
+
+
+def _inject_busy_ext(content: str) -> str:
+    """run_busy.py 的 fork 扩展集合：busy ack 进状态行 + redirect 开新卡。"""
+    content = _inject_busy_ack(content)
+    return _inject_redirect(content)
 
 
 _LOCAL_INJECTORS = {
@@ -939,7 +986,7 @@ _LOCAL_INJECTORS = {
     "run_notifications.py": _inject_notifications_ext,
     "run_turn.py": _inject_heartbeat,
     "run_turn_runner.py": _inject_turn_registry,
-    "run_busy.py": _inject_busy_ack,
+    "run_busy.py": _inject_busy_ext,
 }
 
 

@@ -452,6 +452,25 @@ async def on_document_deliver(*, chat_id: str, file_path: str) -> bool:
         return False
 
 
+def on_redirect_started(
+    *,
+    message_id: str,
+    chat_id: str,
+    anchor_id: str | None = None,
+    session_key: str | None = None,
+) -> None:
+    """[注入点 18] busy redirect 生效点 — 旧卡优雅收尾 + 为纠正消息开新卡."""
+    try:
+        ctrl = get_controller()
+        if not ctrl.enabled:
+            return
+        ctrl.on_redirect_started(
+            message_id=message_id, chat_id=chat_id, anchor_id=anchor_id, session_key=session_key,
+        )
+    except Exception as exc:
+        _logger.warning("on_redirect_started error: %s", exc, exc_info=True)
+
+
 def on_busy_ack(*, chat_id: str, text: str) -> bool:
     """[注入点 17] _send_busy_reply — busy ack（redirect/queue/steer）提示进卡片状态行."""
     try:
