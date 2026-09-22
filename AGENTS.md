@@ -50,7 +50,9 @@ gateway/run.py (Hermes)
        ├─ on_message_completed_wait → controller.on_completed_wait()
        ├─ on_message_aborted    → controller.on_aborted()
        ├─ on_session_aborted    → controller.on_session_aborted() (busy-session /stop)
-       └─ on_background_deliver → controller.on_background_deliver()
+       ├─ on_background_deliver → controller.on_background_deliver()
+       ├─ on_document_deliver   → controller.on_document_deliver() (run_notifications _deliver_media_from_response；文件回复到卡片消息下方)
+       └─ on_busy_ack           → controller.on_busy_ack() (run_busy _send_busy_reply；redirect/queue 提示进卡片心跳状态行)
   └─ ADAPTER_INIT (injected AFTER gateway:startup emit in start()) → clarify.patch_feishu_adapter(self.adapters)
        └─ patches FeishuAdapter.send_clarify (class method) + replaces SDK card-action processor.f (clarify inline single-select)
 
@@ -138,6 +140,8 @@ Card templates (cardkit/)
 
 **踩坑**：曾试合成 message_id `bg_proc_{session_id}` 给 background 回合，但飞书 API 拒绝（message_id 必须 `om_xxx`）→ 改成按 chat 复用（不创建新卡，避开 API 校验）。
 
+**keep_completed_sessions 默认值（2026-09-22 修复）**：上游拆分网关合并一度把「完成保留 session」改成 opt-in 配置且默认关（上游语义：完成即清理），导致跨回合合并、文档交付、非对话通知这些按 chat 找回最近卡片的特性全部静默失效。现已改回 fork 默认 `True`（`config.py`），并在两个 profile 的 config.yaml 显式写上 `streaming.keep_completed_sessions: true`（带 `.bak-lark-card-features` 备份）。设 False 会退回上游语义，上述特性一起失效。
+
 **测试**：`tests/test_merge_background.py`（5 个：复用+重激活 / 无可复用跳过 / 用户新消息新卡 / delta chat fallback / 重激活仅 COMPLETED）+ 原 430 回归 = **435 全绿**。**改了 `patcher.py` 后必须 `uninstall && install` 重打 AST patch**（否则 run.py 还是旧 hook），再 restart。
 
 **诊断**：`hermes_lark_streaming` logger 不进 `gateway.log`（hermes logging 配置问题），合并诊断用 `logging.getLogger("gateway.run").info("[cheerwhy-merge] ...")`（在 `on_message_started` None 分支 + `_reactivate_session`），grep `[cheerwhy-merge]` 看合并是否触发（`bg turn msg=None ... reactivated=True` / `session reactivated ... cross-turn merge`）。
@@ -145,6 +149,12 @@ Card templates (cardkit/)
 ## hermes 升级后自愈（三层防御）
 
 hermes 自动升级是**原子流程**：拉新代码覆盖 `gateway/run.py`（清掉 AST hook）→ 立即 `gateway restart`。补丁赶不上这趟车。为此建了三层防御，升级后**通常无需手动操作**：
+
+**bg watcher 通知进卡（2026-09-22）**：`on_bg_watcher_notify` 原行为是「同 chat 有卡片即过滤丢弃」（认为 agent 已跟踪 process）。现改为 `notices_in_card`（默认 true）开启时把通知以灰色 NOTICE segment 追加进最近卡片并重完成（跨回合合并同款 reactivate→append→re-complete 流程）；FAILED/ABORTED 卡片返回 False 走原生文本保底；无卡片仍发独立 background 卡片；关闭 `notices_in_card` 退回旧的过滤行为。NOTICE segment（`SegmentType.NOTICE`）渲染为灰色 notation markdown，截断 300 字符。
+
+**文档交付进卡（2026-09-22）**：飞书卡片两种 schema 都**不支持 file 组件**（实测 cardkit_create 报 `not support tag: file`，file_v3 key 只能用于 IM 消息）——所以文档/文件交付采用「上传 file → reply 到卡片消息（card_msg_id）」：topic 群里文件落在卡片同一线程，DM 里是引用卡片的回复。注入点在 `run_notifications.py` `_deliver_media_from_response` 的非图片媒体循环体开头（marker `DOC_DELIVER`），`on_document_deliver` 成功返回 True 跳过原生 `send_document`，上传/回复失败或无可复用卡片返回 False 原生保底。语音/视频/图片不走此钩子（原生体验更好）。
+
+**busy ack 进卡（2026-09-22）**：busy 时用户发消息的确认文本（`↪ Redirected current run` / `⏳ Queued for the next turn` 等，`run_busy.py` `_send_busy_reply` 是唯一出口）注入 marker `BUSY_ACK` 接管：feishu + 同 chat 有 STREAMING 卡片且预留了心跳行时，ack 文本写进卡片心跳状态行（`on_busy_ack` 复用 heartbeat 机制，回合完成时状态行自然消失）；不为 ack 重激活已完成卡片，其余场景原生 ack 文本保底。
 
 ### 第 1 层：`register()` 启动时自愈（核心）
 `hermes_lark_streaming/__init__.py` 的 `register(ctx)` 是 `hermes_agent.plugins` entry point（`pyproject.toml` 已声明）。网关每次启动（含升级后自动 restart）经 `discover_plugins()`（`gateway/run.py` 的 startup）调用到这里。`register()` 逻辑（`streaming.self_heal` 默认 true，关闭后退回手动）：

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable, Coroutine, Iterator
@@ -736,8 +737,21 @@ class StreamCardController(StreamingController):
             return False
         session = self._find_session_by_chat(chat_id)
         if session is not None and session.has_card:
-            # 有活跃 agent session（agent 已通过 on_tool_update tool=process 跟踪 + 已回复）→
-            # watcher 通知冗余，完全过滤（不发卡片不发文本）
+            # 有同 chat 卡片（agent 已跟踪 process 或卡片刚完成）→ 通知以灰色 notice 段
+            # 追加进卡片并重完成（非对话通知进卡，不再单发文本/不再过滤丢弃）
+            if self._cfg.notices_in_card and self._reactivate_session(session):
+                session.last_activity_at = time.time()
+                assert session.segment_state is not None
+                session.segment_state.add_notice(content)
+                logging.getLogger("gateway.run").info(
+                    "[cheerwhy-card] bg watcher 通知进卡 chat=%s card=%s len=%d",
+                    chat_id[:12], session.card_id, len(content))
+                self._complete_session(session)
+                return True
+            if self._cfg.notices_in_card:
+                # FAILED/ABORTED 卡片不可重激活 → 返回 False 走 Hermes 原生文本保底
+                return False
+            # notices_in_card 关闭：保留旧过滤行为（agent 已跟踪 process，通知冗余）
             logging.getLogger("gateway.run").info(
                 "[cheerwhy-card] bg watcher 通知过滤（agent 已跟踪 process）chat=%s", chat_id[:12])
             return True
@@ -749,6 +763,54 @@ class StreamCardController(StreamingController):
             content=content,
             reply_to_message_id=reply_to_message_id,
         )
+
+    async def on_document_deliver(self, *, chat_id: str, file_path: str) -> bool:
+        """文档/文件交付 → 上传后以 file 消息回复卡片消息，文件落在卡片正下方.
+
+        飞书卡片两种 schema 都不支持 file 组件（实测 cardkit_create 报
+        "not support tag: file"），reply 到卡片消息是内聚性最好的落点：
+        topic 群里进卡片同一线程，DM 里是引用卡片的回复。返回 False 时
+        调用方（注入 hook）放行 Hermes 原生 send_document。
+        """
+        if not self.enabled or not chat_id or not file_path:
+            return False
+        session = self._find_session_by_chat(chat_id)
+        if session is None or not session.has_card or not session.card_msg_id:
+            return False
+        if session.state not in (SessionState.STREAMING, SessionState.COMPLETED):
+            return False
+        await self._ensure_init()
+        assert self._client is not None
+        file_key = await self._client.upload_document(file_path)
+        if not file_key:
+            return False
+        name = os.path.basename(file_path[7:] if file_path.startswith("file://") else file_path)
+        await self._client.reply_file_by_id(session.card_msg_id, file_key, name)
+        logging.getLogger("gateway.run").info(
+            "[cheerwhy-card] document delivered under card chat=%s card=%s file=%s",
+            chat_id[:12], session.card_id, name)
+        return True
+
+    def on_busy_ack(self, *, chat_id: str, text: str) -> bool:
+        """busy ack（redirect/queue/steer 提示）→ 复用心跳状态行进卡片.
+
+        只接管 STREAMING 卡片（不为一条 ack 重激活已完成卡片）；
+        无卡片/心跳关闭/非流式返回 False 走 Hermes 原生 ack 文本。
+        """
+        if not self.enabled or not self._cfg.heartbeat_in_card or not text or not chat_id:
+            return False
+        session = self._find_session_by_chat(chat_id)
+        if session is None or not session.has_card or not session.heartbeat_enabled:
+            return False
+        if session.state != SessionState.STREAMING:
+            return False
+        session.last_activity_at = time.time()
+        session.heartbeat_text = text
+        session.heartbeat_dirty = True
+        self._schedule_flush(session)
+        logging.getLogger("gateway.run").info(
+            "[cheerwhy-card] busy ack 进卡状态行 chat=%s text=%s", chat_id[:12], text[:60])
+        return True
 
     def defer_background_review(
         self,

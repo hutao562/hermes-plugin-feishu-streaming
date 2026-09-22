@@ -79,12 +79,24 @@ class Config:
     def keep_completed_sessions(self) -> bool:
         """完成后是否保留 session 供 background 回合复用（跨回合合并）.
 
-        默认 False（上游语义：完成即清理）。开启后 COMPLETED session 留在
-        注册表里等 _prune_stale_sessions 的 TTL 清理，message_id=None 的
-        background 回合可复用同 chat 最近卡片。
+        默认 True（fork 语义：一个对话任务一张卡）。COMPLETED session 留在
+        注册表里等 _prune_stale_sessions 的 TTL 清理；message_id=None 的
+        background 回合、busy redirect、文档交付、后台通知都靠它按 chat 找回
+        最近卡片。设 False 退回上游语义（完成即清理，合并/文档/通知全部失效）。
         """
         sec = self._streaming_sec()
-        return bool(sec.get("keep_completed_sessions", False))
+        return bool(sec.get("keep_completed_sessions", True))
+
+    @property
+    def notices_in_card(self) -> bool:
+        """bg watcher 等非对话通知是否并进最近卡片（默认 True）.
+
+        开启后后台进程完成通知（💾 Self-improvement review 等）以灰色
+        notice 段追加进同 chat 最近卡片并重完成；无卡片时仍走独立
+        background 卡片兜底。关闭后退回「有卡片即过滤丢弃」的旧行为。
+        """
+        sec = self._streaming_sec()
+        return bool(sec.get("notices_in_card", True))
 
     @property
     def self_heal(self) -> bool:

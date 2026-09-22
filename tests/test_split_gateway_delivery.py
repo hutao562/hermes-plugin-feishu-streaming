@@ -85,7 +85,9 @@ def upstream(upstream_sources, monkeypatch):
 def controller(tmp_path, monkeypatch):
     ctrl = StreamCardController(profile_home=tmp_path)
     ctrl._cfg._raw = {
-        "streaming": {"enabled": True, "footer": {"enabled": False}},
+        # 本文件测传输/交付语义，显式关闭 retention 让「完成即清理」断言成立；
+        # retention 行为（fork 默认开）在 test_controller/test_merge_background 单测。
+        "streaming": {"enabled": True, "footer": {"enabled": False}, "keep_completed_sessions": False},
         "feishu": {"app_id": "test-app", "app_secret": "test-secret"},
     }
     ctrl._initialized = True

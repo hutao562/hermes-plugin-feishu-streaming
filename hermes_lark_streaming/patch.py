@@ -436,6 +436,34 @@ async def on_bg_watcher_notify(
         return False
 
 
+async def on_document_deliver(*, chat_id: str, file_path: str) -> bool:
+    """[注入点 16] _deliver_media_from_response 文档分支 — 文件回复到卡片消息下方.
+
+    返回 True 表示已接管（上传+回复成功），调用方跳过原生 send_document；
+    False 时原生通道保底。
+    """
+    try:
+        ctrl = get_controller()
+        if not ctrl.enabled:
+            return False
+        return await ctrl.on_document_deliver(chat_id=chat_id, file_path=file_path)
+    except Exception as exc:
+        _logger.warning("on_document_deliver error: %s", exc, exc_info=True)
+        return False
+
+
+def on_busy_ack(*, chat_id: str, text: str) -> bool:
+    """[注入点 17] _send_busy_reply — busy ack（redirect/queue/steer）提示进卡片状态行."""
+    try:
+        ctrl = get_controller()
+        if not ctrl.enabled:
+            return False
+        return bool(ctrl.on_busy_ack(chat_id=chat_id, text=text))
+    except Exception as exc:
+        _logger.warning("on_busy_ack error: %s", exc, exc_info=True)
+        return False
+
+
 @_safe_hook()
 def on_clarify_enter(
     *,

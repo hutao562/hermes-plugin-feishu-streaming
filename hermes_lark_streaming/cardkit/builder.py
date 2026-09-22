@@ -313,6 +313,15 @@ def _build_reasoning_panel(
     return panel
 
 
+def _notice_markdown(text: str) -> str:
+    """非对话通知的灰色紧凑渲染（bg watcher 完成通知等），截断防长输出刷屏."""
+    compact = " ".join(text.split())
+    if len(compact) > 300:
+        compact = compact[:300] + "…"
+    compact = compact.replace("[", "\\[").replace("]", "\\]")
+    return f"<font color='grey'>{compact}</font>"
+
+
 def _build_footer_elements(
     footer_data: dict | None,
     is_error: bool = False,
@@ -547,6 +556,12 @@ def build_complete_card(
             content = _downgrade_tables(optimize_markdown_style(seg.text))
             for chunk in _split_long_text(content):
                 elements.append({"tag": "markdown", "content": chunk, "text_size": body_text_size})
+        elif seg.type == SegmentType.NOTICE and seg.text:
+            elements.append({
+                "tag": "markdown",
+                "content": _notice_markdown(seg.text),
+                "text_size": "notation",
+            })
 
     if not has_answer:
         elements.append({"tag": "markdown", "content": _T["done"][0], "text_size": body_text_size})

@@ -10,6 +10,7 @@ class SegmentType(StrEnum):
     REASONING = "reasoning"
     ANSWER = "answer"
     TOOL = "tool"
+    NOTICE = "notice"
 
 
 class Segment:
@@ -88,6 +89,17 @@ class SegmentState:
         self._counter += 1
         seg = Segment(SegmentType.TOOL, f"tools_{c}")
         seg.tool_offset = tool_offset
+        seg.start_time = time.time()
+        self._finalize_prev_reasoning(seg.start_time)
+        self.segments.append(seg)
+        return seg
+
+    def add_notice(self, text: str) -> Segment:
+        """追加一条非对话通知段（bg watcher 完成通知等）— 独立新建，不与相邻段合并."""
+        c = self._counter
+        self._counter += 1
+        seg = Segment(SegmentType.NOTICE, f"notice_{c}")
+        seg.text = text
         seg.start_time = time.time()
         self._finalize_prev_reasoning(seg.start_time)
         self.segments.append(seg)

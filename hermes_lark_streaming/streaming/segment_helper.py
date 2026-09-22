@@ -9,6 +9,7 @@ from ..cardkit.builder import (
     _build_reasoning_panel,
     _build_tool_panel,
     _format_elapsed,
+    _notice_markdown,
     _streaming_element,
 )
 from ..cardkit.i18n import _T, _i18n
@@ -24,6 +25,8 @@ def estimate_segment_elements(seg: Segment, all_steps: list[ToolDisplayStep]) ->
     if seg.type == SegmentType.REASONING:
         return 4  # collapsible_panel + plain_text + standard_icon + markdown
     if seg.type == SegmentType.ANSWER:
+        return 1
+    if seg.type == SegmentType.NOTICE:
         return 1
     if seg.type == SegmentType.TOOL:
         return estimate_tool_elements(
@@ -87,6 +90,13 @@ def build_add_segment_action(
         start = seg.tool_offset
         end = seg.tool_end_offset if seg.tool_end_offset else len(all_steps)
         element = _build_tool_panel(all_steps[start:end], element_id=seg.el_id)
+    elif seg.type == SegmentType.NOTICE:
+        element = {
+            "tag": "markdown",
+            "content": _notice_markdown(seg.text),
+            "text_size": "notation",
+            "element_id": seg.el_id,
+        }
     else:
         raise ValueError(f"unsupported segment type: {seg.type}")
 

@@ -48,6 +48,8 @@ _EXT_HOOK_NAMES = [
     "BG_WATCHER_RUNNING",    # 旧版 bg watcher 注入形态（仅用于清理历史注入）
     "BG_WATCHER_FINISHED",   # bg watcher 通知接管（现用早返回形态）
     "TURN_REGISTRY",     # 登记本回合 agent，供卡片 footer 计算 t/s
+    "DOC_DELIVER",       # 文档交付回复到卡片消息下方（飞书卡片无 file 组件）
+    "BUSY_ACK",          # busy ack（redirect/queue/steer）提示进卡片状态行
     # 旧 fork patcher 遗留 marker：功能已由上游 ANSWER wrapper 接管，只清理不再注入
     "ANSWER_GUARD",
 ]
@@ -853,11 +855,91 @@ def _inject_turn_registry(content: str) -> str:
     return content
 
 
+def _doc_deliver_hook(indent: str) -> str:
+    # _deliver_media_from_response 的文档分支循环体开头：文件回复到卡片消息下方。
+    # 语音/视频/图片不走此钩子（原生消息体验更好）。
+    return _make_hook(
+        indent,
+        f"# {PREFIX}_DOC_DELIVER_BEGIN",
+        f"# {PREFIX}_DOC_DELIVER_END",
+        [
+            "try:",
+            "    _lark_platform = getattr(event.source.platform, 'value', '') or ''",
+            "    if _lark_platform.lower() in ('feishu', 'lark') and not is_voice:",
+            "        from hermes_lark_streaming.patch import on_document_deliver",
+            "        if await on_document_deliver(chat_id=chat_id, file_path=media_path):",
+            "            continue",
+            *_hook_exception_lines("doc_deliver"),
+        ],
+    )
+
+
+def _inject_doc_deliver(content: str) -> str:
+    """run_notifications.py：_deliver_media_from_response 的非图片媒体循环体开头插入。"""
+    tree = ast.parse(content)
+    lines = content.splitlines(keepends=True)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+            and node.name == "_deliver_media_from_response"
+        ):
+            for stmt in ast.walk(node):
+                if not isinstance(stmt, ast.For):
+                    continue
+                target_elts = (
+                    stmt.target.elts if isinstance(stmt.target, ast.Tuple) else (stmt.target,)
+                )
+                if any(getattr(elt, "id", None) == "media_path" for elt in target_elts):
+                    idx = stmt.lineno  # 0-based：for 行的下一行 = 循环体开头
+                    indent = _safe_indent(lines, idx)
+                    lines[idx:idx] = _doc_deliver_hook(indent).splitlines(keepends=True)
+                    return "".join(lines)
+    _logger.warning("run_notifications.py: media delivery loop not found — skipping DOC_DELIVER")
+    return content
+
+
+def _busy_ack_hook(indent: str) -> str:
+    # _send_busy_reply 开头接管：busy ack 文本进卡片心跳状态行，handled 则早 return。
+    return _make_hook(
+        indent,
+        f"# {PREFIX}_BUSY_ACK_BEGIN",
+        f"# {PREFIX}_BUSY_ACK_END",
+        [
+            "try:",
+            "    if event.source.platform.value.lower() in ('feishu', 'lark'):",
+            "        from hermes_lark_streaming.patch import on_busy_ack",
+            "        if on_busy_ack(chat_id=event.source.chat_id, text=content):",
+            "            return",
+            *_hook_exception_lines("busy_ack"),
+        ],
+    )
+
+
+def _inject_busy_ack(content: str) -> str:
+    """run_busy.py：_send_busy_reply 方法体开头（docstring 之后）插入接管钩子。"""
+    tree = ast.parse(content)
+    lines = content.splitlines(keepends=True)
+    site = _find_func_body(tree, lines, "_send_busy_reply")
+    if site is None:
+        _logger.warning("run_busy.py: _send_busy_reply not found — skipping BUSY_ACK")
+        return content
+    idx, indent = site
+    lines[idx:idx] = _busy_ack_hook(indent).splitlines(keepends=True)
+    return "".join(lines)
+
+
+def _inject_notifications_ext(content: str) -> str:
+    """run_notifications.py 的 fork 扩展集合：bg watcher 接管 + 文档交付进卡。"""
+    content = _inject_bg_watcher(content)
+    return _inject_doc_deliver(content)
+
+
 _LOCAL_INJECTORS = {
     "run_startup.py": _inject_adapter_init,
-    "run_notifications.py": _inject_bg_watcher,
+    "run_notifications.py": _inject_notifications_ext,
     "run_turn.py": _inject_heartbeat,
     "run_turn_runner.py": _inject_turn_registry,
+    "run_busy.py": _inject_busy_ack,
 }
 
 

@@ -181,3 +181,95 @@ def test_has_chat_card_gate_states() -> None:
 
     assert ctrl.has_chat_card(None) is False  # 无 chat_id → 不可
     assert ctrl.has_chat_card("oc_unknown") is False  # 未知 chat → 不可
+
+
+def test_bg_watcher_notice_appends_into_card() -> None:
+    """bg watcher 非对话通知：同 chat 有卡片 → 重激活 + 追加 NOTICE 段 + 触发重完成."""
+    ctrl = StreamCardController()
+    _enable(ctrl)
+    _mock_create_card(ctrl)
+
+    chat = "oc_chat_notice"
+    session = _seed_streaming_session(ctrl, "om_msg1", chat)
+    session.state = SessionState.COMPLETED
+    session.flush.mark_completed()
+
+    with patch.object(ctrl, "_complete_session") as complete_mock:
+        result = asyncio.get_event_loop().run_until_complete(
+            ctrl.on_bg_watcher_notify(chat_id=chat, content="💾 Self-improvement review: Skill patched")
+        )
+    assert result is True
+    assert session.state == SessionState.STREAMING  # 已重激活，等重完成
+    segs = session.segment_state.segments
+    from hermes_lark_streaming.streaming.segments import SegmentType as _ST
+    assert segs[-1].type == _ST.NOTICE
+    assert "Self-improvement review" in segs[-1].text
+    complete_mock.assert_called_once()
+
+
+def test_bg_watcher_notice_no_card_falls_back_to_background_card() -> None:
+    """无同 chat 卡片 → 退化发独立 background card（原行为）."""
+    ctrl = StreamCardController()
+    _enable(ctrl)
+
+    with patch.object(ctrl, "on_background_deliver", return_value=True) as bg_mock:
+        result = asyncio.get_event_loop().run_until_complete(
+            ctrl.on_bg_watcher_notify(chat_id="oc_no_card", content="process finished")
+        )
+    assert result is True
+    bg_mock.assert_awaited_once()
+
+
+def test_document_deliver_replies_file_under_card() -> None:
+    """文档交付：上传 + 回复到卡片消息下方，返回 True 让网关跳过原生 send_document."""
+    from unittest.mock import AsyncMock, Mock
+
+    ctrl = StreamCardController()
+    _enable(ctrl)
+    session = _seed_streaming_session(ctrl, "om_msg1", "oc_doc_chat")
+    session.state = SessionState.COMPLETED
+    session.flush.mark_completed()
+
+    ctrl._initialized = True
+    ctrl._client = Mock()
+    ctrl._client.upload_document = AsyncMock(return_value="file_v3_xxx")
+    ctrl._client.reply_file_by_id = AsyncMock(return_value=True)
+
+    result = asyncio.get_event_loop().run_until_complete(
+        ctrl.on_document_deliver(chat_id="oc_doc_chat", file_path="/tmp/report.pdf")
+    )
+    assert result is True
+    ctrl._client.upload_document.assert_awaited_once_with("/tmp/report.pdf")
+    ctrl._client.reply_file_by_id.assert_awaited_once_with("om_card_om_msg1", "file_v3_xxx", "report.pdf")
+
+
+def test_document_deliver_without_card_returns_false() -> None:
+    """无可复用卡片（未保留/已被 TTL 清理）→ 返回 False，网关走原生 send_document."""
+    ctrl = StreamCardController()
+    _enable(ctrl)
+
+    result = asyncio.get_event_loop().run_until_complete(
+        ctrl.on_document_deliver(chat_id="oc_unknown", file_path="/tmp/x.pdf")
+    )
+    assert result is False
+
+
+def test_busy_ack_updates_heartbeat_status_line() -> None:
+    """busy ack：STREAMING 卡片 → 写心跳状态行返回 True；终态/无卡返回 False."""
+    ctrl = StreamCardController()
+    _enable(ctrl)
+
+    session = _seed_streaming_session(ctrl, "om_msg1", "oc_ack_chat")
+    session.heartbeat_enabled = True  # 卡片创建时按 heartbeat_in_card 配置预留
+    assert ctrl.on_busy_ack(chat_id="oc_ack_chat", text="⏳ Queued for the next turn") is True
+    assert session.heartbeat_text == "⏳ Queued for the next turn"
+    assert session.heartbeat_dirty is True
+
+    # 已完成卡片不为 ack 重激活
+    session.state = SessionState.COMPLETED
+    session.flush.mark_completed()
+    assert ctrl.on_busy_ack(chat_id="oc_ack_chat", text="↪ Redirected current run") is False
+
+    # 未预留心跳行的卡片不接管
+    _seed_streaming_session(ctrl, "om_msg2", "oc_ack_chat2")
+    assert ctrl.on_busy_ack(chat_id="oc_ack_chat2", text="⏳ Queued") is False
