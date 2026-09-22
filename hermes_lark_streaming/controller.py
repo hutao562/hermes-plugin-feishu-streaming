@@ -521,6 +521,44 @@ class StreamCardController(StreamingController):
             if val == old_message_id:
                 self._interrupt_map[key] = new_message_id
 
+    def on_redirect_started(
+        self,
+        *,
+        message_id: str,
+        chat_id: str,
+        anchor_id: str | None = None,
+        session_key: str | None = None,
+    ) -> None:
+        """busy redirect（运行中被用户新指令接管）— 旧卡优雅收尾 + 开新卡.
+
+        与 on_interrupted 的区别：旧卡不标 ABORTED（红色恐吓），而是补一条 NOTICE
+        （「任务已按新指令重启」）后正常完成；新卡 anchor 指向纠正消息，redirect 后
+        流式回调携带新消息 id，自然落进新卡。_interrupt_map 登记 old→new，让完成
+        信号路由到新卡（复用中断 A→B 通路）。steer/queue 不走此方法。
+        """
+        if not self.enabled or not message_id or not chat_id:
+            return
+        _gw = logging.getLogger("gateway.run")
+        old_session = self._find_session_by_chat(chat_id)
+        if old_session is not None and old_session.message_id == message_id:
+            return  # 同 id 重复 redirect，不动
+        if old_session is not None and old_session.has_card and old_session.state == SessionState.STREAMING:
+            if old_session.segment_state is not None:
+                old_session.segment_state.add_notice("↪ 任务已按新指令重启，结果见下方新卡片")
+            old_session.flush.mark_completed()
+            _gw.info(
+                "[cheerwhy-card] redirect: 旧卡收尾 msg=%s → 新卡 msg=%s",
+                old_session.message_id[:12], message_id[:12],
+            )
+            self._complete_session(old_session)
+            self._interrupt_map[old_session.message_id] = message_id
+            for key, val in list(self._interrupt_map.items()):
+                if val == old_session.message_id:
+                    self._interrupt_map[key] = message_id
+        self.on_message_started(
+            message_id=message_id, chat_id=chat_id, anchor_id=anchor_id, session_key=session_key,
+        )
+
     def on_clarify_enter(
         self,
         *,
@@ -772,21 +810,29 @@ class StreamCardController(StreamingController):
         topic 群里进卡片同一线程，DM 里是引用卡片的回复。返回 False 时
         调用方（注入 hook）放行 Hermes 原生 send_document。
         """
+        _doc_log = logging.getLogger("gateway.run")
         if not self.enabled or not chat_id or not file_path:
             return False
         session = self._find_session_by_chat(chat_id)
         if session is None or not session.has_card or not session.card_msg_id:
+            _doc_log.info(
+                "[cheerwhy-card] document deliver 退回原生：无可复用卡片 chat=%s file=%s",
+                chat_id[:12], file_path)
             return False
         if session.state not in (SessionState.STREAMING, SessionState.COMPLETED):
+            _doc_log.info(
+                "[cheerwhy-card] document deliver 退回原生：卡片终态 %s file=%s",
+                session.state.value, file_path)
             return False
         await self._ensure_init()
         assert self._client is not None
         file_key = await self._client.upload_document(file_path)
         if not file_key:
+            _doc_log.info("[cheerwhy-card] document deliver 退回原生：上传失败 file=%s", file_path)
             return False
         name = os.path.basename(file_path[7:] if file_path.startswith("file://") else file_path)
         await self._client.reply_file_by_id(session.card_msg_id, file_key, name)
-        logging.getLogger("gateway.run").info(
+        _doc_log.info(
             "[cheerwhy-card] document delivered under card chat=%s card=%s file=%s",
             chat_id[:12], session.card_id, name)
         return True
@@ -799,8 +845,22 @@ class StreamCardController(StreamingController):
         """
         if not self.enabled or not self._cfg.heartbeat_in_card or not text or not chat_id:
             return False
-        session = self._find_session_by_chat(chat_id)
-        if session is None or not session.has_card or not session.heartbeat_enabled:
+        # 不能用 _find_session_by_chat（它过滤未建卡 session）——ack 常在建卡完成前到达
+        mid = self._chat_index.get(chat_id)
+        session = self._sessions.get(mid) if mid else None
+        if session is None:
+            session = self._find_session_by_chat(chat_id)
+        if session is None:
+            return False
+        if not session.has_card and session.state in (SessionState.IDLE, SessionState.CREATING):
+            # 新卡尚未建好（redirect 开新卡后 ack 立刻到达）：暂存心跳文本，
+            # _do_create_card 建成后会把 dirty heartbeat 一并推送到状态行
+            session.heartbeat_text = text
+            session.heartbeat_dirty = True
+            logging.getLogger("gateway.run").info(
+                "[cheerwhy-card] busy ack 暂存（建卡中）chat=%s text=%s", chat_id[:12], text[:60])
+            return True
+        if not session.has_card or not session.heartbeat_enabled:
             return False
         if session.state != SessionState.STREAMING:
             return False

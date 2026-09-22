@@ -273,3 +273,66 @@ def test_busy_ack_updates_heartbeat_status_line() -> None:
     # 未预留心跳行的卡片不接管
     _seed_streaming_session(ctrl, "om_msg2", "oc_ack_chat2")
     assert ctrl.on_busy_ack(chat_id="oc_ack_chat2", text="⏳ Queued") is False
+
+
+def test_redirect_opens_new_card_and_routes_completion() -> None:
+    """busy redirect：旧卡 NOTICE 收尾 + _interrupt_map 路由完成信号到新卡."""
+    ctrl = StreamCardController()
+    _enable(ctrl)
+    _mock_create_card(ctrl)
+
+    chat = "oc_redirect_chat"
+    old_session = _seed_streaming_session(ctrl, "om_old", chat)
+    ctrl.on_answer(message_id="om_old", chat_id=chat, text="被打断前的部分回答")
+
+    with patch.object(ctrl, "_complete_session") as complete_mock:
+        ctrl.on_redirect_started(message_id="om_new", chat_id=chat, anchor_id="om_new", session_key="sk")
+
+    # 旧卡：NOTICE 收尾 + 触发完成
+    from hermes_lark_streaming.streaming.segments import SegmentType as _ST
+    assert old_session.segment_state.segments[-1].type == _ST.NOTICE
+    assert "新卡片" in old_session.segment_state.segments[-1].text
+    complete_mock.assert_called_once()
+
+    # 路由：old→new 映射 + chat 索引指向新卡 + 新 session 已建
+    assert ctrl._interrupt_map["om_old"] == "om_new"
+    assert ctrl._chat_index[chat] == "om_new"
+    assert "om_new" in ctrl._sessions
+
+    # 完成信号（带旧 id）路由到新卡：生产中 _complete_session 异步收尾使旧卡终态，
+    # 直查跳过 → 走 _interrupt_map；这里手动模拟终态（mock 掉了真实完成）
+    old_session.state = SessionState.COMPLETED
+    old_session.flush.mark_completed()
+    resolved = ctrl._completion_session("om_old", chat)
+    assert resolved is not None and resolved.message_id == "om_new"
+
+    # redirect 后流式回调带新 id → 直接命中新卡
+    assert ctrl.on_answer(message_id="om_new", chat_id=chat, text="纠正后的回答") is True
+    new_session = ctrl._sessions["om_new"]
+    assert any(s.type == _ST.ANSWER and "纠正后的回答" in s.text for s in new_session.segment_state.segments)
+
+
+def test_redirect_skips_when_no_running_card() -> None:
+    """无可复用卡片时 redirect 仅开新卡，不注册中断映射."""
+    ctrl = StreamCardController()
+    _enable(ctrl)
+    _mock_create_card(ctrl)
+
+    ctrl.on_redirect_started(message_id="om_new", chat_id="oc_empty", anchor_id="om_new")
+    assert "om_new" in ctrl._sessions
+    assert not ctrl._interrupt_map
+
+
+def test_busy_ack_stored_while_card_creating() -> None:
+    """redirect ack 在新卡还在 CREATING 时到达 → 暂存心跳文本."""
+    ctrl = StreamCardController()
+    _enable(ctrl)
+    _mock_create_card(ctrl)
+
+    ctrl.on_message_started(message_id="om_new", chat_id="oc_ack_creating")
+    session = ctrl._sessions["om_new"]
+    assert session.state == SessionState.IDLE  # mock 关闭了建卡协程，停在 IDLE（建卡前）
+
+    assert ctrl.on_busy_ack(chat_id="oc_ack_creating", text="↪ Redirected current run") is True
+    assert session.heartbeat_text == "↪ Redirected current run"
+    assert session.heartbeat_dirty is True
