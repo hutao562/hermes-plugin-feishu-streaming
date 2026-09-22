@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from hermes_lark_streaming.cardkit.builder import (
@@ -26,7 +28,7 @@ from hermes_lark_streaming.cardkit.markdown import (
     _strip_invalid_image_keys,
     optimize_markdown_style,
 )
-from hermes_lark_streaming.streaming.segments import Segment
+from hermes_lark_streaming.streaming.segments import Segment, SegmentState
 
 # --- Markdown 优化 ---
 
@@ -740,3 +742,24 @@ class TestCompleteCardFooter:
         )
         tags = [e.get("tag") for e in card["body"]["elements"]]
         assert "hr" not in tags
+
+
+def test_complete_card_notice_suppresses_done_placeholder() -> None:
+    """redirect 收尾卡（工具+NOTICE、无回答）：不补「Done.」占位，摘要用重启提示."""
+    state = SegmentState()
+    state.on_tool_event(2)
+    state.add_notice("↪ 任务已按新指令重启，结果见下方新卡片")
+    card = build_complete_card(segments=state.segments, all_tool_steps=[])
+
+    body = json.dumps(card["body"], ensure_ascii=False)
+    assert "Done." not in body
+    assert "任务已按新指令重启" in body
+    # 会话列表摘要一眼识别作废旧卡
+    assert card["config"]["summary"]["content"].startswith("↪")
+
+
+def test_complete_card_without_answer_keeps_done_placeholder() -> None:
+    """无回答也无 NOTICE 的空卡：保留「Done.」占位（原行为）."""
+    state = SegmentState()
+    card = build_complete_card(segments=state.segments, all_tool_steps=[])
+    assert "Done." in json.dumps(card["body"], ensure_ascii=False)

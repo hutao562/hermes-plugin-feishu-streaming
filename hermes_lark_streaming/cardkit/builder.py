@@ -563,7 +563,9 @@ def build_complete_card(
                 "text_size": "notation",
             })
 
-    if not has_answer:
+    # 无回答时的「Done.」占位——带 NOTICE 的卡（redirect 收尾/后台通知）本身已有
+    # 状态说明，再补一句 Done. 会隔断「结果见下方新卡片」的指向（2026-09-22 实测）
+    if not has_answer and not any(seg.type == SegmentType.NOTICE for seg in segments):
         elements.append({"tag": "markdown", "content": _T["done"][0], "text_size": body_text_size})
 
     # image_generate 产物图（用 markdown 图片语法 ![alt](img_key)，复用 ImageResolver 已验证的渲染方式）
@@ -587,6 +589,12 @@ def build_complete_card(
         if seg.type in (SegmentType.ANSWER, SegmentType.REASONING) and seg.text:
             summary_text = seg.text
             break
+    if not summary_text:
+        # 无回答的卡（redirect 早期收尾）：会话列表摘要用重启提示，一眼识别作废旧卡
+        for seg in reversed(segments):
+            if seg.type == SegmentType.NOTICE and seg.text:
+                summary_text = seg.text
+                break
     summary = summary_text[:120].replace("\n", " ").replace("```", "").strip()
 
     card: dict[str, Any] = {
