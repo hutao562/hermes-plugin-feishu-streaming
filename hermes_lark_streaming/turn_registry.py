@@ -55,6 +55,23 @@ def register(
             _refs[key] = (ref, (chat_id or "").strip())
 
 
+def is_live(*, message_id: str | None = None, chat_id: str | None = None) -> bool:
+    """回合是否仍在运行（agent 弱引用存活且未被 clear）.
+
+    僵尸卡守护的免死判据：长工具静默期（渲染/上传等数分钟无流式事件）期间
+    回合真实存活，不能因 idle 超 时把卡标成 ABORTED——那会让后续所有
+    delta/心跳/完成全部 decline 走纯文本（2026-09-22 雪儿配乐 25min 回合实测）。
+    """
+    with _lock:
+        for key in (_msg_key(message_id), _chat_key(chat_id)):
+            if not key or key == "chat:":
+                continue
+            entry = _refs.get(key)
+            if entry is not None and entry[0]() is not None:
+                return True
+    return False
+
+
 def velocity(
     *,
     message_id: str | None = None,

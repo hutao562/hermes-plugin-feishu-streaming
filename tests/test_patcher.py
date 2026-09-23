@@ -408,7 +408,7 @@ async def test_generated_stop_hook_uses_available_session_key(key_name: str) -> 
 async def test_generated_complete_hook_keeps_footer_in_card_without_native_resend() -> None:
     complete = _build_complete_hook_runner()
     agent_result: dict = {}
-    event = SimpleNamespace(message_id="message")
+    event = SimpleNamespace(message_id="message", source=SimpleNamespace(chat_id="chat"))
 
     with (
         patch(
@@ -436,7 +436,7 @@ async def test_generated_complete_hook_keeps_footer_in_card_without_native_resen
 async def test_generated_complete_hook_suppresses_native_error_after_error_card() -> None:
     complete = _build_complete_hook_runner()
     agent_result = {"failed": True}
-    event = SimpleNamespace(message_id="message")
+    event = SimpleNamespace(message_id="message", source=SimpleNamespace(chat_id="chat"))
 
     with (
         patch(

@@ -245,7 +245,7 @@ def inject_gateway(filename: str, content: str) -> str:
                 on_message_aborted(message_id=_lark_id)
             elif not _delivery_result.get('interrupted'):
                 _lark_sent = await on_message_completed_wait(
-                    message_id=_lark_id, answer=first_response,
+                    message_id=_lark_id, chat_id=turn_ctx.source.chat_id, answer=first_response,
                     is_error=bool(_delivery_result.get('failed')), duration=0.0,
                     reconcile_answer=bool(_delivery_result.get('failed')
                                           or _delivery_result.get('response_transformed')),

@@ -1098,6 +1098,10 @@ class StreamCardController(StreamingController):
                     idle = now - last
                     if idle <= _ZOMBIE_IDLE_SEC:
                         continue
+                    # 长工具静默期（渲染/上传等）：回合仍真实存活时不能杀卡，
+                    # 否则后续 delta/心跳/完成全 decline → 整段内容跑出卡片外
+                    if turn_registry.is_live(message_id=mid, chat_id=session.chat_id):
+                        continue
                     _logger.warning(
                         "[cheerwhy-zombie] force-abort stuck card msg=%s state=%s idle=%.0fs card_id=%s",
                         mid[:12], session.state.value, idle,
