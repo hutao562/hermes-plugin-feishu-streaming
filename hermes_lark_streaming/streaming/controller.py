@@ -13,6 +13,7 @@ from ..cardkit.markdown import (
     optimize_markdown_style,
 )
 from ..feishu import (
+    CARD_OVER_SIZE,
     CARDKIT_CONTENT_FAILED,
     CARDKIT_ELEMENT_LIMIT,
     CARDKIT_RATE_LIMITED,
@@ -486,6 +487,16 @@ class StreamingController:
                             seg.el_id,
                         )
                         break
+            # 卡片超体积（200860）：重试无意义（同一内容继续超限），就地强制换卡——
+            # 已落内容 seal 进旧卡（截断后的渲染体积变小，cardkit_update 整卡替换能成功），
+            # 未创建的 segment 留给下一轮 flush add 进新卡
+            if e.code == CARD_OVER_SIZE and not session.split_disabled:
+                _logger.warning(
+                    "CardKit over max size — forcing rollover: card=%s elements=%d",
+                    session.card_id[:12], session.element_count,
+                )
+                if await self._do_split_card(session, len(segments), [], set(), {}, []):
+                    return False
             self._handle_flush_error(e)
             return False
         return True
@@ -784,25 +795,29 @@ class StreamingController:
                 log_prefix="CardKit",
             )
 
-        card = build_complete_card(
-            segments=active_segments,
-            all_tool_steps=all_tool_steps,
-            footer_data=session.footer,
-            image_keys=session.image_keys,
-            is_error=is_error,
-            is_aborted=is_aborted,
-            footer_fields=self._cfg.footer_fields,
-            footer_show_label=self._cfg.footer_show_label,
-            footer_enabled=self._cfg.footer_enabled,
-            footer_text_size=self._cfg.footer_text_size,
-            panel_expanded=self._cfg.panel_expanded,
-            header_enabled=self._cfg.header_enabled,
-            body_text_size=self._cfg.body_text_size,
-            show_tool_use=self._cfg.show_tool_use,
-            width_mode=self._cfg.width_mode,
-        )
+        def _render_complete_card(*, show_tool_use: bool) -> dict[str, Any]:
+            return build_complete_card(
+                segments=active_segments,
+                all_tool_steps=all_tool_steps,
+                footer_data=session.footer,
+                image_keys=session.image_keys,
+                is_error=is_error,
+                is_aborted=is_aborted,
+                footer_fields=self._cfg.footer_fields,
+                footer_show_label=self._cfg.footer_show_label,
+                footer_enabled=self._cfg.footer_enabled,
+                footer_text_size=self._cfg.footer_text_size,
+                panel_expanded=self._cfg.panel_expanded,
+                header_enabled=self._cfg.header_enabled,
+                body_text_size=self._cfg.body_text_size,
+                show_tool_use=show_tool_use,
+                width_mode=self._cfg.width_mode,
+            )
+
+        card = _render_complete_card(show_tool_use=self._cfg.show_tool_use)
 
         streaming_closed = False
+        oversize = False
         for attempt in range(3):
             try:
                 assert self._client is not None
@@ -832,6 +847,11 @@ class StreamingController:
                     session.sequence,
                     exc_info=True,
                 )
+                if e.code == CARD_OVER_SIZE:
+                    oversize = True
+                if oversize and attempt < 2:
+                    # 超体积：丢工具面板重渲（回答 + footer 优先保进卡），体积大幅缩小
+                    card = _render_complete_card(show_tool_use=False)
                 if session.guard.terminate("_do_complete_card", e):
                     return False
                 if attempt < 2:

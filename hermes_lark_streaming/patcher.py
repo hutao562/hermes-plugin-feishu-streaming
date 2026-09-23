@@ -288,7 +288,7 @@ def _complete_hook(indent: str) -> str:
             "    _lark_completion_id = agent_result.get('_hermes_lark_completion_id') or event.message_id",
             "    _lark_card_sent = await on_message_completed_wait(",
             "        message_id=_lark_completion_id,",
-            "        chat_id=getattr(event.source, 'chat_id', None),",
+            "        chat_id=getattr(getattr(event, 'source', None), 'chat_id', None),",
             "        answer=response,",
             "        is_error=bool(agent_result.get('failed')),",
             "        duration=_response_time,",

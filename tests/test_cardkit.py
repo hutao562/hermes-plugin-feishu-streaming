@@ -763,3 +763,16 @@ def test_complete_card_without_answer_keeps_done_placeholder() -> None:
     state = SegmentState()
     card = build_complete_card(segments=state.segments, all_tool_steps=[])
     assert "Done." in json.dumps(card["body"], ensure_ascii=False)
+
+
+def test_tool_output_block_capped_for_card_size() -> None:
+    """超长工具输出截断（head+tail+标记）：防卡片 JSON 撑爆飞书体积上限（200860）."""
+    from hermes_lark_streaming.streaming.tooluse import _fenced_block
+
+    huge = "x" * 5000
+    block = _fenced_block("text", huge)
+    assert len(block["content"]) < 1400
+    assert "已截断" in block["content"]
+
+    short = _fenced_block("text", "ok")
+    assert short["content"] == "ok"
