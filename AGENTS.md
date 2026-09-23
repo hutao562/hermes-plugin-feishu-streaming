@@ -156,6 +156,8 @@ hermes 自动升级是**原子流程**：拉新代码覆盖 `gateway/run.py`（�
 
 **busy ack 进卡（2026-09-22）**：busy 时用户发消息的确认文本（`↪ Redirected current run` / `⏳ Queued for the next turn` 等，`run_busy.py` `_send_busy_reply` 是唯一出口）注入 marker `BUSY_ACK` 接管：feishu + 同 chat 有 STREAMING 卡片且预留了心跳行时，ack 文本写进卡片心跳状态行（`on_busy_ack` 复用 heartbeat 机制，回合完成时状态行自然消失）；不为 ack 重激活已完成卡片，其余场景原生 ack 文本保底。**注意 ack 查找不能走 `_find_session_by_chat`**（它过滤未建卡 session）——ack 常在建卡完成前到达，需直接查 `_chat_index`；IDLE/CREATING 未建卡时暂存心跳文本等 `_do_create_card` 推送。
 
+**卡片体积上限（2026-09-23）**：飞书卡片除元素数硬上限 200 外还有 **JSON 体积上限**，错误码 200860 "card over max size"——工具面板曾把 execute_code 完整输出无截断塞进代码块，88 个元素（远低于 180 的拆分阈值）就超限：所有更新被拒 → 卡片冻结「处理中」、思考/回答溢出卡外、完成重渲失败走文本兜底。三层修复：结果块截断（head 900 + tail 240，`_fenced_block`）、`_do_batch_update` 收到 200860 就地强制换卡（截断后整卡替换体积变小可成功）、完成渲染超限降级丢工具面板保回答。诊断特征：errors.log 连续 `card over max size`。另：僵尸守护杀卡前查 `turn_registry.is_live()`（agent 弱引用存活 = 回合真在跑，长工具静默期不误杀）；COMPLETE hook 已补传 chat_id（防御式 getattr）。这两个是 25min 配乐回合整段跑出卡外的根因（2013de9）。
+
 **busy redirect 开新卡（2026-09-22）**：交互设计决策——**用户主动意图（redirect 纠正）开新卡，系统内部延续（message_id=None 后台回合）维持合并**。注入 marker `REDIRECT`（`_handle_active_session_busy_message` 的 `effective_mode, redirected = ...` 赋值后）：`on_redirect_started` 给旧卡补「↪ 任务已按新指令重启，结果见下方新卡片」NOTICE 后正常完成（绿色收尾，不用 ABORTED），为新消息 id 建新卡（anchor=纠正消息）。redirect 后流式回调携带新消息 id 自然落新卡；完成信号带旧 id，经 `_interrupt_map`（old→new，复用中断 A→B 通路）在 `_completion_session` 路由到新卡。steer/queue 行为不变（steer 无新消息身份、queue 走 drain 本来就开新卡）。新注入点 18：`on_redirect_started`。
 
 ### 第 1 层：`register()` 启动时自愈（核心）
