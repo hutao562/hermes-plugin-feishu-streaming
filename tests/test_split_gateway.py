@@ -331,7 +331,8 @@ async def test_completion_footer_failure_silence_and_cleanup(
                         NS(heartbeat_owner_is_current=lambda *a: path != "gate"))
     hooks.on_message_completed_wait.return_value = owned
     hooks.on_message_needs_text_fallback.return_value = not owned
-    event = NS(message_id="inbound", text="question", channel_prompt=None, message_type="text")
+    event = NS(message_id="inbound", source=NS(chat_id="chat"),
+               text="question", channel_prompt=None, message_type="text")
     source = NS(platform=NS(value="feishu"), user_name="user", chat_id="chat", thread_id=None, user_id="user")
     entry = NS(session_id="sid")
     prepared = NS(history=[], message_text="question", context_prompt="prompt", persist_user_message="question",
@@ -528,7 +529,7 @@ async def test_target_inbound_finally_preserves_generation_cleanup(hooks, monkey
     source = source_at("gateway/run_inbound.py", TARGET_REVISION)
     generated = {"run_inbound.py": inject_gateway("run_inbound.py", source)}
     monkeypatch.setitem(sys.modules, "gateway.run", NS(_AGENT_PENDING_SENTINEL=object()))
-    event = NS(message_id="inbound")
+    event = NS(message_id="inbound", source=NS(chat_id="chat"))
     source_obj = context().source
     order = []
     hooks.on_message_aborted.side_effect = lambda **kw: order.append(("card", kw["message_id"]))

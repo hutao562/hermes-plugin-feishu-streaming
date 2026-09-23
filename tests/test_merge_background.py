@@ -337,3 +337,15 @@ def test_busy_ack_stored_while_card_creating() -> None:
     assert ctrl.on_busy_ack(chat_id="oc_ack_creating", text="↪ Redirected current run") is True
     assert session.heartbeat_text == "↪ Redirected current run"
     assert session.heartbeat_dirty is True
+
+
+def test_tooluse_steps_cap_detail() -> None:
+    """工具展示步的 detail 截断到 200 字符（面板正文不爆体积）."""
+    from hermes_lark_streaming.streaming.tooluse import ToolStatus, ToolUseTracker
+
+    tracker = ToolUseTracker()
+    tracker.record_start("terminal", "y" * 800)
+    tracker.record_end("terminal", output="done")
+    steps = tracker.build_display_steps()
+    assert len(steps[0]["detail"]) <= 200
+    assert steps[0]["status"] == ToolStatus.SUCCESS.value

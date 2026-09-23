@@ -313,7 +313,15 @@ def _build_display_block(
     return _fenced_block("text", normalized) if normalized else None
 
 
+_BLOCK_MAX_CHARS = 1200  # 单工具结果块上限：飞书卡片有 JSON 体积上限（200860），
+# execute_code 等工具的完整输出会把卡撑爆——工具面板只是进度展示，全文在终端里
+
+
 def _fenced_block(language: str, content: str) -> ToolBlock:
+    if len(content) > _BLOCK_MAX_CHARS:
+        head, tail = content[:900], content[-240:]
+        omitted = len(content) - 1140
+        content = f"{head}\n…（已截断 {omitted} 字符，完整输出见终端）…\n{tail}"
     fence = "`" * max(3, max((len(m) for m in re.findall(r"`+", content)), default=0) + 1)
     return {"language": language, "content": content, "fenced": f"{fence}{language}\n{content}\n{fence}"}
 
@@ -402,7 +410,7 @@ class ToolUseTracker:
                     "name": s.name,
                     "title": base_title,
                     "status": s.status.value,
-                    "detail": detail,
+                    "detail": detail[:200],
                     "label": label,
                     "emoji": emoji,
                     "output": s.output,

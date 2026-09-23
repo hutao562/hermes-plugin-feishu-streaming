@@ -104,6 +104,7 @@ CARDKIT_RATE_LIMITED = 230020  # 频控
 CARDKIT_CONTENT_FAILED = 230099  # 卡片内容创建失败（通用码，需检查子错误）
 CARDKIT_ELEMENT_LIMIT = 11310  # 子码: 卡片元素数量超限
 CARDKIT_STREAMING_CLOSED = 300309  # 卡片流式模式已关闭
+CARD_OVER_SIZE = 200860  # 卡片超过飞书体积上限（工具长输出堆爆 JSON，元素数还没到阈值）
 MSG_NOT_FOUND = 1000023  # 消息不存在/已删除
 
 
