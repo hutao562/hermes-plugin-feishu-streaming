@@ -62,7 +62,12 @@ def register(ctx: Any) -> None:
     logging.getLogger("gateway.run").info(
         "[feishu-streaming] register() called — registering streaming feishu platform")
     client = _LazyClient()
-    engine = ChatCardEngine(client)
+    engine = ChatCardEngine(
+        client,
+        footer_fields=_footer_config("fields"),
+        footer_show_label=_footer_config("show_label", False),
+        footer_enabled=_footer_config("enabled", True),
+    )
 
     ctx.register_platform(
         name="feishu",
@@ -87,6 +92,20 @@ def register(ctx: Any) -> None:
         ctx.register_hook("on_stream_delta", _make_reasoning_hook(engine))
         # usage 聚合（footer tokens/t/s）：session_id 含 chat_id，complete 时消费
         ctx.register_hook("post_api_request", _make_usage_hook(engine))
+
+
+def _footer_config(key: str, default: Any = None) -> Any:
+    """读 HERMES_HOME/config.yaml 的 streaming.footer 段（与注入模式同源同形态）."""
+    try:
+        from ._vendor.config import Config
+
+        footer = Config()._streaming_sec().get("footer", {})
+        value = footer.get(key) if isinstance(footer, dict) else None
+        if key == "fields" and value and isinstance(value, list) and isinstance(value[0], str):
+            value = [value]  # 一维自动包二维（同注入模式 Config.footer_fields）
+        return value if value is not None else default
+    except Exception:
+        return default
 
 
 def _feishu_deps_present() -> bool:
@@ -117,6 +136,7 @@ def _make_usage_hook(engine: ChatCardEngine) -> Any:
         usage = kwargs.get("usage")
         if isinstance(usage, dict):
             session_id = kwargs.get("session_id") or ""
+            usage = {**usage, "context_length": kwargs.get("context_length")}
             engine.record_usage(session_id, usage, model=kwargs.get("model") or "")
             if session_id not in logged:  # 每回合桶首条打一次（确认钩子活性）
                 logged.add(session_id)

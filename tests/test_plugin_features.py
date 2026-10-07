@@ -247,7 +247,8 @@ def test_record_usage_extracts_chat_from_session_id() -> None:
 async def test_complete_footer_renders_tokens_and_speed() -> None:
     import json
 
-    engine = ChatCardEngine(_mock_client())
+    engine = ChatCardEngine(
+        _mock_client(), footer_fields=[["elapsed", "speed"], ["tokens", "model"]])
     engine.record_usage("agent:main:feishu:dm:oc_chatxxx0000000000000000000000ff",
                         {"prompt_tokens": 1000, "completion_tokens": 120}, model="test-model")
     engine.on_draft("oc_chatxxx0000000000000000000000ff", "回答", reply_to="om_a")
@@ -307,3 +308,98 @@ async def test_send_normal_final_with_notify_stays_card_path(adapter) -> None:
                                 metadata={"notify": True})
     assert adapter._engine().session_for("chat1").state == "completed"
     assert result.message_id == "om_card_msg"
+
+
+# ── redirect：↪ ack 标记 → 下一 draft 收旧开新 ──
+
+
+@pytest.mark.asyncio
+async def test_redirect_ack_then_draft_seals_old_with_notice() -> None:
+    """↪ redirect 后新 draft：旧卡 NOTICE 收尾 + 新卡（interrupt 同锚场景）."""
+    engine = ChatCardEngine(_mock_client())
+    engine.on_draft("chat1", "旧指令的回答", reply_to="om_a")
+    await _settle(engine)
+    old = engine.session_for("chat1")
+    assert old.state == "streaming"
+
+    engine.mark_redirect("chat1")  # ↪ ack 到达
+    engine.on_draft("chat1", "新指令的回答", reply_to="om_a")  # 同锚！
+    await _settle(engine)
+
+    new = engine.session_for("chat1")
+    assert new is not old, "redirect 后应开新会话"
+    assert old.state == "completed"
+    notice_segs = [s for s in old.segment_state.segments if s.type.value == "notice"]
+    assert notice_segs and "新指令" in notice_segs[-1].text  # NOTICE 收尾文案
+    assert engine._client.cardkit_create.call_count == 2  # 新卡
+    assert new.redirected is False  # 标记已消费
+
+
+@pytest.mark.asyncio
+async def test_queued_ack_does_not_mark_redirect() -> None:
+    """⏳ queued ack 不打标记（queue 回合 drain 成新消息新锚，走锚变化路径）."""
+    engine = ChatCardEngine(_mock_client())
+    engine.on_draft("chat1", "内容", reply_to="om_a")
+    await _settle(engine)
+    first = engine.session_for("chat1")
+    assert first.redirected is False  # engine 无 queued 入口，确认默认不标记
+
+
+@pytest.mark.asyncio
+async def test_adapter_redirect_ack_marks_engine(adapter) -> None:
+    adapter._engine().on_draft("chat1", "流式中", reply_to="om_a")
+    await _settle(adapter._engine())
+
+    result = await adapter.send("chat1", "↪ 已重定向当前运行", reply_to="om_1",
+                                metadata={"notify": True})
+    assert result.success is True
+    assert adapter._engine().session_for("chat1").redirected is True
+
+
+# ── footer：形态对齐注入模式配置 ──
+
+
+@pytest.mark.asyncio
+async def test_footer_renders_without_labels_single_row() -> None:
+    """footer_fields 单行四字段 + show_label=False → emoji 形态（注入模式同款）."""
+    import json
+
+    engine = ChatCardEngine(
+        _mock_client(),
+        footer_fields=[["elapsed", "model", "speed", "context"]],
+        footer_show_label=False)
+    engine.record_usage(
+        "oc_abc0000000000000000000000000099",
+        {"prompt_tokens": 5000, "completion_tokens": 100, "context_length": 1000000},
+        model="m1")
+    engine.on_draft("oc_abc0000000000000000000000000099", "答", reply_to="om_a")
+    await _settle(engine)
+    await engine.complete("oc_abc0000000000000000000000000099", "答", duration=5.0)
+
+    card = json.dumps(engine._client.cardkit_update.call_args.args[1], ensure_ascii=False)
+    assert "Elapsed" not in card  # 无英文标签
+    assert "⏱" in card and "⚡" in card  # emoji 形态
+    assert "t/s" in card and "m1" in card
+    assert "1.0M" in card  # context 字段（1M 上限）
+
+
+def test_footer_config_reads_hermes_yaml() -> None:
+    """register 的 footer 形态来自 HERMES_HOME/config.yaml（与注入模式同源）."""
+    from plugin import _footer_config
+
+    fields = _footer_config("fields", None)
+    assert isinstance(fields, list) and isinstance(fields[0], list)  # 二维
+
+
+@pytest.mark.asyncio
+async def test_usage_hook_passes_context_length() -> None:
+    from plugin import _make_usage_hook
+
+    engine = ChatCardEngine(_mock_client())
+    hook = _make_usage_hook(engine)
+    hook(session_id="agent:main:feishu:dm:oc_abc00000000000000000000000000099",
+         usage={"prompt_tokens": 10, "completion_tokens": 2},
+         model="m", context_length=2000000)
+    bucket = engine._usage["oc_abc00000000000000000000000000099"]
+    assert bucket["context_max"] == 2000000
+    assert bucket["context_used"] == 10

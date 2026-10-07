@@ -126,7 +126,11 @@ class StreamingFeishuMixin:
         if (session is not None and session.state == "streaming" and not interim
                 and content and len(content) <= 200
                 and content.lstrip().startswith(_BUSY_ACK_PREFIXES)):
-            # busy ack（↪ Redirected / ⏳ Queued）→ 心跳行；回合完成时随完成卡消失
+            # busy ack → 心跳行；回合完成时随完成卡消失。
+            # ↪ redirect（用户纠正、interrupt 注入新指令）额外打标记：下一个
+            # draft 收旧卡开新卡（interrupt 不换 event_message_id，锚检测覆盖不到）
+            if content.lstrip().startswith("↪"):
+                engine.mark_redirect(chat_id)
             engine.on_heartbeat(chat_id, content)
             return _compat.send_result(success=True,
                                        message_id=f"lark-card:{session.card_msg_id}")
