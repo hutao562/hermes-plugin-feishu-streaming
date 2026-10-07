@@ -136,7 +136,9 @@ def _make_usage_hook(engine: ChatCardEngine) -> Any:
         usage = kwargs.get("usage")
         if isinstance(usage, dict):
             session_id = kwargs.get("session_id") or ""
-            usage = {**usage, "context_length": kwargs.get("context_length")}
+            usage = {**usage, "context_length": kwargs.get("context_length"),
+                     "started_at": kwargs.get("started_at"),
+                     "ended_at": kwargs.get("ended_at")}
             engine.record_usage(session_id, usage, model=kwargs.get("model") or "")
             if session_id not in logged:  # 每回合桶首条打一次（确认钩子活性）
                 logged.add(session_id)
