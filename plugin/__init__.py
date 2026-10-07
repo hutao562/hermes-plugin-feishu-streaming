@@ -111,11 +111,18 @@ def _make_reasoning_hook(engine: ChatCardEngine) -> Any:
 
 
 def _make_usage_hook(engine: ChatCardEngine) -> Any:
+    logged: set[str] = set()
+
     def on_post_api_request(**kwargs: Any) -> None:
         usage = kwargs.get("usage")
         if isinstance(usage, dict):
-            engine.record_usage(kwargs.get("session_id") or "", usage,
-                                model=kwargs.get("model") or "")
+            session_id = kwargs.get("session_id") or ""
+            engine.record_usage(session_id, usage, model=kwargs.get("model") or "")
+            if session_id not in logged:  # 每回合桶首条打一次（确认钩子活性）
+                logged.add(session_id)
+                logging.getLogger("gateway.run").info(
+                    "[feishu-streaming] usage tracking started: session=%s model=%s",
+                    session_id[:40], kwargs.get("model") or "?")
 
     return on_post_api_request
 

@@ -230,6 +230,11 @@ class ChatCardEngine:
             len(session.tool_tracker.build_display_steps()))
         session.state = "failed" if is_error else "completed"
         usage = self._pop_usage(chat_id)
+        if usage:
+            _logger.info(
+                "[feishu-streaming] footer usage: chat=%s in=%d out=%d model=%s",
+                chat_id[:12], usage.get("input", 0), usage.get("output", 0),
+                usage.get("model") or model or "?")
         if tokens:
             usage = {"input": tokens.get("input_tokens", 0),
                      "output": tokens.get("output_tokens", 0), "model": model}
