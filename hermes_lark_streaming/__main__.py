@@ -402,7 +402,7 @@ def _cmd_status() -> int:
     patched = patcher.is_patched()
     print(f"Patched: {'yes' if patched else 'no'}")
     print(f"Target:  {patcher.run_path}")
-    print(f"Layout:  {'split gateway modules' if patcher.split else 'monolithic gateway'}")
+    print("Layout:  split gateway modules")
 
     # 插件是否在 venv 可 import（升级重建 venv 会丢 editable 安装 —— 即便 patch 打了
     # gateway 进程也 ImportError，streaming 静默失效。这是最关键的诊断项）。
@@ -507,10 +507,9 @@ def _cmd_verify() -> int:
         return 1
 
     print(f"Target: {patcher.run_path}")
-    if patcher.split:
-        print("Layout: split gateway modules")
-        for path in patcher.target_paths[1:]:
-            print(f"  {path}")
+    print("Layout: split gateway modules")
+    for path in patcher.target_paths[1:]:
+        print(f"  {path}")
     print("Checking compatibility...")
     try:
         patcher.verify_target()
