@@ -144,10 +144,13 @@ class StreamingFeishuMixin:
             if msg_id is not None:
                 return _compat.send_result(success=True, message_id=msg_id)
             # 建卡失败 → 落回原生文本
-        elif not interim and content.strip() and reply_to is not None:
+        elif (not interim and content.strip() and reply_to is not None
+                and not content.lstrip().startswith(_BUSY_ACK_PREFIXES)):
             # 无流式会话（短回答被 transport 的 _MIN_NEW_MSG_CHARS 吞帧 / 单 tick 直达
             # finalize，draft 让位真发）→ 现场开卡立即完成，保证回合产出卡片形态一致。
             # reply_to 有锚 = 对话回合；无锚通知（watcher 等）保持原生文本。
+            # busy-ack（↪/⏳）除外——回合早期的 ack 到达时卡还没建，误开卡会把
+            # ack 文本当回答渲染成完成卡。
             engine.on_draft(chat_id, content, reply_to=reply_to)
             msg_id = await engine.complete(chat_id, content)
             if msg_id is not None:
