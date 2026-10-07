@@ -56,6 +56,7 @@ class ChatSession:
     card_msg_id: str | None = None
     answer_seg: Segment | None = None
     redirected: bool = False  # ↪ redirect ack 已见：下一 draft 收旧开新
+    _reasoning_logged: bool = False
     tool_seg: Segment | None = None
     heartbeat_text: str = ""
     sequence: int = 0
@@ -116,7 +117,9 @@ class ChatCardEngine:
         bucket = self._usage.setdefault(
             chat_id, {"input": 0, "output": 0, "model": "", "context_max": 0,
                       "first_started": None, "last_ended": None})
-        bucket["input"] += int(usage.get("prompt_tokens") or 0)
+        # input 取最后值不累加：每轮 API 的 prompt 都含全量历史，累加会虚高
+        # 数量级（实测 2000 字回合累出 88 万）；注入模式口径即最后值
+        bucket["input"] = max(bucket["input"], int(usage.get("prompt_tokens") or 0))
         bucket["output"] += int(usage.get("completion_tokens")
                                 or usage.get("output_tokens") or usage.get("total_tokens") or 0)
         if model:
@@ -150,8 +153,11 @@ class ChatCardEngine:
             # typing 是 2s 心跳循环：回合刚完成后的尾巴调用，不是新回合——
             # 重建会得到一张永挂 loading 的空卡
             return
-        self._ensure_session(chat_id)
-        _logger.info("[feishu-streaming] turn started: chat=%s", chat_id[:12])
+        existing = self._sessions.get(chat_id)
+        if existing is None or existing.is_terminal:
+            self._ensure_session(chat_id)
+            _logger.info("[feishu-streaming] turn started: chat=%s", chat_id[:12])
+        # typing 2s 心跳循环的重复调用：会话健在时静默（此前每 2s 刷一条）
 
     def mark_redirect(self, chat_id: str) -> None:
         """↪ redirect ack（用户纠正、interrupt 模式）→ 标记当前会话：下一个
@@ -261,6 +267,10 @@ class ChatCardEngine:
         target = self._resolve_reasoning_target(chat_id)
         if target is None:
             return
+        if not target._reasoning_logged:
+            target._reasoning_logged = True
+            _logger.info("[feishu-streaming] reasoning streaming into card: chat=%s",
+                         target.chat_id[:12])
         target.segment_state.on_reasoning_delta(text)
         self._schedule(target)
 
@@ -437,12 +447,14 @@ class ChatCardEngine:
         return active[0] if active else None
 
     def _resolve_reasoning_target(self, chat_id: str) -> ChatSession | None:
-        # 钩子不带 chat：显式 chat 命中优先；否则仅单会话时兜底（多会话并发丢弃防串扰）
+        # 钩子不带 chat：显式 chat 命中优先；否则仅单会话时兜底（多会话并发丢弃防串扰）。
+        # 兜底须含 creating（typing 建卡窗口内的 reasoning 也不能丢——长思考回合
+        # 的 reasoning 若在建卡期被丢，卡片全程只有 loading）
         session = self.active_session(chat_id)
         if session is not None:
             return session
-        streaming = self.streaming_sessions()
-        return streaming[0] if len(streaming) == 1 else None
+        active = [s for s in self._sessions.values() if not s.is_terminal]
+        return active[0] if len(active) == 1 else None
 
     def _schedule(self, session: ChatSession) -> None:
         if session.state == "creating" or session.flush is None or self._loop is None:
