@@ -4,6 +4,8 @@
 
 Hermes Gateway plugin that injects hooks into Hermes split gateway modules and `cron/scheduler_delivery.py` via AST patching to provide real-time streaming Feishu/Lark CardKit v2.0 cards with typewriter effect.
 
+**第二形态（官方插件模式，`plugin/`）**：`kind: platform` 平台适配器插件（`hermes plugins validate` 已通过），子类化官方 `FeishuAdapter` 实现 draft-streaming 契约（`supports_draft_streaming`/`send_draft` → CardKit v2），以 `register_platform(name="feishu")` 同名注册顶替 bundled（registry last-writer-wins，具体注册压掉 deferred loader）。与注入模式二选一切换：部署到 `~/.hermes/plugins/feishu-streaming/` + `plugins.enabled` 加 `feishu-streaming` + 注入模式先 `uninstall`；部署需 `streaming.enabled: true`（官方全局默认关，注入模式靠 hook 绕过了它）。会话以 **chat** 为键（draft 帧不带 message 身份），ANSWER 段整段置换（draft content 是全量快照），`draft_stream_is_message=True` 保证工具边界不封卡；`format_tool_event` 记录结构化事件后返 None 吃掉文本行；`_interim_send` metadata（到 adapter 才剥离）与 busy-ack 前缀（↪/⏳）路由进心跳行；`send_document` 上传后 reply 到卡片消息。manifest 需 `provides_hooks` 声明（on_stream_delta），否则 validate 失败。
+
 ## Commands
 
 ```bash
