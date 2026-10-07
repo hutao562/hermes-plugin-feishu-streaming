@@ -574,12 +574,14 @@ async def test_gateway_lifecycle_notice_not_merged_into_card(adapter) -> None:
     assert adapter.native_sends  # 确实发出去了
 
 
-def test_reasoning_hook_reads_delta_kwarg() -> None:
+@pytest.mark.asyncio
+async def test_reasoning_hook_reads_delta_kwarg() -> None:
     """官方 enqueue 参数名是 delta（非 text）——回归防护."""
     from plugin import _make_reasoning_hook
 
     engine = ChatCardEngine(_mock_client())
     engine.on_turn_started("chat1")  # 建活跃会话（含 creating 兜底）
+    await _settle(engine)
     hook = _make_reasoning_hook(engine)
     hook(kind="reasoning", delta="💭 思考增量")
     session = engine.session_for("chat1")
