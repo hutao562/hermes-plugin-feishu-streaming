@@ -431,3 +431,77 @@ async def test_interrupt_notice_never_opens_card(adapter) -> None:
                                  metadata={"notify": True})
     assert result2.message_id.startswith("lark-card:")
     assert adapter._engine().session_for("chat1").state == "streaming"
+
+
+# ── typing 建卡 + 工具阶段可见 + t/s 真实口径 ──
+
+
+@pytest.mark.asyncio
+async def test_turn_started_creates_card_before_any_draft() -> None:
+    """typing 时机建卡：工具阶段用户就能看到 loading 卡（不等首条 draft）."""
+    engine = ChatCardEngine(_mock_client())
+    engine.on_turn_started("chat1")  # send_typing 时机
+    await _settle(engine)
+    session = engine.session_for("chat1")
+    assert session is not None and session.state == "streaming"
+    engine._client.cardkit_create.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_tool_events_before_draft_show_in_panel() -> None:
+    """工具事件先于 draft：面板数据积累，卡已建（typing 兜底）。"""
+    engine = ChatCardEngine(_mock_client())
+    engine.on_turn_started("chat1")
+    engine.on_tool_start("web_search", "ai news")
+    engine.on_tool_end("web_search", output="results")
+    await _settle(engine)
+    session = engine.session_for("chat1")
+    steps = session.tool_tracker.build_display_steps()
+    assert len(steps) == 1 and steps[0]["status"] == "success"
+    # 工具面板元素已建（不等正文）
+    assert session.tool_seg is not None and session.tool_seg.created
+
+
+@pytest.mark.asyncio
+async def test_draft_after_typing_session_records_anchor() -> None:
+    """typing 建的会话（无锚）收到带锚 draft：记录锚不重开（DM 直发卡保留）."""
+    engine = ChatCardEngine(_mock_client())
+    engine.on_turn_started("chat1")
+    await _settle(engine)
+    first = engine.session_for("chat1")
+    engine.on_draft("chat1", "内容", reply_to="om_a")
+    assert engine.session_for("chat1") is first  # 不重开
+    assert first.reply_to == "om_a"  # 锚已记录
+    assert engine._client.cardkit_create.call_count == 1  # 没建第二张
+
+
+@pytest.mark.asyncio
+async def test_ts_uses_api_time_span_not_session_time() -> None:
+    """t/s 分母 = API 时间跨度（首 started → 末 ended，含工具时间），
+    不用会话时长（只覆盖流式尾巴，会虚高一个数量级）。"""
+    import json
+
+    engine = ChatCardEngine(
+        _mock_client(), footer_fields=[["elapsed", "speed"]])
+    engine.record_usage(
+        "oc_aaa0000000000000000000000000099",
+        {"prompt_tokens": 100, "completion_tokens": 500,
+         "started_at": 100.0, "ended_at": 110.0}, model="m")
+    engine.record_usage(
+        "oc_aaa0000000000000000000000000099",
+        {"prompt_tokens": 50, "completion_tokens": 500,
+         "started_at": 130.0, "ended_at": 140.0}, model="m")
+    engine.on_draft("oc_aaa0000000000000000000000000099", "答", reply_to="om_a")
+    await _settle(engine)
+    # 会话时长 ~0（刚建）；API 跨度 40s → 1000 tokens / 40s = 25 t/s
+    await engine.complete("oc_aaa0000000000000000000000000099", "答")
+    card = json.dumps(engine._client.cardkit_update.call_args.args[1], ensure_ascii=False)
+    assert "25 t/s" in card
+
+
+@pytest.mark.asyncio
+async def test_adapter_send_typing_starts_card(adapter) -> None:
+    typed = await adapter.send_typing("chat1")
+    await _settle(adapter._engine())
+    assert adapter._engine().session_for("chat1") is not None
+    assert typed is None  # 官方 no-op 返回值

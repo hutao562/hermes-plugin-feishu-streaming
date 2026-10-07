@@ -112,7 +112,8 @@ class ChatCardEngine:
             return
         chat_id = self._chat_of_session(session_id)
         bucket = self._usage.setdefault(
-            chat_id, {"input": 0, "output": 0, "model": "", "context_max": 0})
+            chat_id, {"input": 0, "output": 0, "model": "", "context_max": 0,
+                      "first_started": None, "last_ended": None})
         bucket["input"] += int(usage.get("prompt_tokens") or 0)
         bucket["output"] += int(usage.get("completion_tokens")
                                 or usage.get("output_tokens") or usage.get("total_tokens") or 0)
@@ -121,12 +122,29 @@ class ChatCardEngine:
         if usage.get("context_length"):
             bucket["context_max"] = int(usage["context_length"])
             bucket["context_used"] = int(usage.get("prompt_tokens") or 0)
+        # API 时间跨度（含排队/工具间隔）：t/s 分母用它，口径对齐注入模式的 _turn_seconds
+        if usage.get("started_at"):
+            if bucket["first_started"] is None:
+                bucket["first_started"] = usage["started_at"]
+            bucket["last_ended"] = usage.get("ended_at") or bucket["last_ended"]
 
     def _pop_usage(self, chat_id: str) -> dict[str, Any] | None:
         bucket = self._usage.pop(chat_id, None) or self._usage.pop("", None)
         if not bucket or not (bucket["input"] or bucket["output"]):
             return None
         return bucket
+
+    def on_turn_started(self, chat_id: str) -> None:
+        """回合开始（send_typing 时机）→ 立即建卡.
+
+        带工具的回合 draft 要等工具全部跑完才出现，此前用户什么都看不到
+        （注入模式消息进来就建卡）。typing 先行建卡（无锚直发 chat），工具
+        事件与正文随后进卡；DM/普通群与注入模式体感一致。
+        """
+        self._capture_loop()
+        session = self._ensure_session(chat_id)
+        _logger.info("[feishu-streaming] turn started (typing): chat=%s card=%s",
+                     chat_id[:12], "pending" if session.card_create_task else "exists")
 
     def mark_redirect(self, chat_id: str) -> None:
         """↪ redirect ack（用户纠正、interrupt 模式）→ 标记当前会话：下一个
@@ -166,12 +184,10 @@ class ChatCardEngine:
         可能从 agent 工作线程同步到达，需 call_soon_threadsafe 回环）。
         reply_to 是 transport _draft_metadata 带的用户消息锚（首轮记录，后续幂等）。
         """
-        if self._loop is None:
-            self._loop = asyncio.get_running_loop()
-            self._thread = threading.current_thread()
+        self._capture_loop()
         session = self._ensure_session(chat_id)
-        if (session.state != "creating" and session.redirected
-                and content and content.strip()):
+        if (session.redirected and content and content.strip()
+                and (session.state != "creating" or session.tool_tracker.build_display_steps())):
             # redirect 后首个有内容 draft：旧卡 NOTICE 收尾 + 开新卡（同锚）。
             # 等价注入模式 REDIRECT marker（on_redirect_started）语义。
             _logger.info("[feishu-streaming] redirect boundary: sealing card, opening new")
@@ -202,10 +218,20 @@ class ChatCardEngine:
         self._schedule(session)
 
     def on_tool_start(self, tool_name: str, detail: str = "") -> None:
-        """format_tool_event(ToolCallChunk) 的落点 — 记录步骤并刷新工具面板."""
-        session = self._any_streaming_session()
+        """format_tool_event(ToolCallChunk) 的落点 — 记录步骤并刷新工具面板.
+
+        工具事件可能先于任何 draft（带工具回合的常态）：无会话时也建卡，
+        让工具面板从第一步就滚动在用户眼前。
+        """
+        session = self._any_active_session()
         if session is None:
-            return
+            # 工具事件先于 typing 的兜底：在事件循环线程上捕获 loop 建""占位
+            # 会话（typing 到达后按 chat 归位）；跨线程无 loop 时丢弃该事件
+            try:
+                self._capture_loop()
+            except RuntimeError:
+                return
+            session = self._ensure_session("")
         session.tool_tracker.record_start(tool_name, detail)
         if session.tool_seg is None:
             session.segment_state.on_tool_event(len(session.tool_tracker.build_display_steps()))
@@ -215,7 +241,7 @@ class ChatCardEngine:
         self._schedule(session)
 
     def on_tool_end(self, tool_name: str, *, error: str = "", output: str = "") -> None:
-        session = self._any_streaming_session()
+        session = self._any_active_session()
         if session is None:
             return
         session.tool_tracker.record_end(tool_name, error=error, output=output)
@@ -261,6 +287,11 @@ class ChatCardEngine:
             len(session.tool_tracker.build_display_steps()))
         session.state = "failed" if is_error else "completed"
         usage = self._pop_usage(chat_id)
+        if (usage and usage.get("first_started") and usage.get("last_ended")
+                and usage["last_ended"] > usage["first_started"] and duration is None):
+            # 真实回合时长 = 首次 API 开始 → 最后一次 API 结束（含工具时间）；
+            # 会话时长只覆盖流式尾巴，会让 t/s 虚高一个数量级
+            duration = usage["last_ended"] - usage["first_started"]
         if usage:
             _logger.info(
                 "[feishu-streaming] footer usage: chat=%s in=%d out=%d model=%s",
@@ -337,6 +368,12 @@ class ChatCardEngine:
 
     # ── 内部 ──
 
+    def _capture_loop(self) -> None:
+        """捕获引擎事件循环（首个 async 入口调用；后续跨线程调度用）."""
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
+            self._thread = threading.current_thread()
+
     def _ensure_session(self, chat_id: str) -> ChatSession:
         session = self._sessions.get(chat_id)
         if session is None or session.is_terminal:
@@ -386,9 +423,9 @@ class ChatCardEngine:
 
         self._loop.create_task(_seal())
 
-    def _any_streaming_session(self) -> ChatSession | None:
-        streaming = self.streaming_sessions()
-        return streaming[0] if streaming else None
+    def _any_active_session(self) -> ChatSession | None:
+        active = [s for s in self._sessions.values() if not s.is_terminal]
+        return active[0] if active else None
 
     def _resolve_reasoning_target(self, chat_id: str) -> ChatSession | None:
         # 钩子不带 chat：显式 chat 命中优先；否则仅单会话时兜底（多会话并发丢弃防串扰）

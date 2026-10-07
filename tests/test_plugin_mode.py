@@ -232,6 +232,9 @@ class _FakeBaseAdapter:
     async def upload_document(self, file_path, *, file_name=None):
         return "file_key_1"
 
+    async def send_typing(self, chat_id, metadata=None):
+        return None
+
     async def reply_file_by_id(self, message_id, file_key, file_name):
         return True
 

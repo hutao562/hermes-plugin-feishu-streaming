@@ -173,6 +173,12 @@ class StreamingFeishuMixin:
         return await super().edit_message(chat_id, message_id, content,  # type: ignore[misc]
                                           finalize=finalize, **kwargs)
 
+    async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> Any:
+        """回合开始的 typing 指示 → 立即建卡（带工具回合的 draft 要等工具跑完，
+        此前用户什么都看不到）。官方实现是 no-op，此处附加建卡后转调。"""
+        self._engine().on_turn_started(chat_id)
+        return await super().send_typing(chat_id, metadata)  # type: ignore[misc]
+
     # ── clarify 内联单选（类定义期覆写；SDK connect() 注册的绑定方法即本版本）──
 
     async def send_clarify(
