@@ -587,3 +587,12 @@ async def test_reasoning_hook_reads_delta_kwarg() -> None:
     session = engine.session_for("chat1")
     reasoning = [s for s in session.segment_state.segments if s.type.value == "reasoning"]
     assert reasoning and "思考增量" in reasoning[0].text
+
+
+@pytest.mark.asyncio
+async def test_draft_strips_thinking_tags(engine: ChatCardEngine) -> None:
+    """draft 快照剥 <thinking> 标签（注入模式同款防线）."""
+    engine.on_draft("chat1", "<thinking>盘算</thinking>正文", reply_to="om_a")
+    await _settle(engine)
+    seg = engine.session_for("chat1").answer_seg
+    assert "thinking" not in seg.text and "正文" in seg.text

@@ -34,6 +34,7 @@ from ._vendor.streaming.segment_helper import (
     build_tool_update_action,
 )
 from ._vendor.streaming.segments import Segment, SegmentState, SegmentType
+from ._vendor.streaming.text import strip_reasoning_tags
 from ._vendor.streaming.tooluse import ToolUseTracker
 
 # 本包 logger 不进 gateway.log（hermes logging 配置问题，见 AGENTS.md）——
@@ -226,7 +227,9 @@ class ChatCardEngine:
             # 空文本走 on_answer_delta：在正确位置（reasoning 之后）新建空 ANSWER 段
             session.segment_state.on_answer_delta("")
             session.answer_seg = session.segment_state.segments[-1]
-        session.answer_seg.text = content
+        # 与注入模式 on_answer 同款防线：<thinking>/<thought> 标签形态的
+        # 思考泄漏清洗（模型裸文本碎片两种模式都无法剥，此处只防标签形态）
+        session.answer_seg.text = strip_reasoning_tags(content)
         session.answer_seg.dirty = True
         self._schedule(session)
 
