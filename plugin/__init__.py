@@ -85,6 +85,8 @@ def register(ctx: Any) -> None:
     # reasoning 流观察（off token path）：钩子不带 chat，引擎按单会话兜底路由
     if hasattr(ctx, "register_hook"):
         ctx.register_hook("on_stream_delta", _make_reasoning_hook(engine))
+        # usage 聚合（footer tokens/t/s）：session_id 含 chat_id，complete 时消费
+        ctx.register_hook("post_api_request", _make_usage_hook(engine))
 
 
 def _feishu_deps_present() -> bool:
@@ -106,6 +108,16 @@ def _make_reasoning_hook(engine: ChatCardEngine) -> Any:
             engine.on_reasoning("", text)  # chat 未知 → 引擎单会话兜底
 
     return on_stream_delta
+
+
+def _make_usage_hook(engine: ChatCardEngine) -> Any:
+    def on_post_api_request(**kwargs: Any) -> None:
+        usage = kwargs.get("usage")
+        if isinstance(usage, dict):
+            engine.record_usage(kwargs.get("session_id") or "", usage,
+                                model=kwargs.get("model") or "")
+
+    return on_post_api_request
 
 
 def _make_standalone_sender() -> Any:
