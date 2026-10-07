@@ -505,3 +505,12 @@ async def test_adapter_send_typing_starts_card(adapter) -> None:
     await _settle(adapter._engine())
     assert adapter._engine().session_for("chat1") is not None
     assert typed is None  # 官方 no-op 返回值
+
+
+@pytest.mark.asyncio
+async def test_probe_starts_card(adapter) -> None:
+    """draft 探针（回合开始必调、带 chat_id）→ 立即建卡（飞书无 typing API）."""
+    assert adapter.supports_draft_streaming(chat_id="chat1") is True
+    await _settle(adapter._engine())
+    assert adapter._engine().session_for("chat1") is not None
+    assert adapter._engine().session_for("chat1").state == "streaming"
