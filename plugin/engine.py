@@ -198,9 +198,10 @@ class ChatCardEngine:
             show_tool_use=self._show_tool_use,
             width_mode=self._width_mode,
         )
-        session.sequence += 1
         try:
+            session.sequence += 1
             await self._client.cardkit_close_streaming(session.card_id, sequence=session.sequence)
+            session.sequence += 1
             await self._client.cardkit_update(session.card_id, card, sequence=session.sequence)
         except Exception as e:
             _logger.warning("plugin complete card update failed: chat=%s err=%s", chat_id, e)
