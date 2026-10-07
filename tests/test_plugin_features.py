@@ -514,3 +514,23 @@ async def test_probe_starts_card(adapter) -> None:
     await _settle(adapter._engine())
     assert adapter._engine().session_for("chat1") is not None
     assert adapter._engine().session_for("chat1").state == "streaming"
+
+
+@pytest.mark.asyncio
+async def test_typing_tail_after_completion_does_not_reopen(adapter) -> None:
+    """回合完成后 2s 内的 typing 循环尾巴不得重建空卡（completed_at <5s 守卫）."""
+    engine = adapter._engine()
+    engine.on_turn_started("chat1")
+    await _settle(engine)
+    await engine.complete("chat1", "回答")
+    assert engine._client.cardkit_create.call_count == 1
+
+    engine.on_turn_started("chat1")  # 完成后 2s 内的 typing 尾巴
+    await _settle(engine)
+    assert engine._client.cardkit_create.call_count == 1  # 没建空卡
+
+    # 模拟旧会话已过窗口（>5s）→ 新回合 typing 正常建新卡
+    engine.session_for("chat1").completed_at -= 10.0
+    engine.on_turn_started("chat1")
+    await _settle(engine)
+    assert engine._client.cardkit_create.call_count == 2
