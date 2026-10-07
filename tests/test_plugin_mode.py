@@ -284,6 +284,26 @@ async def test_send_without_active_session_falls_to_native(adapter) -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_conversation_final_without_session_opens_card(adapter) -> None:
+    """有 reply 锚的终态文本（draft 帧被 MIN_CHARS 吞掉时）→ 现场开卡即完成."""
+    result = await adapter.send("chat_fresh", "短回答", reply_to="om_anchor",
+                                metadata={"notify": True})
+
+    assert result.success is True
+    assert result.message_id == "om_card_msg"  # 卡片消息 id，非原生文本
+    assert adapter.native_sends == []
+    assert adapter._engine().session_for("chat_fresh").state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_send_unanchored_notice_stays_native(adapter) -> None:
+    """无锚通知（bg watcher 等）保持原生文本，不开卡."""
+    result = await adapter.send("ghost_chat", "Background task finished", metadata=None)
+    assert result.message_id == "om_native"
+    assert adapter._engine().session_for("ghost_chat") is None
+
+
+@pytest.mark.asyncio
 async def test_edit_synthetic_card_id_routes_to_heartbeat(adapter) -> None:
     adapter._engine().on_draft("chat1", "流式内容")
     await _settle(adapter._engine())
