@@ -55,6 +55,7 @@ class ChatSession:
     card_id: str | None = None
     card_msg_id: str | None = None
     answer_seg: Segment | None = None
+    redirected: bool = False  # ↪ redirect ack 已见：下一 draft 收旧开新
     tool_seg: Segment | None = None
     heartbeat_text: str = ""
     sequence: int = 0
@@ -77,12 +78,20 @@ class ChatCardEngine:
 
     def __init__(self, client: Any, *, body_text_size: str = "normal_v2",
                  show_tool_use: bool = True, header_enabled: bool = False,
-                 width_mode: str = "default") -> None:
+                 width_mode: str = "default",
+                 footer_fields: list[list[str]] | None = None,
+                 footer_show_label: bool = False,
+                 footer_enabled: bool = True) -> None:
         self._client = client
         self._body_text_size = body_text_size
         self._show_tool_use = show_tool_use
         self._header_enabled = header_enabled
         self._width_mode = width_mode
+        # footer 形态与注入模式同源（vendor Config 读 HERMES_HOME/config.yaml
+        # 的 streaming.footer 段），两形态渲染一致
+        self._footer_fields = footer_fields or [["elapsed", "model", "context"]]
+        self._footer_show_label = footer_show_label
+        self._footer_enabled = footer_enabled
         self._sessions: dict[str, ChatSession] = {}
         # chat → 回合累计 usage（post_api_request 钩子按 session_id 归组，complete 消费）
         self._usage: dict[str, dict[str, Any]] = {}
@@ -102,18 +111,31 @@ class ChatCardEngine:
         if not usage:
             return
         chat_id = self._chat_of_session(session_id)
-        bucket = self._usage.setdefault(chat_id, {"input": 0, "output": 0, "model": ""})
+        bucket = self._usage.setdefault(
+            chat_id, {"input": 0, "output": 0, "model": "", "context_max": 0})
         bucket["input"] += int(usage.get("prompt_tokens") or 0)
         bucket["output"] += int(usage.get("completion_tokens")
                                 or usage.get("output_tokens") or usage.get("total_tokens") or 0)
         if model:
             bucket["model"] = model
+        if usage.get("context_length"):
+            bucket["context_max"] = int(usage["context_length"])
+            bucket["context_used"] = int(usage.get("prompt_tokens") or 0)
 
     def _pop_usage(self, chat_id: str) -> dict[str, Any] | None:
         bucket = self._usage.pop(chat_id, None) or self._usage.pop("", None)
         if not bucket or not (bucket["input"] or bucket["output"]):
             return None
         return bucket
+
+    def mark_redirect(self, chat_id: str) -> None:
+        """↪ redirect ack（用户纠正、interrupt 模式）→ 标记当前会话：下一个
+        draft 到来时收旧开新（同锚——interrupt 注入新指令不换 event_message_id，
+        锚变化检测覆盖不到，此为唯一信号）。"""
+        session = self.active_session(chat_id)
+        if session is not None:
+            session.redirected = True
+            _logger.info("[feishu-streaming] redirect marked: chat=%s", chat_id[:12])
 
     # ── 会话查询 ──
 
@@ -148,6 +170,15 @@ class ChatCardEngine:
             self._loop = asyncio.get_running_loop()
             self._thread = threading.current_thread()
         session = self._ensure_session(chat_id)
+        if (session.state != "creating" and session.redirected
+                and content and content.strip()):
+            # redirect 后首个有内容 draft：旧卡 NOTICE 收尾 + 开新卡（同锚）。
+            # 等价注入模式 REDIRECT marker（on_redirect_started）语义。
+            _logger.info("[feishu-streaming] redirect boundary: sealing card, opening new")
+            old_session = session
+            self._sessions[chat_id] = ChatSession(chat_id=chat_id, reply_to=session.reply_to)
+            session = self._ensure_session(chat_id)
+            self._seal_session(old_session, notice="↪ 任务已按新指令重启，结果见下方新卡片")
         if session.state != "creating" and reply_to and session.reply_to and reply_to != session.reply_to:
             # draft 锚变化 = 新回合开始（排队 followup 被 drain，新消息身份）：
             # 旧卡按已有内容收尾（绿色完成态，避免永挂"处理中"），新回合开新卡。
@@ -242,7 +273,9 @@ class ChatCardEngine:
             segments=session.segment_state.segments,
             all_tool_steps=session.tool_tracker.build_display_steps(),
             footer_data=self._footer_data(session, duration, usage, model),
-            footer_fields=[["elapsed", "speed"], ["tokens", "model"]],
+            footer_fields=self._footer_fields,
+            footer_show_label=self._footer_show_label,
+            footer_enabled=self._footer_enabled,
             is_error=is_error,
             header_enabled=self._header_enabled,
             body_text_size=self._body_text_size,
@@ -274,6 +307,9 @@ class ChatCardEngine:
                 segments=session.segment_state.segments,
                 all_tool_steps=session.tool_tracker.build_display_steps(),
                 footer_data=self._footer_data(session, None, None, ""),
+                footer_fields=self._footer_fields,
+                footer_show_label=self._footer_show_label,
+                footer_enabled=self._footer_enabled,
                 header_enabled=self._header_enabled,
                 body_text_size=self._body_text_size,
                 show_tool_use=self._show_tool_use,
@@ -314,7 +350,7 @@ class ChatCardEngine:
             session.card_create_task = self._loop.create_task(self._do_create_card(session))
         return session
 
-    def _seal_session(self, session: ChatSession) -> None:
+    def _seal_session(self, session: ChatSession, notice: str | None = None) -> None:
         """旧会话收尾（followup 边界）：按已积累内容渲染完成卡，失败仅记日志."""
         assert self._loop is not None
 
@@ -323,6 +359,8 @@ class ChatCardEngine:
                 await session.card_create_task
             if session.state == "failed" or session.card_id is None:
                 return
+            if notice:
+                session.segment_state.add_notice(notice)
             session.segment_state.finalize_segments(
                 len(session.tool_tracker.build_display_steps()))
             session.state = "completed"
@@ -330,6 +368,9 @@ class ChatCardEngine:
                 segments=session.segment_state.segments,
                 all_tool_steps=session.tool_tracker.build_display_steps(),
                 footer_data=self._footer_data(session, None, None, ""),
+                footer_fields=self._footer_fields,
+                footer_show_label=self._footer_show_label,
+                footer_enabled=self._footer_enabled,
                 header_enabled=self._header_enabled,
                 body_text_size=self._body_text_size,
                 show_tool_use=self._show_tool_use,
@@ -464,6 +505,9 @@ class ChatCardEngine:
             # t/s = 输出 tokens / 回合时长（注入模式同款口径）
             if data["output_tokens"] and data["duration"] > 0:
                 data["tps"] = data["output_tokens"] / data["duration"]
+            if usage.get("context_max"):
+                data["context_max"] = usage["context_max"]
+                data["context_used"] = usage.get("context_used", usage.get("input", 0))
         elif model:
             data["model"] = model
         return data
