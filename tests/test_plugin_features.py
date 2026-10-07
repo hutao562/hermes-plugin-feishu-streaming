@@ -191,11 +191,8 @@ def test_card_action_routes_clarify_and_forwards_others(clarify_adapter) -> None
     assert submitted  # resolve 已调度
     _clarify.CLARIFY_STATE.clear()
 
-    # 非 clarify 动作（approval）→ super 转发
-    data2 = types.SimpleNamespace(event=types.SimpleNamespace(
-        action=types.SimpleNamespace(value={"hermes_action": "approve"})))
-    # super()._on_card_action_trigger 走 _FakeBaseAdapter（无实现会 AttributeError）——
-    # 用官方动作的转发断言：确认进入 super 分支即可（此处直接验证不抛 clarify 状态污染）
+    # 非 clarify 动作（approval/update-prompt）走 super 分支：此处验证 clarify 状态
+    # 未被污染（super 转发的完整行为由官方基类保证，_FakeBaseAdapter 无此方法）
     assert not _clarify.CLARIFY_STATE
 
 
