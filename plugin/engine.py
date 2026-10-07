@@ -64,6 +64,8 @@ class ChatSession:
     tool_tracker: ToolUseTracker = field(default_factory=ToolUseTracker)
     flush: FlushController | None = None
 
+    completed_at: float = 0.0
+
     @property
     def is_terminal(self) -> bool:
         return self.state in ("completed", "failed")
@@ -142,9 +144,14 @@ class ChatCardEngine:
         事件与正文随后进卡；DM/普通群与注入模式体感一致。
         """
         self._capture_loop()
-        session = self._ensure_session(chat_id)
-        _logger.info("[feishu-streaming] turn started (typing): chat=%s card=%s",
-                     chat_id[:12], "pending" if session.card_create_task else "exists")
+        existing = self._sessions.get(chat_id)
+        if (existing is not None and existing.is_terminal
+                and time.time() - existing.completed_at < 5.0):
+            # typing 是 2s 心跳循环：回合刚完成后的尾巴调用，不是新回合——
+            # 重建会得到一张永挂 loading 的空卡
+            return
+        self._ensure_session(chat_id)
+        _logger.info("[feishu-streaming] turn started: chat=%s", chat_id[:12])
 
     def mark_redirect(self, chat_id: str) -> None:
         """↪ redirect ack（用户纠正、interrupt 模式）→ 标记当前会话：下一个
@@ -286,6 +293,7 @@ class ChatCardEngine:
         session.segment_state.finalize_segments(
             len(session.tool_tracker.build_display_steps()))
         session.state = "failed" if is_error else "completed"
+        session.completed_at = time.time()
         usage = self._pop_usage(chat_id)
         if (usage and usage.get("first_started") and usage.get("last_ended")
                 and usage["last_ended"] > usage["first_started"] and duration is None):
@@ -396,6 +404,7 @@ class ChatCardEngine:
                 await session.card_create_task
             if session.state == "failed" or session.card_id is None:
                 return
+            session.completed_at = time.time()
             if notice:
                 session.segment_state.add_notice(notice)
             session.segment_state.finalize_segments(
