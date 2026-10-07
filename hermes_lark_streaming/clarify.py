@@ -198,7 +198,20 @@ async def _send_clarify(
     复用 adapter 自身的 ``_feishu_send_with_retry`` + ``_finalize_send_result``，
     保证 reply/thread metadata 处理同原生 approval 一致。
     """
-    from gateway.platforms.base import SendResult  # type: ignore[import-not-found]
+    try:
+        from gateway.platforms.base import SendResult  # type: ignore[import-not-found]
+    except ImportError:  # 无 hermes 源树的环境（CI/沙箱）：用同形状兜底，成功路径只读 success/message_id
+        from dataclasses import dataclass as _dataclass
+
+        @_dataclass
+        class SendResult:  # type: ignore[no-redef]
+            success: bool
+            message_id: str | None = None
+            error: str | None = None
+            raw_response: object = None
+            retryable: bool = False
+            retry_after: float | None = None
+            continuation_message_ids: tuple = ()
 
     if not getattr(self, "_client", None):
         return SendResult(success=False, error="Not connected")
