@@ -572,3 +572,16 @@ async def test_gateway_lifecycle_notice_not_merged_into_card(adapter) -> None:
         metadata={"thread_id": "om_a"})
     assert result.message_id == "om_native"  # 原生文本
     assert adapter.native_sends  # 确实发出去了
+
+
+def test_reasoning_hook_reads_delta_kwarg() -> None:
+    """官方 enqueue 参数名是 delta（非 text）——回归防护."""
+    from plugin import _make_reasoning_hook
+
+    engine = ChatCardEngine(_mock_client())
+    engine.on_turn_started("chat1")  # 建活跃会话（含 creating 兜底）
+    hook = _make_reasoning_hook(engine)
+    hook(kind="reasoning", delta="💭 思考增量")
+    session = engine.session_for("chat1")
+    reasoning = [s for s in session.segment_state.segments if s.type.value == "reasoning"]
+    assert reasoning and "思考增量" in reasoning[0].text
