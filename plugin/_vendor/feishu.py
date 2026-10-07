@@ -138,6 +138,15 @@ class FeishuClient:
         )
         self._client = builder.build()
 
+    @classmethod
+    def from_lark_client(cls, lark_client: Any) -> FeishuClient:
+        """用现成的 lark SDK client 包装（platform 插件复用官方 adapter 的
+        profile 凭据 client，避免自行读 env 拿到空凭据）."""
+        obj = cls.__new__(cls)
+        obj.config = None  # type: ignore[assignment,attr-defined]
+        obj._client = lark_client
+        return obj
+
     @staticmethod
     def _check(response: Any, operation: str) -> None:
         """检查 SDK 响应，失败时抛出 FeishuAPIError."""

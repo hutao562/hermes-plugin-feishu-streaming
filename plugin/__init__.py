@@ -23,12 +23,23 @@ _logger = logging.getLogger("hermes_lark_streaming.plugin")
 
 
 class _LazyClient:
-    """惰性 FeishuClient — 凭据缺失时插件仍可加载，首次实际使用才构建并报错."""
+    """惰性 FeishuClient — 优先从 adapter 绑定的 client 源取（profile 凭据），
+    未绑定时回退 env（本地直跑/测试）。"""
 
     def __init__(self) -> None:
         self._client: Any = None
+        self._source: Any = None  # callable -> FeishuClient | None
+
+    def bind_source(self, source: Any) -> None:
+        """factory 实例化 adapter 后注入：source() 返回凭据正确的 FeishuClient."""
+        self._source = source
+        self._client = None  # 重新解析
 
     def _build(self) -> Any:
+        if self._source is not None:
+            self._client = self._source()
+            if self._client is not None:
+                return self._client
         from ._vendor.feishu import FeishuClient, FeishuClientConfig
 
         self._client = FeishuClient(FeishuClientConfig(
@@ -50,12 +61,13 @@ def register(ctx: Any) -> None:
     # 走 gateway.run logger（唯一确认落 gateway.log 的通道；本包 logger 不进日志）
     logging.getLogger("gateway.run").info(
         "[feishu-streaming] register() called — registering streaming feishu platform")
-    engine = ChatCardEngine(_LazyClient())
+    client = _LazyClient()
+    engine = ChatCardEngine(client)
 
     ctx.register_platform(
         name="feishu",
         label="Feishu / Lark (streaming cards)",
-        adapter_factory=create_adapter_factory(engine),
+        adapter_factory=create_adapter_factory(engine, client_proxy=client),
         check_fn=_feishu_deps_present,
         required_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
         install_hint="Run `hermes setup` to install Feishu support.",
