@@ -122,7 +122,8 @@ def _make_reasoning_hook(engine: ChatCardEngine) -> Any:
     def on_stream_delta(**kwargs: Any) -> None:
         if kwargs.get("kind") != "reasoning":
             return
-        text = kwargs.get("text") or ""
+        # 官方 enqueue 参数名是 delta（stream_delivery._enqueue_stream_hook），非 text
+        text = kwargs.get("delta") or kwargs.get("text") or ""
         if text:
             engine.on_reasoning("", text)  # chat 未知 → 引擎单会话兜底
 
