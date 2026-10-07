@@ -412,3 +412,22 @@ async def test_busy_ack_without_session_does_not_open_card(adapter) -> None:
                                 metadata={"notify": True})
     assert adapter._engine().session_for("chat_fresh") is None  # 没开卡
     assert result.message_id == "om_native"  # ack 走原生文本（gateway 语义不变）
+
+
+@pytest.mark.asyncio
+async def test_interrupt_notice_never_opens_card(adapter) -> None:
+    """⚡ interrupt 通知（gateway.progress.interrupting_head）不开卡——
+    无活跃会话时走原生文本，有活跃会话时进心跳行."""
+    # 无活跃会话：不开卡
+    result = await adapter.send("chat_fresh", "⚡ 正在中断当前任务。我很快就会回复你的消息。",
+                                reply_to="om_1", metadata={"notify": True})
+    assert adapter._engine().session_for("chat_fresh") is None
+    assert result.message_id == "om_native"
+
+    # 有活跃会话：进心跳行，不完成卡片
+    adapter._engine().on_draft("chat1", "流式中", reply_to="om_a")
+    await _settle(adapter._engine())
+    result2 = await adapter.send("chat1", "⚡ 正在中断当前任务。", reply_to="om_a",
+                                 metadata={"notify": True})
+    assert result2.message_id.startswith("lark-card:")
+    assert adapter._engine().session_for("chat1").state == "streaming"

@@ -28,7 +28,9 @@ _logger = logging.getLogger("hermes_lark_streaming.plugin")
 
 # busy ack（redirect/queue 确认文本）的前缀特征 — 无官方语义标记时的启发式。
 # 文案来自 hermes locales（gateway.progress.redirected_head / queued_head）。
-_BUSY_ACK_PREFIXES = ("↪", "⏳")
+# busy/interrupt 系统通知前缀：↪ redirect、⏳ queued、⚡ interrupting
+# （gateway.progress.* locale；这些文本进心跳行或原生文本，绝不渲染成卡）
+_BUSY_ACK_PREFIXES = ("↪", "⏳", "⚡")
 
 
 def _import_base_adapter() -> type[Any]:
