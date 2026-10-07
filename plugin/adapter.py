@@ -68,8 +68,11 @@ class StreamingFeishuMixin:
     def supports_draft_streaming(self, chat_type: str | None = None,
                                  metadata: dict[str, Any] | None = None,
                                  chat_id: str | None = None) -> bool:
-        logging.getLogger("gateway.run").info(
-            "[feishu-streaming] supports_draft_streaming probe -> True (chat=%s)", chat_id)
+        # 探针每回合开始必调（transport 选择）且带 chat_id——飞书无 typing API
+        # （send_typing 不被调），这里是"回合开始"最可靠信号：立即建卡，带工具
+        # 回合的工具面板从第一步就可见（对齐注入模式 on_message_started 体感）。
+        if chat_id:
+            self._engine().on_turn_started(chat_id)
         return True
 
     async def send_draft(self, chat_id: str, draft_id: int, content: str,
