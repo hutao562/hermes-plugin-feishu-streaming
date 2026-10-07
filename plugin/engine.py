@@ -35,7 +35,9 @@ from ._vendor.streaming.segment_helper import (
 from ._vendor.streaming.segments import Segment, SegmentState, SegmentType
 from ._vendor.streaming.tooluse import ToolUseTracker
 
-_logger = logging.getLogger("hermes_lark_streaming.plugin")
+# 本包 logger 不进 gateway.log（hermes logging 配置问题，见 AGENTS.md）——
+# 诊断日志统一走 gateway.run logger。
+_logger = logging.getLogger("gateway.run")
 
 # 心跳/interim 文本进卡前的字符上限（防异常长文本撑爆状态行）
 _HEARTBEAT_MAX_LEN = 300
@@ -46,6 +48,7 @@ class ChatSession:
     """单 chat 的流式卡片会话（一回合一张卡）."""
 
     chat_id: str
+    reply_to: str | None = None  # 回复锚（用户消息 id）；None = 直发 chat
     created_at: float = field(default_factory=time.time)
     state: str = "creating"  # creating → streaming → completed / failed
     card_id: str | None = None
@@ -105,16 +108,19 @@ class ChatCardEngine:
 
     # ── 流式输入 ──
 
-    def on_draft(self, chat_id: str, content: str) -> None:
+    def on_draft(self, chat_id: str, content: str, reply_to: str | None = None) -> None:
         """draft 帧（全量快照）— 确保会话与建卡，整段置换 answer 文本.
 
         由 async 的 send_draft 调用：此处捕获引擎事件循环（后续 format_tool_event
         可能从 agent 工作线程同步到达，需 call_soon_threadsafe 回环）。
+        reply_to 是 transport _draft_metadata 带的用户消息锚（首轮记录，后续幂等）。
         """
         if self._loop is None:
             self._loop = asyncio.get_running_loop()
             self._thread = threading.current_thread()
         session = self._ensure_session(chat_id)
+        if session.reply_to is None and reply_to:
+            session.reply_to = reply_to
         if session.answer_seg is None:
             # 空文本走 on_answer_delta：在正确位置（reasoning 之后）新建空 ANSWER 段
             session.segment_state.on_answer_delta("")
@@ -256,7 +262,13 @@ class ChatCardEngine:
         )
         try:
             card_id = await self._client.cardkit_create(card)
-            card_msg_id = await self._client.reply_card_by_id(session.chat_id, card_id)
+            if session.reply_to:
+                # 有锚：卡片落在用户消息下方（话题内即同一线程）
+                card_msg_id = await self._client.reply_card_by_id(session.reply_to, card_id)
+            else:
+                # 无锚：直发 chat（chat_id 不是合法 reply 目标，reply 会 230001）
+                card_msg_id = await self._client.send_card_to_chat(
+                    session.chat_id, {"type": "card", "data": {"card_id": card_id}})
         except Exception as e:
             _logger.warning("plugin card create failed: chat=%s err=%s", session.chat_id, e)
             session.state = "failed"

@@ -34,6 +34,7 @@ def _mock_client() -> MagicMock:
     client.cardkit_stream_element = AsyncMock()
     client.cardkit_close_streaming = AsyncMock()
     client.cardkit_update = AsyncMock()
+    client.send_card_to_chat = AsyncMock(return_value="om_card_msg")
     return client
 
 
@@ -156,6 +157,41 @@ async def test_complete_renders_final_card(engine: ChatCardEngine) -> None:
 @pytest.mark.asyncio
 async def test_complete_without_card_returns_none(engine: ChatCardEngine) -> None:
     assert await engine.complete("ghost", "text") is None
+
+
+@pytest.mark.asyncio
+async def test_draft_with_reply_anchor_replies_to_user_message(engine: ChatCardEngine) -> None:
+    """draft 帧带 metadata 锚（transport _draft_metadata 注入）→ 卡片 reply 到用户消息."""
+    engine.on_draft("chat1", "内容", reply_to="om_user_msg")
+    await _settle(engine)
+
+    session = engine.session_for("chat1")
+    assert session.reply_to == "om_user_msg"
+    engine._client.reply_card_by_id.assert_called_once_with("om_user_msg", session.card_id)
+    assert not engine._client.send_card_to_chat.called
+
+
+@pytest.mark.asyncio
+async def test_draft_without_anchor_sends_to_chat(engine: ChatCardEngine) -> None:
+    """无锚 draft → 直发 chat（chat_id 不是合法 reply 目标，reply 会 230001）."""
+    engine.on_draft("chat1", "内容")  # 无 reply_to
+    await _settle(engine)
+
+    session = engine.session_for("chat1")
+    assert session.reply_to is None
+    engine._client.send_card_to_chat.assert_called_once()
+    assert not engine._client.reply_card_by_id.called
+
+
+@pytest.mark.asyncio
+async def test_send_draft_passes_metadata_anchor(adapter) -> None:
+    result = await adapter.send_draft(
+        "chat1", 1, "内容", metadata={"reply_to_message_id": "om_user_msg"})
+    await _settle(adapter._engine())
+
+    assert result.success is True
+    assert adapter._engine().session_for("chat1").reply_to == "om_user_msg"
+    adapter._engine()._client.reply_card_by_id.assert_called_once()
 
 
 @pytest.mark.asyncio
