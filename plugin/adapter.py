@@ -74,7 +74,8 @@ class StreamingFeishuMixin:
                          metadata: dict[str, Any] | None = None) -> Any:
         logging.getLogger("gateway.run").info(
             "[feishu-streaming] send_draft chat=%s draft_id=%s len=%d", chat_id, draft_id, len(content))
-        self._engine().on_draft(chat_id, content)
+        reply_to = (metadata or {}).get("reply_to_message_id")
+        self._engine().on_draft(chat_id, content, reply_to=reply_to)
         return _compat.send_result(success=True, message_id=None)
 
     # ── 结构化流事件 ──
@@ -120,6 +121,8 @@ class StreamingFeishuMixin:
         if session is not None and session.state == "streaming":
             # 回合终态文本 → 完成卡（官方 transport 在 draft 后仍会真发最终文本，
             # 此处接管渲染；已发送标记由 gateway 流机制去重）
+            if session.reply_to is None and reply_to:
+                session.reply_to = reply_to
             msg_id = await engine.complete(chat_id, content)
             if msg_id is not None:
                 return _compat.send_result(success=True, message_id=msg_id)
@@ -128,7 +131,7 @@ class StreamingFeishuMixin:
             # 无流式会话（短回答被 transport 的 _MIN_NEW_MSG_CHARS 吞帧 / 单 tick 直达
             # finalize，draft 让位真发）→ 现场开卡立即完成，保证回合产出卡片形态一致。
             # reply_to 有锚 = 对话回合；无锚通知（watcher 等）保持原生文本。
-            engine.on_draft(chat_id, content)
+            engine.on_draft(chat_id, content, reply_to=reply_to)
             msg_id = await engine.complete(chat_id, content)
             if msg_id is not None:
                 return _compat.send_result(success=True, message_id=msg_id)
