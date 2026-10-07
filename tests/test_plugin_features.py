@@ -403,3 +403,12 @@ async def test_usage_hook_passes_context_length() -> None:
     bucket = engine._usage["oc_abc00000000000000000000000000099"]
     assert bucket["context_max"] == 2000000
     assert bucket["context_used"] == 10
+
+
+@pytest.mark.asyncio
+async def test_busy_ack_without_session_does_not_open_card(adapter) -> None:
+    """回合早期的 redirect/queued ack（卡还没建）不得开卡渲染 ack 文本."""
+    result = await adapter.send("chat_fresh", "↪ 已重定向当前运行", reply_to="om_1",
+                                metadata={"notify": True})
+    assert adapter._engine().session_for("chat_fresh") is None  # 没开卡
+    assert result.message_id == "om_native"  # ack 走原生文本（gateway 语义不变）
