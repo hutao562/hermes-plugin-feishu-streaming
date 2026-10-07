@@ -239,7 +239,7 @@ def test_record_usage_extracts_chat_from_session_id() -> None:
     engine.record_usage("agent:main:feishu:dm:oc_eeba2715144be520aa6a768342c023ae",
                         {"prompt_tokens": 10, "completion_tokens": 5}, model="glm-5.3")
     bucket = engine._usage["oc_eeba2715144be520aa6a768342c023ae"]
-    assert bucket["input"] == 110 and bucket["output"] == 45
+    assert bucket["input"] == 100 and bucket["output"] == 45  # input=max，output=累加
     assert bucket["model"] == "glm-5.3"
 
 
@@ -534,3 +534,41 @@ async def test_typing_tail_after_completion_does_not_reopen(adapter) -> None:
     engine.on_turn_started("chat1")
     await _settle(engine)
     assert engine._client.cardkit_create.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_reasoning_during_creating_window_not_dropped() -> None:
+    """建卡窗口（creating）的 reasoning 不丢弃——长思考回合卡片不能全程空转."""
+    engine = ChatCardEngine(_mock_client())
+    engine.on_turn_started("chat1")  # typing 建卡（creating 中）
+    engine.on_reasoning("", "💭 思考片段")  # 钩子无 chat → 单活跃会话兜底（含 creating）
+    await _settle(engine)
+    session = engine.session_for("chat1")
+    reasoning = [s for s in session.segment_state.segments if s.type.value == "reasoning"]
+    assert reasoning and "思考" in reasoning[0].text
+
+
+def test_input_tokens_takes_last_not_sum() -> None:
+    """input 取最后值：每轮 API prompt 含全量历史，累加虚高数量级."""
+    engine = ChatCardEngine(_mock_client())
+    sid = "agent:main:feishu:dm:oc_bbb00000000000000000000000000099"
+    engine.record_usage(sid, {"prompt_tokens": 100000, "completion_tokens": 50})
+    engine.record_usage(sid, {"prompt_tokens": 120000, "completion_tokens": 60})
+    engine.record_usage(sid, {"prompt_tokens": 110000, "completion_tokens": 70})
+    bucket = engine._usage["oc_bbb00000000000000000000000000099"]
+    assert bucket["input"] == 120000  # max，非 330000 累加
+    assert bucket["output"] == 180  # output 累加（真总产出）
+
+
+@pytest.mark.asyncio
+async def test_gateway_lifecycle_notice_not_merged_into_card(adapter) -> None:
+    """⚠️/♻️ 网关生命周期通知不并进完成卡（走原生文本，与注入模式一致）."""
+    adapter._engine().on_draft("chat1", "回合", reply_to="om_a")
+    await _settle(adapter._engine())
+    await adapter._engine().complete("chat1", "回合")
+
+    result = await adapter.send(
+        "chat1", "⚠️ Hermes 正在关闭——你当前的任务将被中断。",
+        metadata={"thread_id": "om_a"})
+    assert result.message_id == "om_native"  # 原生文本
+    assert adapter.native_sends  # 确实发出去了

@@ -28,9 +28,11 @@ _logger = logging.getLogger("hermes_lark_streaming.plugin")
 
 # busy ack（redirect/queue 确认文本）的前缀特征 — 无官方语义标记时的启发式。
 # 文案来自 hermes locales（gateway.progress.redirected_head / queued_head）。
-# busy/interrupt 系统通知前缀：↪ redirect、⏳ queued、⚡ interrupting
-# （gateway.progress.* locale；这些文本进心跳行或原生文本，绝不渲染成卡）
-_BUSY_ACK_PREFIXES = ("↪", "⏳", "⚡")
+# busy/interrupt 系统通知前缀：↪ redirect、⏳ queued、⚡ interrupting、
+# ⚠️/♻️ 网关生命周期（正在关闭/已上线）——这些文本进心跳行或原生文本，
+# 不渲染成卡、不并进完成卡（gateway.progress.* / gateway lifecycle locale）
+_BUSY_ACK_PREFIXES = ("↪", "⏳", "⚡", "⚠️", "♻️")
+_draft_log_state: dict[int, int] = {}
 
 
 def _import_base_adapter() -> type[Any]:
@@ -77,8 +79,10 @@ class StreamingFeishuMixin:
 
     async def send_draft(self, chat_id: str, draft_id: int, content: str,
                          metadata: dict[str, Any] | None = None) -> Any:
-        logging.getLogger("gateway.run").info(
-            "[feishu-streaming] send_draft chat=%s draft_id=%s len=%d", chat_id, draft_id, len(content))
+        if draft_id not in _draft_log_state or len(content) - _draft_log_state[draft_id] > 1500:
+            _draft_log_state[draft_id] = len(content)
+            logging.getLogger("gateway.run").info(
+                "[feishu-streaming] draft chat=%s len=%d", chat_id[:12], len(content))
         reply_to = (metadata or {}).get("reply_to_message_id")
         self._engine().on_draft(chat_id, content, reply_to=reply_to)
         return _compat.send_result(success=True, message_id=None)
@@ -118,6 +122,7 @@ class StreamingFeishuMixin:
         card_session = engine.session_for(chat_id)  # 含终态（bg 通知常在主回合完成后到达）
         if (not interim and card_session is not None and card_session.card_id
                 and content.strip()
+                and not content.lstrip().startswith(_BUSY_ACK_PREFIXES)
                 and not (metadata or {}).get("notify")
                 and (metadata or {}).get("thread_id")):
             # background 回合交付 / watcher 通知（特征：无 notify 标记 + thread
