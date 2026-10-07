@@ -29,7 +29,7 @@ class _LazyClient:
         self._client: Any = None
 
     def _build(self) -> Any:
-        from hermes_lark_streaming.feishu import FeishuClient, FeishuClientConfig
+        from ._vendor.feishu import FeishuClient, FeishuClientConfig
 
         self._client = FeishuClient(FeishuClientConfig(
             app_id=os.environ.get("FEISHU_APP_ID", ""),
@@ -47,6 +47,9 @@ class _LazyClient:
 
 def register(ctx: Any) -> None:
     """插件入口 — 由 hermes plugin 系统调用（每 profile 一次）."""
+    # 走 gateway.run logger（唯一确认落 gateway.log 的通道；本包 logger 不进日志）
+    logging.getLogger("gateway.run").info(
+        "[feishu-streaming] register() called — registering streaming feishu platform")
     engine = ChatCardEngine(_LazyClient())
 
     ctx.register_platform(
@@ -64,6 +67,8 @@ def register(ctx: Any) -> None:
         emoji="🪽",
         allow_update_command=True,
     )
+    logging.getLogger("gateway.run").info(
+        "[feishu-streaming] platform registered (last-writer-wins over bundled)")
 
     # reasoning 流观察（off token path）：钩子不带 chat，引擎按单会话兜底路由
     if hasattr(ctx, "register_hook"):
@@ -93,7 +98,7 @@ def _make_reasoning_hook(engine: ChatCardEngine) -> Any:
 
 def _make_standalone_sender() -> Any:
     """cron 无网关进程的投递：渲染 cron 卡片后经 FeishuClient 发送."""
-    from hermes_lark_streaming.cardkit.builder import build_cron_card
+    from ._vendor.cardkit.builder import build_cron_card
 
     async def standalone_send(pconfig: Any, chat_id: str, message: str, *,
                               thread_id: str | None = None,

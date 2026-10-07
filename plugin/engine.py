@@ -20,20 +20,20 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from hermes_lark_streaming.cardkit.builder import (
+from ._vendor.cardkit.builder import (
     HEARTBEAT_ELEMENT_ID,
     build_complete_card,
     build_streaming_card_v2,
 )
-from hermes_lark_streaming.cardkit.markdown import optimize_markdown_style
-from hermes_lark_streaming.streaming.flush import FlushController
-from hermes_lark_streaming.streaming.segment_helper import (
+from ._vendor.cardkit.markdown import optimize_markdown_style
+from ._vendor.streaming.flush import FlushController
+from ._vendor.streaming.segment_helper import (
     build_add_segment_action,
     build_reasoning_finalized_action,
     build_tool_update_action,
 )
-from hermes_lark_streaming.streaming.segments import Segment, SegmentState, SegmentType
-from hermes_lark_streaming.streaming.tooluse import ToolUseTracker
+from ._vendor.streaming.segments import Segment, SegmentState, SegmentType
+from ._vendor.streaming.tooluse import ToolUseTracker
 
 _logger = logging.getLogger("hermes_lark_streaming.plugin")
 

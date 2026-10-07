@@ -66,10 +66,14 @@ class StreamingFeishuMixin:
     def supports_draft_streaming(self, chat_type: str | None = None,
                                  metadata: dict[str, Any] | None = None,
                                  chat_id: str | None = None) -> bool:
+        logging.getLogger("gateway.run").info(
+            "[feishu-streaming] supports_draft_streaming probe -> True (chat=%s)", chat_id)
         return True
 
     async def send_draft(self, chat_id: str, draft_id: int, content: str,
                          metadata: dict[str, Any] | None = None) -> Any:
+        logging.getLogger("gateway.run").info(
+            "[feishu-streaming] send_draft chat=%s draft_id=%s len=%d", chat_id, draft_id, len(content))
         self._engine().on_draft(chat_id, content)
         return _compat.send_result(success=True, message_id=None)
 
@@ -92,6 +96,9 @@ class StreamingFeishuMixin:
 
     async def send(self, chat_id: str, content: str, reply_to: str | None = None,
                    metadata: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        logging.getLogger("gateway.run").info(
+            "[feishu-streaming] send chat=%s len=%d interim=%s", chat_id, len(content),
+            bool((metadata or {}).get("_interim_send")))
         engine = self._engine()
         interim = bool((metadata or {}).get("_interim_send"))
         session = engine.active_session(chat_id)
@@ -117,6 +124,14 @@ class StreamingFeishuMixin:
             if msg_id is not None:
                 return _compat.send_result(success=True, message_id=msg_id)
             # 建卡失败 → 落回原生文本
+        elif not interim and content.strip() and reply_to is not None:
+            # 无流式会话（短回答被 transport 的 _MIN_NEW_MSG_CHARS 吞帧 / 单 tick 直达
+            # finalize，draft 让位真发）→ 现场开卡立即完成，保证回合产出卡片形态一致。
+            # reply_to 有锚 = 对话回合；无锚通知（watcher 等）保持原生文本。
+            engine.on_draft(chat_id, content)
+            msg_id = await engine.complete(chat_id, content)
+            if msg_id is not None:
+                return _compat.send_result(success=True, message_id=msg_id)
 
         return await super().send(chat_id, content, reply_to=reply_to,  # type: ignore[misc]
                                   metadata=metadata, **kwargs)
@@ -178,6 +193,9 @@ def create_adapter_factory(engine: ChatCardEngine) -> Any:
     def factory(config: Any) -> Any:
         base = _import_base_adapter()
         cls = build_adapter_class(base, engine)
+        logging.getLogger("gateway.run").info(
+            "[feishu-streaming] adapter factory: base=%s -> StreamingFeishuAdapter",
+            base.__module__)
         return cls(config)
 
     return factory
