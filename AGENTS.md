@@ -8,6 +8,8 @@ Hermes Gateway plugin that injects hooks into Hermes split gateway modules and `
 
 **platform 插件形态**（`plugin/`，kind: platform）：子类化官方 `FeishuAdapter` 实现 draft-streaming 契约（`supports_draft_streaming`/`send_draft` → CardKit v2），以 `register_platform(name="feishu")` 同名注册顶替 bundled（registry last-writer-wins）。**自包含**：底层件 vendor 在 `plugin/_vendor/`（cardkit/streaming/feishu/config），运行环境无需安装本包。**凭据**：引擎的 lark client 绑定官方 adapter 实例的 client（profile secret 作用域），不读 env。**锚点**：draft 帧 metadata 的 `reply_to_message_id`（transport `_draft_metadata()` 注入）→ 卡片 reply 用户消息；无锚直发 chat（chat_id 做 reply 目标会 230001）。**sequence**：cardkit close/update 必须各自独立 +1（同号 300317）。**短回答**：transport `_MIN_NEW_MSG_CHARS=4` 吞帧 + finalize 时 draft 让位真发 → send() 无会话兜底现场开卡即完成。诊断日志 grep `[feishu-streaming]`（engine logger 走 gateway.run）。部署需 `streaming.enabled: true`（transport: auto）。
 
+**fork 特性对齐状态（2026-10-07 五特性补齐，端到端验收）**：clarify 内联单选（Mixin 类定义期覆写 `send_clarify`/`_on_card_action_trigger`/`retire_clarify_card`，零 monkey-patch；卡片构建在 `plugin/_clarify.py`；**send_clarify 绝不能走 self.send**——终态拦截会误完成 streaming 卡，text 兜底直发 `_feishu_send_with_retry`）；followup 边界（draft 锚变化=新回合→旧卡绿色收尾+开新卡）；t/s footer（`post_api_request` 钩子聚合 usage，session_id 是内部 UUID 提取不出 chat→"" 桶 fallback，`_pop_usage` 消费）；跨回合合并（send 无 notify+thread_id metadata=bg 交付特征→NOTICE 段追加进最近完成卡，**须查 session_for 含终态而非 active_session**）；心跳/busy-ack（`_interim_send`→心跳行，生产已拦截）。clarify 回调点击验证留待实际使用（单测+retire 钩子已生产触发）。
+
 ## Commands
 
 ```bash
