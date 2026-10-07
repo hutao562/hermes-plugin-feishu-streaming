@@ -363,6 +363,29 @@ def test_register_replaces_bundled_feishu() -> None:
     assert hook_calls
 
 
+def test_factory_binds_engine_client_to_adapter_lark_client(monkeypatch) -> None:
+    """factory 实例化后把官方 adapter 的 lark client 绑给引擎（profile 凭据）."""
+    import plugin.adapter as adapter_mod
+
+    class _FakeBaseWithClient(_FakeBaseAdapter):
+        def __init__(self, config=None):
+            self._client = "lark-sdk-client"
+
+    monkeypatch.setattr(adapter_mod, "_import_base_adapter", lambda: _FakeBaseWithClient)
+    bound: dict = {}
+    proxy = SimpleNamespace(bind_source=lambda src: bound.__setitem__("source", src))
+    engine = ChatCardEngine(_mock_client())
+
+    factory = adapter_mod.create_adapter_factory(engine, client_proxy=proxy)
+    adapter = factory(SimpleNamespace())
+
+    assert isinstance(adapter, _FakeBaseWithClient)
+    assert "source" in bound
+    client = bound["source"]()
+    # FeishuClient 包装器且内持官方 lark client
+    assert getattr(client, "_client", None) == "lark-sdk-client"
+
+
 def test_register_hook_routes_reasoning_only() -> None:
     from plugin import register
 

@@ -187,8 +187,12 @@ def build_adapter_class(base_cls: type, engine: ChatCardEngine) -> type[Any]:
     return cast("type[Any]", type("StreamingFeishuAdapter", (StreamingFeishuMixin, base_cls), namespace))
 
 
-def create_adapter_factory(engine: ChatCardEngine) -> Any:
-    """adapter_factory(PlatformConfig)：延迟导入官方基类 + 合成子类."""
+def create_adapter_factory(engine: ChatCardEngine, client_proxy: Any = None) -> Any:
+    """adapter_factory(PlatformConfig)：延迟导入官方基类 + 合成子类.
+
+    client_proxy：引擎的 _LazyClient。实例化后绑定官方 adapter 的 lark client
+    （profile 作用域凭据），引擎所有 cardkit 调用走同一凭据通道。
+    """
 
     def factory(config: Any) -> Any:
         base = _import_base_adapter()
@@ -196,6 +200,22 @@ def create_adapter_factory(engine: ChatCardEngine) -> Any:
         logging.getLogger("gateway.run").info(
             "[feishu-streaming] adapter factory: base=%s -> StreamingFeishuAdapter",
             base.__module__)
-        return cls(config)
+        adapter = cls(config)
+        if client_proxy is not None:
+            def _source() -> Any:
+                from ._vendor.feishu import FeishuClient
+
+                lark_client = getattr(adapter, "_client", None)
+                if lark_client is None and hasattr(adapter, "_prepare_client"):
+                    adapter._prepare_client()
+                    lark_client = getattr(adapter, "_client", None)
+                if lark_client is None:
+                    return None  # _LazyClient 回退 env
+                logging.getLogger("gateway.run").info(
+                    "[feishu-streaming] engine client bound to adapter lark client")
+                return FeishuClient.from_lark_client(lark_client)
+
+            client_proxy.bind_source(_source)
+        return adapter
 
     return factory
