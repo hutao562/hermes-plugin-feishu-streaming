@@ -17,3 +17,4 @@ requires_env:
     password: true
 provides_hooks:
   - on_stream_delta
+  - post_api_request

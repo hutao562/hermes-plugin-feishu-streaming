@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -83,8 +84,36 @@ class ChatCardEngine:
         self._header_enabled = header_enabled
         self._width_mode = width_mode
         self._sessions: dict[str, ChatSession] = {}
+        # chat → 回合累计 usage（post_api_request 钩子按 session_id 归组，complete 消费）
+        self._usage: dict[str, dict[str, Any]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: Any = None
+
+    # ── usage 聚合（post_api_request 钩子 → footer tokens/t/s）──
+
+    @staticmethod
+    def _chat_of_session(session_id: str) -> str:
+        """agent session key（agent:main:feishu:dm:<chat_id>）→ chat_id；解析失败返 ""."""
+        m = re.search(r"oc_[0-9a-f]{16,40}", str(session_id or ""))
+        return m.group(0) if m else ""
+
+    def record_usage(self, session_id: str, usage: dict[str, Any] | None, model: str = "") -> None:
+        """单次 API 调用的 usage 累加进所属 chat 的回合桶."""
+        if not usage:
+            return
+        chat_id = self._chat_of_session(session_id)
+        bucket = self._usage.setdefault(chat_id, {"input": 0, "output": 0, "model": ""})
+        bucket["input"] += int(usage.get("prompt_tokens") or 0)
+        bucket["output"] += int(usage.get("completion_tokens")
+                                or usage.get("output_tokens") or usage.get("total_tokens") or 0)
+        if model:
+            bucket["model"] = model
+
+    def _pop_usage(self, chat_id: str) -> dict[str, Any] | None:
+        bucket = self._usage.pop(chat_id, None) or self._usage.pop("", None)
+        if not bucket or not (bucket["input"] or bucket["output"]):
+            return None
+        return bucket
 
     # ── 会话查询 ──
 
@@ -119,6 +148,18 @@ class ChatCardEngine:
             self._loop = asyncio.get_running_loop()
             self._thread = threading.current_thread()
         session = self._ensure_session(chat_id)
+        if session.state != "creating" and reply_to and session.reply_to and reply_to != session.reply_to:
+            # draft 锚变化 = 新回合开始（排队 followup 被 drain，新消息身份）：
+            # 旧卡按已有内容收尾（绿色完成态，避免永挂"处理中"），新回合开新卡。
+            # 与注入模式的 FOLLOWUP_COMPLETE hook 等价，信号反而更可靠——
+            # 锚来自每回合 consumer 的 initial_reply_to_id（即用户消息 id）。
+            _logger.info(
+                "[feishu-streaming] followup boundary: anchor %s -> %s, sealing old card",
+                session.reply_to[:12], reply_to[:12])
+            old_session = session
+            self._sessions[chat_id] = ChatSession(chat_id=chat_id, reply_to=reply_to)
+            session = self._ensure_session(chat_id)  # 新会话补建卡 task
+            self._seal_session(old_session)
         if session.reply_to is None and reply_to:
             session.reply_to = reply_to
         if session.answer_seg is None:
@@ -188,10 +229,15 @@ class ChatCardEngine:
         session.segment_state.finalize_segments(
             len(session.tool_tracker.build_display_steps()))
         session.state = "failed" if is_error else "completed"
+        usage = self._pop_usage(chat_id)
+        if tokens:
+            usage = {"input": tokens.get("input_tokens", 0),
+                     "output": tokens.get("output_tokens", 0), "model": model}
         card = build_complete_card(
             segments=session.segment_state.segments,
             all_tool_steps=session.tool_tracker.build_display_steps(),
-            footer_data=self._footer_data(session, duration, tokens, model),
+            footer_data=self._footer_data(session, duration, usage, model),
+            footer_fields=[["elapsed", "speed"], ["tokens", "model"]],
             is_error=is_error,
             header_enabled=self._header_enabled,
             body_text_size=self._body_text_size,
@@ -205,6 +251,39 @@ class ChatCardEngine:
             await self._client.cardkit_update(session.card_id, card, sequence=session.sequence)
         except Exception as e:
             _logger.warning("plugin complete card update failed: chat=%s err=%s", chat_id, e)
+        return session.card_msg_id
+
+    async def append_notice(self, chat_id: str, text: str) -> str | None:
+        """把 background/系统通知追加进该 chat 最近一张卡（跨回合合并）.
+
+        会话可能是 COMPLETED（bg 回合在主回合完成后到达）——追加 NOTICE segment
+        后整体重渲完成卡；会话仍活跃则交由 flush 建 NOTICE 元素。
+        返回卡片消息 id；无可用卡片返回 None（调用方走原生文本保底）。
+        """
+        session = self._sessions.get(chat_id)
+        if session is None or session.card_id is None:
+            return None
+        session.segment_state.add_notice(text)
+        if session.is_terminal:
+            card = build_complete_card(
+                segments=session.segment_state.segments,
+                all_tool_steps=session.tool_tracker.build_display_steps(),
+                footer_data=self._footer_data(session, None, None, ""),
+                header_enabled=self._header_enabled,
+                body_text_size=self._body_text_size,
+                show_tool_use=self._show_tool_use,
+                width_mode=self._width_mode,
+            )
+            session.sequence += 1
+            try:
+                await self._client.cardkit_update(session.card_id, card, sequence=session.sequence)
+            except Exception as e:
+                _logger.warning("[feishu-streaming] append notice update failed: %s", e)
+                return None
+        else:
+            self._schedule(session)
+        _logger.info("[feishu-streaming] notice merged into card: chat=%s len=%d",
+                     chat_id[:12], len(text))
         return session.card_msg_id
 
     async def abandon(self, chat_id: str) -> None:
@@ -229,6 +308,37 @@ class ChatCardEngine:
                 session.flush = FlushController(loop=self._loop)
             session.card_create_task = self._loop.create_task(self._do_create_card(session))
         return session
+
+    def _seal_session(self, session: ChatSession) -> None:
+        """旧会话收尾（followup 边界）：按已积累内容渲染完成卡，失败仅记日志."""
+        assert self._loop is not None
+
+        async def _seal() -> None:
+            if session.card_create_task is not None:
+                await session.card_create_task
+            if session.state == "failed" or session.card_id is None:
+                return
+            session.segment_state.finalize_segments(
+                len(session.tool_tracker.build_display_steps()))
+            session.state = "completed"
+            card = build_complete_card(
+                segments=session.segment_state.segments,
+                all_tool_steps=session.tool_tracker.build_display_steps(),
+                footer_data=self._footer_data(session, None, None, ""),
+                header_enabled=self._header_enabled,
+                body_text_size=self._body_text_size,
+                show_tool_use=self._show_tool_use,
+                width_mode=self._width_mode,
+            )
+            try:
+                session.sequence += 1
+                await self._client.cardkit_close_streaming(session.card_id, sequence=session.sequence)
+                session.sequence += 1
+                await self._client.cardkit_update(session.card_id, card, sequence=session.sequence)
+            except Exception as e:
+                _logger.warning("[feishu-streaming] seal old card failed: %s", e)
+
+        self._loop.create_task(_seal())
 
     def _any_streaming_session(self) -> ChatSession | None:
         streaming = self.streaming_sessions()
@@ -335,13 +445,20 @@ class ChatCardEngine:
                 _logger.debug("plugin heartbeat update failed: %s", e)
 
     def _footer_data(self, session: ChatSession, duration: float | None,
-                     tokens: dict[str, int] | None, model: str) -> dict[str, Any] | None:
+                     usage: dict[str, Any] | None, model: str) -> dict[str, Any] | None:
         data: dict[str, Any] = {
             "duration": duration if duration is not None else time.time() - session.created_at,
         }
-        if tokens:
-            data["input_tokens"] = tokens.get("input_tokens", 0)
-            data["output_tokens"] = tokens.get("output_tokens", 0)
-        if model:
+        if usage:
+            data["input_tokens"] = usage.get("input", 0)
+            data["output_tokens"] = usage.get("output", 0)
+            if model:
+                data["model"] = model
+            elif usage.get("model"):
+                data["model"] = usage["model"]
+            # t/s = 输出 tokens / 回合时长（注入模式同款口径）
+            if data["output_tokens"] and data["duration"] > 0:
+                data["tps"] = data["output_tokens"] / data["duration"]
+        elif model:
             data["model"] = model
         return data

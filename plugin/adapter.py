@@ -110,6 +110,19 @@ class StreamingFeishuMixin:
             return _compat.send_result(success=True,
                                        message_id=f"lark-card:{session.card_msg_id}")
 
+        card_session = engine.session_for(chat_id)  # 含终态（bg 通知常在主回合完成后到达）
+        if (not interim and card_session is not None and card_session.card_id
+                and content.strip()
+                and not (metadata or {}).get("notify")
+                and (metadata or {}).get("thread_id")):
+            # background 回合交付 / watcher 通知（特征：无 notify 标记 + thread
+            # metadata，与普通 final 的 _mark_notify_metadata 相区分）→ 追加进
+            # 最近卡片（跨回合合并），不再散落纯文本。
+            card_msg_id = await engine.append_notice(chat_id, content)
+            if card_msg_id is not None:
+                return _compat.send_result(success=True, message_id=card_msg_id)
+            # 无可用卡片 → 落回原生文本
+
         if (session is not None and session.state == "streaming" and not interim
                 and content and len(content) <= 200
                 and content.lstrip().startswith(_BUSY_ACK_PREFIXES)):
@@ -150,6 +163,98 @@ class StreamingFeishuMixin:
                 return _compat.send_result(success=True, message_id=message_id)
         return await super().edit_message(chat_id, message_id, content,  # type: ignore[misc]
                                           finalize=finalize, **kwargs)
+
+    # ── clarify 内联单选（类定义期覆写；SDK connect() 注册的绑定方法即本版本）──
+
+    async def send_clarify(
+        self, chat_id: str, question: str, choices: Any, clarify_id: str,
+        session_key: str, metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Clarify prompt：多选 → 编号按钮卡（schema 1.0）；开放题 → 无按钮卡 + text-capture.
+
+        官方契约（base.send_clarify docstring）：choice 按钮必须经
+        resolve_gateway_clarify 回调 resolve；「其他」调 mark_awaiting_text。
+        全程走 _feishu_send_with_retry（与官方 approval 卡同链路），绝不经过
+        self.send——send 拦截会把 streaming 卡误判为回合终态。
+        """
+        from . import _clarify
+
+        if not getattr(self, "_client", None):
+            return _compat.send_result(success=False, error="Not connected")
+        try:
+            clean = _clarify.normalize_choices(choices)
+            if clean:
+                card = _clarify.build_clarify_card(
+                    question=str(question or ""), choices=clean, clarify_id=clarify_id)
+            else:
+                from tools.clarify_gateway import mark_awaiting_text  # type: ignore[import-not-found]
+
+                mark_awaiting_text(clarify_id)
+                card = _clarify.build_open_clarify_card(question=str(question or ""))
+            response = await self._feishu_send_with_retry(  # type: ignore[attr-defined]
+                chat_id=chat_id, msg_type="interactive",
+                payload=_clarify.card_payload(card), reply_to=None, metadata=metadata)
+            result = self._finalize_send_result(response, "send_clarify failed")  # type: ignore[attr-defined]
+            if getattr(result, "success", False):
+                _clarify.CLARIFY_STATE[clarify_id] = {
+                    "session_key": session_key or "",
+                    "chat_id": chat_id,
+                    "message_id": getattr(result, "message_id", "") or "",
+                }
+                logging.getLogger("gateway.run").info(
+                    "[feishu-streaming][clarify] card sent id=%s choices=%d chat=%s",
+                    clarify_id[:12], len(clean), chat_id[:12])
+            return result
+        except Exception as exc:
+            logging.getLogger("gateway.run").warning(
+                "[feishu-streaming][clarify] card send failed, falling back to text: %s", exc)
+            # 回退 text 版：不能调 super().send_clarify——它的默认实现走 self.send，
+            # 会被 send() 拦截误判为回合终态（把 streaming 卡完成掉）。直发 text。
+            try:
+                from tools.clarify_gateway import mark_awaiting_text  # type: ignore[import-not-found]
+
+                mark_awaiting_text(clarify_id)
+                import json as _json
+
+                response = await self._feishu_send_with_retry(  # type: ignore[attr-defined]
+                    chat_id=chat_id, msg_type="text",
+                    payload=_json.dumps({"text": str(question or "")}, ensure_ascii=False),
+                    reply_to=None, metadata=metadata)
+                return self._finalize_send_result(response, "send_clarify text fallback failed")  # type: ignore[attr-defined]
+            except Exception as exc2:
+                return _compat.send_result(success=False, error=str(exc2))
+
+    def _on_card_action_trigger(self, data: Any) -> Any:
+        """SDK 卡片回调 wrapper：hermes_clarify_action → clarify 处理；其余转发官方.
+
+        注入模式必须事后替换 SDK processor.f（绑定方法已快照）；插件模式下本方法
+        在类定义期覆写，SDK connect() 拿到的绑定方法就是本版本——零 monkey-patch。
+        """
+        event = getattr(data, "event", None)
+        action = getattr(event, "action", None)
+        action_value = getattr(action, "value", {}) or {}
+        if isinstance(action_value, dict) and action_value.get("hermes_clarify_action"):
+            loop = self._loop  # type: ignore[attr-defined]
+            if not self._loop_accepts_callbacks(loop):  # type: ignore[attr-defined]
+                return self._card_response()  # type: ignore[attr-defined]
+            from . import _clarify
+
+            return _clarify.handle_clarify_card_action(
+                self, event=event, action_value=action_value)
+        return super()._on_card_action_trigger(data)  # type: ignore[misc]
+
+    async def retire_clarify_card(self, clarify_id: str, notice: Any = None) -> None:
+        """官方钩子：clarify 未点击而终结（超时/重置/自由文本取代）时清理状态.
+
+        卡面残留可接受（后续点击因 state miss 被忽略）；官方 interactive 消息
+        更新链路（edit_message）只支持 text/post，不值得为此另起 update API。
+        """
+        from . import _clarify
+
+        state = _clarify.CLARIFY_STATE.pop(clarify_id, None)
+        if state:
+            logging.getLogger("gateway.run").info(
+                "[feishu-streaming][clarify] retired id=%s (no click)", clarify_id[:12])
 
     async def send_document(self, chat_id: str, file_path: str, *,
                             file_name: str | None = None, **kwargs: Any) -> Any:
