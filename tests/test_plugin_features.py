@@ -207,7 +207,8 @@ async def test_draft_anchor_change_seals_old_and_opens_new() -> None:
     old = engine.session_for("chat1")
     assert old.state == "streaming" and old.reply_to == "om_msg_A"
 
-    # 新回合：锚变成消息 B → 旧卡收尾 + 新会话
+    # 新回合：锚变成消息 B（drain 时 processing_start 已登记）→ 旧卡收尾 + 新会话
+    engine.note_inbound("chat1", "om_msg_B")
     engine.on_draft("chat1", "第二回合", reply_to="om_msg_B")
     await _settle(engine)
     new = engine.session_for("chat1")
@@ -433,12 +434,59 @@ async def test_redirect_same_turn_anchor_swing_does_not_split_card() -> None:
     assert engine.session_for("chat1") is session, "锚回摆不应拆卡"
     assert session.answer_seg is not None and "诗歌正文" in session.answer_seg.text
 
-    # 真正的新锚（下一条用户消息的 followup drain）→ 拆卡
+    # 真正的新锚（下一条用户消息的 followup drain，processing_start 已登记）→ 拆卡
+    engine.note_inbound("chat1", "om_next")
     engine.on_draft("chat1", "新回合内容", reply_to="om_next")
     await _settle(engine)
     new_session = engine.session_for("chat1")
     assert new_session is not session
     assert new_session.reply_to == "om_next"
+
+
+@pytest.mark.asyncio
+async def test_anchor_swing_to_unseen_id_reanchors_without_split() -> None:
+    """工具边界换 consumer 的重锚（锚=引擎没见过的 id）→ 改锚不拆卡.
+
+    2026-10-09 实测回归：redirected 回合写文件后 draft 锚变成全新 id，
+    旧逻辑当新回合拆卡——思考 27s 的卡只装了个「Done.」，1497 字正文
+    全落进第三张卡（write_done）。
+    """
+    engine = ChatCardEngine(_mock_client())
+    engine.on_draft("chat1", "开头", reply_to="om_a")
+    await _settle(engine)
+
+    engine.mark_redirect("chat1", anchor="om_b")
+    await _settle(engine)
+    session = engine.session_for("chat1")
+
+    # 写文件工具跑完，consumer 重锚到引擎从未见过的 om_swing（非入站消息）
+    engine.on_draft("chat1", "写好了，最终版已盘至 novel_draft.md", reply_to="om_swing")
+    await _settle(engine)
+    assert engine.session_for("chat1") is session, "未见入站的锚变化不应拆卡"
+    assert session.reply_to == "om_swing"
+    assert "om_swing" in session.accepted_anchors
+    assert "novel_draft" in (session.answer_seg.text if session.answer_seg else "")
+    assert engine._client.cardkit_create.call_count == 2  # 没有第三张卡
+
+
+@pytest.mark.asyncio
+async def test_followup_boundary_fires_only_for_inbound_anchor() -> None:
+    """拆卡门槛：新锚 = on_processing_start 登记过的入站消息才拆."""
+    engine = ChatCardEngine(_mock_client())
+    engine.on_draft("chat1", "旧回合", reply_to="om_a")
+    await _settle(engine)
+
+    # 未登记入站 → 不拆（swing 改锚）
+    engine.on_draft("chat1", "同回合续", reply_to="om_swing")
+    assert engine.session_for("chat1").reply_to == "om_swing"
+
+    # 登记入站（drain 开始时的 processing_start）→ 拆
+    engine.note_inbound("chat1", "om_drain")
+    engine.on_draft("chat1", "新回合", reply_to="om_drain")
+    await _settle(engine)
+    new_session = engine.session_for("chat1")
+    assert new_session.reply_to == "om_drain"
+    assert new_session.answer_seg is not None and "新回合" in new_session.answer_seg.text
 
 
 @pytest.mark.asyncio

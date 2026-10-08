@@ -107,6 +107,9 @@ class ChatCardEngine:
         self._sessions: dict[str, ChatSession] = {}
         # chat → 回合累计 usage（post_api_request 钩子按 session_id 归组，complete 消费）
         self._usage: dict[str, dict[str, Any]] = {}
+        # chat → 见过的入站消息 id（on_processing_start 登记，drain 消息在 drain
+        # 开始时也会触发）——followup 拆卡的门槛：新锚必须是真入站消息
+        self._inbound_seen: dict[str, dict[str, float]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: Any = None
 
@@ -168,6 +171,25 @@ class ChatCardEngine:
             _logger.info("[feishu-streaming] turn started: chat=%s", chat_id[:12])
         # typing 2s 心跳循环的重复调用：会话健在时静默（此前每 2s 刷一条）
 
+    def note_inbound(self, chat_id: str, message_id: str) -> None:
+        """入站消息登记（adapter.on_processing_start 调用，drain 消息在 drain
+        开始时同样触发）——followup 拆卡门槛的数据源：draft 锚只有在里面才
+        允许拆卡。工具边界换 consumer 的重锚不是入站消息，不得拆卡
+        （2026-10-09 实测：redirected 回合写文件后锚变新 id，误拆成
+        「Done.」空卡 + 内容全落第三张卡）。"""
+        if not chat_id or not message_id:
+            return
+        bucket = self._inbound_seen.setdefault(chat_id, {})
+        bucket[message_id] = time.time()
+        while len(bucket) > 50:  # 每_chat 只留最近 50 条，防无界增长
+            bucket.pop(next(iter(bucket)))
+
+    def _inbound_verified(self, chat_id: str, message_id: str | None) -> bool:
+        """锚是否为引擎亲眼见过的入站消息."""
+        if not message_id:
+            return False
+        return message_id in self._inbound_seen.get(chat_id, {})
+
     def mark_redirect(self, chat_id: str, anchor: str | None = None) -> None:
         """↪ redirect ack（用户纠正、interrupt 模式）→ **立即收旧开新**.
 
@@ -189,7 +211,7 @@ class ChatCardEngine:
         if anchor:
             session.redirect_anchor = anchor
         _logger.info("[feishu-streaming] redirect boundary at ack: chat=%s anchor=%s",
-                     chat_id[:12], (anchor or "-")[:12])
+                     chat_id[:12], anchor or "-")
         new = ChatSession(
             chat_id=chat_id, reply_to=session.redirect_anchor or session.reply_to,
             straggler_guard=(session.answer_seg.text if session.answer_seg else ""))
@@ -248,19 +270,27 @@ class ChatCardEngine:
             {session.reply_to} if session.reply_to else set())
         if (session.state != "creating" and reply_to and session.reply_to
                 and reply_to not in accepted):
-            # draft 锚变成回合未知新锚 = 新回合开始（排队 followup 被 drain，
-            # 新消息身份）：旧卡按已有内容收尾（绿色完成态），新回合开新卡。
-            # 与注入模式的 FOLLOWUP_COMPLETE hook 等价，信号反而更可靠——
-            # 锚来自每回合 consumer 的 initial_reply_to_id（即用户消息 id）。
-            _logger.info(
-                "[feishu-streaming] followup boundary: anchor %s -> %s, sealing old card",
-                session.reply_to[:12], reply_to[:12])
-            old_session = session
-            new = ChatSession(chat_id=chat_id, reply_to=reply_to)
-            new.accepted_anchors = {reply_to}
-            self._sessions[chat_id] = new
-            session = self._ensure_session(chat_id)  # 新会话补建卡 task
-            self._seal_session(old_session)
+            if not self._inbound_verified(chat_id, reply_to):
+                # 新锚不是入站消息 = 工具边界换 consumer 的重锚（同一回合继续，
+                # 2026-10-09 实测：redirected 回合写文件后锚变全新 id）——改锚
+                # 不拆卡。拆卡门槛必须是「新锚 = 新入站消息」（排队 followup
+                # 被 drain，processing_start 在 drain 开始时触发，先于首帧）。
+                _logger.info("[feishu-streaming] anchor swing (not an inbound msg), "
+                             "re-anchor in place: %s -> %s", session.reply_to, reply_to)
+                session.reply_to = reply_to
+                session.accepted_anchors.add(reply_to)
+            else:
+                # draft 锚变成新入站消息 = 新回合开始（排队 followup 被 drain）：
+                # 旧卡按已有内容收尾（绿色完成态），新回合开新卡。
+                _logger.info(
+                    "[feishu-streaming] followup boundary: anchor %s -> %s (inbound), "
+                    "sealing old card", session.reply_to, reply_to)
+                old_session = session
+                new = ChatSession(chat_id=chat_id, reply_to=reply_to)
+                new.accepted_anchors = {reply_to}
+                self._sessions[chat_id] = new
+                session = self._ensure_session(chat_id)  # 新会话补建卡 task
+                self._seal_session(old_session)
         if session.reply_to is None and reply_to:
             session.reply_to = reply_to
             session.accepted_anchors = {reply_to}

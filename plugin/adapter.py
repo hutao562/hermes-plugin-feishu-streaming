@@ -202,6 +202,10 @@ class StreamingFeishuMixin:
         if callable(super_method):
             await super_method(event)
         msg_id = getattr(event, "message_id", "") or "?"
+        chat_id = getattr(getattr(event, "source", None), "chat_id", "") or ""
+        # 入站登记：followup 拆卡门槛的数据源（drain 消息在 drain 开始时也触发）
+        if msg_id != "?" and chat_id:
+            self._engine().note_inbound(chat_id, str(msg_id))
         logging.getLogger("gateway.run").info(
             "[feishu-streaming] processing_start msg=%s typing_badge=%s",
             msg_id[:16],
