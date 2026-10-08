@@ -597,3 +597,29 @@ async def test_draft_strips_thinking_tags() -> None:
     await _settle(engine)
     seg = engine.session_for("chat1").answer_seg
     assert "thinking" not in seg.text and "正文" in seg.text
+
+
+@pytest.mark.asyncio
+async def test_interrupted_card_seals_red() -> None:
+    """被打断（redirect）的旧卡红色收尾：header=stopped 红 + NOTICE 说明."""
+    import json
+
+    engine = ChatCardEngine(_mock_client(), header_enabled=True)
+    engine.on_draft("chat1", "写到一半的内容", reply_to="om_a")
+    await _settle(engine)
+
+    engine.mark_redirect("chat1")
+    engine.on_draft("chat1", "新回合", reply_to="om_a")
+    await _settle(engine)
+
+    # 第一张 update = 旧卡 seal（红 + NOTICE）
+    old_card = json.dumps(engine._client.cardkit_update.call_args_list[0].args[1],
+                          ensure_ascii=False)
+    assert '"red"' in old_card  # 红 header
+    assert "已按新指令重启" in old_card  # NOTICE 文案
+
+    # 新回合完成后正常绿色
+    await engine.complete("chat1", "新回合的完整回答")
+    new_card = json.dumps(engine._client.cardkit_update.call_args_list[-1].args[1],
+                          ensure_ascii=False)
+    assert '"green"' in new_card
