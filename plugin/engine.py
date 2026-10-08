@@ -302,6 +302,9 @@ class ChatCardEngine:
         session = self.active_session(chat_id)
         if session is None:
             return None
+        _logger.info("[feishu-streaming] complete: chat=%s state=%s segs=%d redirected=%s",
+                     chat_id[:12], session.state, len(session.segment_state.segments),
+                     session.redirected)
         if session.card_create_task is not None:
             await session.card_create_task
         if session.flush is not None:
@@ -407,8 +410,17 @@ class ChatCardEngine:
         session = self._sessions.get(chat_id)
         if session is None or session.is_terminal:
             # 旧卡（终态）保留在聊天里，新回合开新会话
-            session = ChatSession(chat_id=chat_id)
-            self._sessions[chat_id] = session
+            if session is not None:
+                _logger.info(
+                    "[feishu-streaming] session replaced: chat=%s old_state=%s "
+                    "completed_ago=%s redirected=%s",
+                    chat_id[:12], session.state,
+                    f"{time.time() - session.completed_at:.1f}s"
+                    if session.completed_at else "never",
+                    session.redirected)
+            new = ChatSession(chat_id=chat_id)
+            self._sessions[chat_id] = new
+            session = new
         if session.state == "creating" and session.card_create_task is None:
             assert self._loop is not None
             if session.flush is None:
@@ -469,6 +481,9 @@ class ChatCardEngine:
         if session is not None:
             return session
         active = [s for s in self._sessions.values() if not s.is_terminal]
+        if len(active) == 1:
+            _logger.info("[feishu-streaming] reasoning fallback: asked=%s target=%s",
+                         (chat_id or "-")[:12], active[0].chat_id[:12])
         return active[0] if len(active) == 1 else None
 
     def _schedule(self, session: ChatSession) -> None:
