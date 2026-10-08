@@ -16,6 +16,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from .adapter import create_scoped_adapter_factory
@@ -126,13 +127,39 @@ def _build_scoped_engine() -> tuple[ChatCardEngine, Any]:
     )
     with _ENGINES_LOCK:
         _ENGINES.append(engine)
-    _diag_log(f"scoped engine built (home={os.environ.get('HERMES_HOME', '?')})")
+    _diag_log(f"scoped engine built (home={_current_home()})")
     return engine, client
 
 
+def _current_home() -> str:
+    """当前作用域 home（contextvar 感知）——profile scope 内即该 profile 目录."""
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
+
+        return str(get_hermes_home())
+    except Exception:
+        return os.environ.get("HERMES_HOME", "?")
+
+
+def _profile_disabled_plugin(home: Any) -> bool:
+    """该 profile 是否把本插件列入 plugins.disabled（全局默认启用的退出开关）."""
+    try:
+        import yaml
+
+        with open(Path(home) / "config.yaml", encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh) or {}
+        disabled = ((cfg.get("plugins") or {}).get("disabled")) or []
+        return "feishu-streaming-platform" in disabled
+    except Exception:
+        return False
+
+
 def _fanout_to_profile_scopes(entry_kwargs: dict[str, Any]) -> None:
-    """把平台条目补注册到每个 live profile 的 registry scope 桶."""
-    _log = logging.getLogger("gateway.run")
+    """把平台条目补注册到每个 live profile 的 registry scope 桶.
+
+    全局默认全 profile 启用；profile 在自己 config 的 plugins.disabled 里
+    写 feishu-streaming-platform 可退出（回退官方 bundled adapter）。
+    """
     try:
         from gateway.platform_registry import PlatformEntry, platform_registry
         from hermes_cli.profiles import profiles_to_serve  # type: ignore[import-not-found]
@@ -142,6 +169,9 @@ def _fanout_to_profile_scopes(entry_kwargs: dict[str, Any]) -> None:
         for profile_name, home in profiles_to_serve(multiplex=True):
             key = hermes_home_key(home)
             if key == current:
+                continue
+            if _profile_disabled_plugin(home):
+                _diag_log(f"profile '{profile_name}' disabled this plugin — skip fan-out")
                 continue
             platform_registry.register(
                 PlatformEntry(source="plugin",

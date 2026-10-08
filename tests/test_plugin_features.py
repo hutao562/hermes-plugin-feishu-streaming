@@ -864,3 +864,19 @@ def test_fanout_registers_profile_scopes() -> None:
     assert "key:/h/family" in registered, "family scope 必须被补注册"
     assert "key:/h/default" not in registered, "注册 scope 本身不重复"
     assert registered["key:/h/family"]["name"] == "feishu"
+
+
+def test_fanout_respects_profile_optout(tmp_path) -> None:
+    """plugins.disabled 列出本插件的 profile 不被补注册（全局启用的退出开关）."""
+    import plugin as plugin_pkg
+
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  disabled:\n    - feishu-streaming-platform\n", encoding="utf-8")
+    assert plugin_pkg._profile_disabled_plugin(tmp_path) is True
+
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  disabled: []\n", encoding="utf-8")
+    assert plugin_pkg._profile_disabled_plugin(tmp_path) is False
+
+    (tmp_path / "config.yaml").unlink()
+    assert plugin_pkg._profile_disabled_plugin(tmp_path) is False  # 坏文件不退出
