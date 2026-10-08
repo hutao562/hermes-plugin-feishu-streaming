@@ -310,29 +310,76 @@ async def test_send_normal_final_with_notify_stays_card_path(adapter) -> None:
     assert result.message_id == "om_card_msg"
 
 
-# ── redirect：↪ ack 标记 → 下一 draft 收旧开新 ──
+# ── redirect：↪ ack 即刻收旧开新（不等首条正文 draft）──
 
 
 @pytest.mark.asyncio
 async def test_redirect_ack_then_draft_seals_old_with_notice() -> None:
-    """↪ redirect 后新 draft：旧卡 NOTICE 收尾 + 新卡（interrupt 同锚场景）."""
+    """↪ redirect ack 一到就拆：旧卡 NOTICE 收尾 + 新卡即刻开（思考/工具期不再画老卡）."""
     engine = ChatCardEngine(_mock_client())
     engine.on_draft("chat1", "旧指令的回答", reply_to="om_a")
     await _settle(engine)
     old = engine.session_for("chat1")
     assert old.state == "streaming"
 
-    engine.mark_redirect("chat1")  # ↪ ack 到达
-    engine.on_draft("chat1", "新指令的回答", reply_to="om_a")  # 同锚！
+    engine.mark_redirect("chat1")  # ↪ ack 到达：此刻立即收旧开新
     await _settle(engine)
-
     new = engine.session_for("chat1")
-    assert new is not old, "redirect 后应开新会话"
+    assert new is not old, "ack 即刻开新会话，不等 draft"
     assert old.state == "completed"
     notice_segs = [s for s in old.segment_state.segments if s.type.value == "notice"]
     assert notice_segs and "新指令" in notice_segs[-1].text  # NOTICE 收尾文案
-    assert engine._client.cardkit_create.call_count == 2  # 新卡
-    assert new.redirected is False  # 标记已消费
+    assert engine._client.cardkit_create.call_count == 2  # 新卡已建（尚无任何 draft）
+    assert new.redirected is False
+
+    engine.on_draft("chat1", "新指令的回答", reply_to="om_a")  # 同锚！落新卡
+    await _settle(engine)
+    assert engine.session_for("chat1") is new
+    assert new.answer_seg is not None and "新指令" in new.answer_seg.text
+
+
+@pytest.mark.asyncio
+async def test_redirect_post_ack_reasoning_tools_land_new_card() -> None:
+    """ack 后、正文 draft 前的 reasoning/工具事件必须落新卡（回归：旧实现落老卡）."""
+    engine = ChatCardEngine(_mock_client())
+    engine.on_draft("chat1", "旧回答", reply_to="om_a")
+    await _settle(engine)
+    old = engine.session_for("chat1")
+
+    engine.mark_redirect("chat1", anchor="om_new")
+    await _settle(engine)
+    new = engine.session_for("chat1")
+    assert new is not old and new.state == "streaming"
+    assert new.reply_to == "om_new"
+
+    engine.on_reasoning("chat1", "新回合思考")
+    engine.on_tool_start("execute_code", "ls")
+    engine.on_draft("chat1", "新正文", reply_to="om_a")
+    await _settle(engine)
+    reasoning = [s for s in new.segment_state.segments if s.type.value == "reasoning"]
+    assert reasoning and "新回合思考" in reasoning[0].text
+    assert all("新回合思考" not in s.text for s in old.segment_state.segments)
+    assert "新正文" in (new.answer_seg.text if new.answer_seg else "")
+
+
+@pytest.mark.asyncio
+async def test_redirect_straggler_draft_dropped() -> None:
+    """旧请求取消前的残尾快照（老内容超集）不得闪进新卡."""
+    engine = ChatCardEngine(_mock_client())
+    engine.on_draft("chat1", "旧答案写到一半", reply_to="om_a")
+    await _settle(engine)
+
+    engine.mark_redirect("chat1", anchor="om_new")
+    new = engine.session_for("chat1")
+    engine.on_draft("chat1", "旧答案写到一半的更多内容", reply_to="om_a")  # 残尾（超集）
+    assert new.answer_seg is None, "残尾不应写入新卡"
+
+    engine.on_draft("chat1", "全新的回答", reply_to="om_a")  # 真新内容：放行并解除拦截
+    await _settle(engine)
+    assert new.answer_seg is not None and new.answer_seg.text == "全新的回答"
+    # guard 已解除：后续帧正常置换
+    engine.on_draft("chat1", "全新的回答（续）", reply_to="om_a")
+    assert new.answer_seg.text == "全新的回答（续）"
 
 
 @pytest.mark.asyncio
@@ -346,15 +393,19 @@ async def test_redirect_new_card_anchors_user_correction_message() -> None:
     engine.on_draft("chat1", "老指令的回答", reply_to="om_old")
     await _settle(engine)
 
-    # ↪ ack 到达：reply_to 是用户新指令消息 id；随后新 draft 仍带老锚（同锚）
+    # ↪ ack 到达：reply_to 是用户新指令消息 id；此刻新卡即以该锚建卡
     engine.mark_redirect("chat1", anchor="om_new")
-    engine.on_draft("chat1", "新指令的回答", reply_to="om_old")
     await _settle(engine)
 
     new = engine.session_for("chat1")
     assert new.reply_to == "om_new", "新卡锚应为用户纠正消息 id"
 
-    # 建卡后以新锚 reply 落位（卡片落在用户纠正消息下方）
+    # 后续 draft（仍带老锚——interrupt 不换消息身份）落入新卡，锚不变
+    engine.on_draft("chat1", "新指令的回答", reply_to="om_old")
+    await _settle(engine)
+    assert engine.session_for("chat1") is new
+
+    # 建卡时以新锚 reply 落位（卡片落在用户纠正消息下方）
     reply_call = engine._client.reply_card_by_id.call_args
     assert reply_call.args[0] == "om_new"
 
@@ -370,13 +421,13 @@ async def test_redirect_same_turn_anchor_swing_does_not_split_card() -> None:
     engine.on_draft("chat1", "散文开头", reply_to="om_old")
     await _settle(engine)
 
-    engine.mark_redirect("chat1", anchor="om_new")
-    engine.on_draft("chat1", "改成诗歌的计划", reply_to="om_old")  # 触发 redirect 边界
+    engine.mark_redirect("chat1", anchor="om_new")  # ack 即刻收旧开新
     await _settle(engine)
     session = engine.session_for("chat1")
     assert session.reply_to == "om_new"
 
     # 同回合锚回摆：老锚 draft（老回合尾巴/重锚后的 consumer）→ 不拆卡
+    engine.on_draft("chat1", "改成诗歌的计划", reply_to="om_old")
     engine.on_draft("chat1", "诗歌正文", reply_to="om_old")
     await _settle(engine)
     assert engine.session_for("chat1") is session, "锚回摆不应拆卡"
@@ -401,14 +452,29 @@ async def test_queued_ack_does_not_mark_redirect() -> None:
 
 
 @pytest.mark.asyncio
-async def test_adapter_redirect_ack_marks_engine(adapter) -> None:
-    adapter._engine().on_draft("chat1", "流式中", reply_to="om_a")
-    await _settle(adapter._engine())
+async def test_adapter_redirect_ack_opens_new_card_immediately(adapter) -> None:
+    """↪ ack 经 send() 拦截即触发收旧开新（老会话密封、新会话顶替）."""
+    engine = adapter._engine()
+    engine.on_draft("chat1", "流式中", reply_to="om_a")
+    await _settle(engine)
+    old = engine.session_for("chat1")
 
     result = await adapter.send("chat1", "↪ 已重定向当前运行", reply_to="om_1",
                                 metadata={"notify": True})
     assert result.success is True
-    assert adapter._engine().session_for("chat1").redirected is True
+    await _settle(engine)  # 等 seal task 跑完
+    new = engine.session_for("chat1")
+    assert new is not old, "ack 即刻顶替会话"
+    assert old.redirected is True  # 被重启回合的诊断标记留在旧会话上
+    assert old.state == "completed"
+    assert new.state in ("creating", "streaming")  # 新卡已在建/已建
+
+    # ↪ ack 文本进新卡心跳行（旧卡已密封，不再吃内容；settle 后字段已被 flush 清空）
+    from plugin._vendor.cardkit.builder import HEARTBEAT_ELEMENT_ID
+
+    heartbeat_pushes = [c.args[2] for c in engine._client.cardkit_stream_element.call_args_list
+                        if c.args[1] == HEARTBEAT_ELEMENT_ID]
+    assert any("已重定向" in t for t in heartbeat_pushes)
 
 
 # ── footer：形态对齐注入模式配置 ──

@@ -297,7 +297,9 @@ async def test_send_busy_ack_prefix_routes_to_heartbeat(adapter) -> None:
                                 reply_to="om_1", metadata={"notify": True})
 
     assert result.success is True
-    assert result.message_id.startswith("lark-card:")
+    # ↪ ack 即刻收旧开新：ack 文本进新卡心跳行；新卡尚在建，无消息 id 可回
+    assert result.message_id is None
+    assert "Redirected" in adapter._engine().session_for("chat1").heartbeat_text
     assert adapter.native_sends == []
 
 

@@ -133,18 +133,24 @@ class StreamingFeishuMixin:
                 return _compat.send_result(success=True, message_id=card_msg_id)
             # 无可用卡片 → 落回原生文本
 
-        if (session is not None and session.state == "streaming" and not interim
+        if (session is not None and session.state in ("creating", "streaming") and not interim
                 and content and len(content) <= 200
                 and content.lstrip().startswith(_BUSY_ACK_PREFIXES)):
             # busy ack → 心跳行；回合完成时随完成卡消失。
-            # ↪ redirect（用户纠正、interrupt 注入新指令）额外打标记：下一个
-            # draft 收旧卡开新卡（interrupt 不换 event_message_id，锚检测覆盖不到）
+            # ↪ redirect（用户纠正、interrupt 注入新指令）→ 即刻收旧开新（hermes
+            # redirect 是同回合改锚续跑，draft 锚不变，等锚变化/首条 draft 都
+            # 接不到）。含 creating：ack 可早于建卡完成，此时也不能漏标记。
             if content.lstrip().startswith("↪"):
                 # ack 的 reply_to = 用户纠正消息 id（hermes 锚到新消息）→ 新卡 reply 引用它
                 engine.mark_redirect(chat_id, anchor=reply_to)
+                session = engine.active_session(chat_id)  # mark_redirect 可能已顶替会话
             engine.on_heartbeat(chat_id, content)
-            return _compat.send_result(success=True,
-                                       message_id=f"lark-card:{session.card_msg_id}")
+            # 新卡尚在建（card_msg_id 未落）时返回无 id 的成功——ack 无后续 edit，
+            # 合成 "lark-card:None" 会让后续 edit 打到原生链路上
+            return _compat.send_result(
+                success=True,
+                message_id=(f"lark-card:{session.card_msg_id}"
+                            if session is not None and session.card_msg_id else None))
 
         if session is not None and session.state == "streaming":
             # 回合终态文本 → 完成卡（官方 transport 在 draft 后仍会真发最终文本，
