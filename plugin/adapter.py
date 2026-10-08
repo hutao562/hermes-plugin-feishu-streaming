@@ -373,3 +373,22 @@ def create_adapter_factory(engine: ChatCardEngine, client_proxy: Any = None) -> 
         return adapter
 
     return factory
+
+
+def create_scoped_adapter_factory(engine_builder: Any) -> Any:
+    """multiplex 版 factory：每次实例化（每 profile 的 adapter）独立 engine.
+
+    平台注册条目按 plugin scope 分桶——secondary profile（如 family）创建
+    adapter 时在同一 registry 条目上调用 factory，此处运行于该 profile 的
+    _profile_runtime_scope 内（HERMES_HOME 指向其目录）。共享单 engine 会把
+    client_proxy 重绑到最后一个 adapter 的凭据上（跨 app 串扰），且 footer/
+    header 配置必须按各 profile 自己的 config.yaml 解析——所以 engine 与
+    client 均按调用现场构建。engine_builder() -> (engine, client_proxy)，
+    并自行登记进 __init__._ENGINES 供钩子路由。
+    """
+
+    def factory(config: Any) -> Any:
+        engine, client_proxy = engine_builder()
+        return create_adapter_factory(engine, client_proxy=client_proxy)(config)
+
+    return factory

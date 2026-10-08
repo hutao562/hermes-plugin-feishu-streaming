@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from typing import Any
 
-from .adapter import create_adapter_factory
+from .adapter import create_scoped_adapter_factory
 from .engine import ChatCardEngine
 
 _logger = logging.getLogger("hermes_lark_streaming.plugin")
@@ -56,26 +58,33 @@ class _LazyClient:
         return getattr(self._client, name)
 
 
-def register(ctx: Any) -> None:
-    """插件入口 — 由 hermes plugin 系统调用（每 profile 一次）."""
-    # 走 gateway.run logger（唯一确认落 gateway.log 的通道；本包 logger 不进日志）
-    logging.getLogger("gateway.run").info(
-        "[feishu-streaming] register() called — registering streaming feishu platform")
-    client = _LazyClient()
-    engine = ChatCardEngine(
-        client,
-        footer_fields=_footer_config("fields"),
-        footer_show_label=_footer_config("show_label", False),
-        footer_enabled=_footer_config("enabled", True),
-        # header（完成态状态条）与注入模式同源读 streaming.header 段；
-        # 漏接会让红卡等 header 依赖特性静默失效
-        header_enabled=_header_config(),
-    )
+def _diag_log(message: str) -> None:
+    """启动早期 hermes logging 未配置，INFO 会进黑洞——关键生命周期事件落独立文件."""
+    logging.getLogger("gateway.run").info("[feishu-streaming] %s", message)
+    try:
+        path = os.path.join(os.environ.get("HERMES_HOME",
+                                           os.path.expanduser("~/.hermes")),
+                            "logs", "feishu-streaming-plugin.log")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{os.getpid()}] {message}\n")
+    except Exception:
+        pass
 
-    ctx.register_platform(
+
+def register(ctx: Any) -> None:
+    """插件入口 — 由 hermes plugin 系统调用（每进程一次，默认 profile scope）.
+
+    multiplex 网关下 secondary profile（如 family）创建 adapter 时在自己的
+    profile scope 查 registry——插件条目默认只落在注册时的 scope 桶里，其它
+    profile 查不到就回退官方 bundled adapter（安安没流式卡的根因）。因此注册
+    后把同一平台条目补注册到每个 live profile 的 scope。
+    """
+    _diag_log("register() called")
+
+    entry_kwargs = dict(
         name="feishu",
         label="Feishu / Lark (streaming cards)",
-        adapter_factory=create_adapter_factory(engine, client_proxy=client),
+        adapter_factory=create_scoped_adapter_factory(_build_scoped_engine),
         check_fn=_feishu_deps_present,
         required_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
         install_hint="Run `hermes setup` to install Feishu support.",
@@ -87,14 +96,66 @@ def register(ctx: Any) -> None:
         emoji="🪽",
         allow_update_command=True,
     )
-    logging.getLogger("gateway.run").info(
-        "[feishu-streaming] platform registered (last-writer-wins over bundled)")
+    ctx.register_platform(**entry_kwargs)
+    _diag_log("platform registered via ctx (scope entry)")
+    _fanout_to_profile_scopes(entry_kwargs)
 
-    # reasoning 流观察（off token path）：钩子不带 chat，引擎按单会话兜底路由
+    # reasoning 流观察（off token path）：钩子不带 chat，引擎路由按全局单活跃会话兜底
     if hasattr(ctx, "register_hook"):
-        ctx.register_hook("on_stream_delta", _make_reasoning_hook(engine))
-        # usage 聚合（footer tokens/t/s）：session_id 含 chat_id，complete 时消费
-        ctx.register_hook("post_api_request", _make_usage_hook(engine))
+        ctx.register_hook("on_stream_delta", _make_reasoning_hook())
+        # usage 聚合（footer tokens/t/s）：session_id 含 chat_id 路由到所属 engine
+        ctx.register_hook("post_api_request", _make_usage_hook())
+
+
+def _build_scoped_engine() -> tuple[ChatCardEngine, Any]:
+    """factory 调用现场（= 目标 profile 的 runtime scope）构建独立 engine.
+
+    footer/header 配置在此读取——HERMES_HOME 此时指向该 profile 目录，
+    各 profile 的 streaming.footer/header 段独立生效。engine 登记进
+    _ENGINES 供跨 engine 钩子路由。
+    """
+    client = _LazyClient()
+    engine = ChatCardEngine(
+        client,
+        footer_fields=_footer_config("fields"),
+        footer_show_label=_footer_config("show_label", False),
+        footer_enabled=_footer_config("enabled", True),
+        # header（完成态状态条）与注入模式同源读 streaming.header 段；
+        # 漏接会让红卡等 header 依赖特性静默失效
+        header_enabled=_header_config(),
+    )
+    with _ENGINES_LOCK:
+        _ENGINES.append(engine)
+    _diag_log(f"scoped engine built (home={os.environ.get('HERMES_HOME', '?')})")
+    return engine, client
+
+
+def _fanout_to_profile_scopes(entry_kwargs: dict[str, Any]) -> None:
+    """把平台条目补注册到每个 live profile 的 registry scope 桶."""
+    _log = logging.getLogger("gateway.run")
+    try:
+        from gateway.platform_registry import PlatformEntry, platform_registry
+        from hermes_cli.profiles import profiles_to_serve  # type: ignore[import-not-found]
+        from hermes_constants import hermes_home_key  # type: ignore[import-not-found]
+
+        current = hermes_home_key()
+        for profile_name, home in profiles_to_serve(multiplex=True):
+            key = hermes_home_key(home)
+            if key == current:
+                continue
+            platform_registry.register(
+                PlatformEntry(source="plugin",
+                               plugin_name="feishu-streaming-platform",
+                               **entry_kwargs),
+                scope=key)
+            _diag_log(f"platform fanned out to profile '{profile_name}' (scope={key})")
+    except Exception as exc:
+        _diag_log(f"profile scope fan-out FAILED: {exc!r}")
+
+
+# 跨 engine 钩子路由（multiplex 下每 profile 一个 engine）
+_ENGINES: list[ChatCardEngine] = []
+_ENGINES_LOCK = threading.Lock()
 
 
 def _footer_config(key: str, default: Any = None) -> Any:
@@ -131,36 +192,59 @@ def _feishu_deps_present() -> bool:
         return False
 
 
-def _make_reasoning_hook(engine: ChatCardEngine) -> Any:
+def _make_reasoning_hook() -> Any:
     def on_stream_delta(**kwargs: Any) -> None:
         if kwargs.get("kind") != "reasoning":
             return
         # 官方 enqueue 参数名是 delta（stream_delivery._enqueue_stream_hook），非 text
         text = kwargs.get("delta") or kwargs.get("text") or ""
-        if text:
-            engine.on_reasoning("", text)  # chat 未知 → 引擎单会话兜底
+        if not text:
+            return
+        # 钩子不带 chat：全局恰好一个活跃会话时兜底（跨 engine 聚合判定）
+        with _ENGINES_LOCK:
+            engines = list(_ENGINES)
+        actives = [(e, e.streaming_sessions()) for e in engines]
+        actives = [(e, s) for e, s in actives if s]
+        if len(actives) == 1 and len(actives[0][1]) == 1:
+            actives[0][0].on_reasoning("", text)
 
     return on_stream_delta
 
 
-def _make_usage_hook(engine: ChatCardEngine) -> Any:
+def _make_usage_hook() -> Any:
     logged: set[str] = set()
 
     def on_post_api_request(**kwargs: Any) -> None:
         usage = kwargs.get("usage")
-        if isinstance(usage, dict):
-            session_id = kwargs.get("session_id") or ""
-            usage = {**usage, "context_length": kwargs.get("context_length"),
-                     "started_at": kwargs.get("started_at"),
-                     "ended_at": kwargs.get("ended_at")}
-            engine.record_usage(session_id, usage, model=kwargs.get("model") or "")
-            if session_id not in logged:  # 每回合桶首条打一次（确认钩子活性）
-                logged.add(session_id)
-                logging.getLogger("gateway.run").info(
-                    "[feishu-streaming] usage tracking started: session=%s model=%s",
-                    session_id[:40], kwargs.get("model") or "?")
+        if not (isinstance(usage, dict)):
+            return
+        session_id = kwargs.get("session_id") or ""
+        with _ENGINES_LOCK:
+            engines = list(_ENGINES)
+        engine = _route_usage_engine(engines, session_id)
+        if engine is None:
+            return
+        usage = {**usage, "context_length": kwargs.get("context_length"),
+                 "started_at": kwargs.get("started_at"),
+                 "ended_at": kwargs.get("ended_at")}
+        engine.record_usage(session_id, usage, model=kwargs.get("model") or "")
+        if session_id not in logged:  # 每回合桶首条打一次（确认钩子活性）
+            logged.add(session_id)
+            logging.getLogger("gateway.run").info(
+                "[feishu-streaming] usage tracking started: session=%s model=%s",
+                session_id[:40], kwargs.get("model") or "?")
 
     return on_post_api_request
+
+
+def _route_usage_engine(engines: list[ChatCardEngine], session_id: str) -> ChatCardEngine | None:
+    """session key 里的 chat → 拥有该 chat 会话的 engine；无命中回退唯一 engine."""
+    chat = ChatCardEngine._chat_of_session(session_id)
+    if chat:
+        owners = [e for e in engines if e.session_for(chat) is not None]
+        if len(owners) == 1:
+            return owners[0]
+    return engines[0] if len(engines) == 1 else None
 
 
 def _make_standalone_sender() -> Any:

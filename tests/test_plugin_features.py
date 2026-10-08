@@ -448,16 +448,20 @@ def test_footer_config_reads_hermes_yaml() -> None:
 
 @pytest.mark.asyncio
 async def test_usage_hook_passes_context_length() -> None:
-    from plugin import _make_usage_hook
+    import plugin as plugin_pkg
 
     engine = ChatCardEngine(_mock_client())
-    hook = _make_usage_hook(engine)
+    # 路由版钩子：engine 登记进全局表，按 session_id 里的 chat 路由
+    plugin_pkg._ENGINES.clear()
+    plugin_pkg._ENGINES.append(engine)
+    hook = plugin_pkg._make_usage_hook()
     hook(session_id="agent:main:feishu:dm:oc_abc00000000000000000000000000099",
          usage={"prompt_tokens": 10, "completion_tokens": 2},
          model="m", context_length=2000000)
     bucket = engine._usage["oc_abc00000000000000000000000000099"]
     assert bucket["context_max"] == 2000000
     assert bucket["context_used"] == 10
+    plugin_pkg._ENGINES.clear()
 
 
 @pytest.mark.asyncio
@@ -632,13 +636,16 @@ async def test_gateway_lifecycle_notice_not_merged_into_card(adapter) -> None:
 @pytest.mark.asyncio
 async def test_reasoning_hook_reads_delta_kwarg() -> None:
     """官方 enqueue 参数名是 delta（非 text）——回归防护."""
-    from plugin import _make_reasoning_hook
+    import plugin as plugin_pkg
 
     engine = ChatCardEngine(_mock_client())
     engine.on_turn_started("chat1")  # 建活跃会话（含 creating 兜底）
     await _settle(engine)
-    hook = _make_reasoning_hook(engine)
+    plugin_pkg._ENGINES.clear()
+    plugin_pkg._ENGINES.append(engine)
+    hook = plugin_pkg._make_reasoning_hook()
     hook(kind="reasoning", delta="💭 思考增量")
+    plugin_pkg._ENGINES.clear()
     session = engine.session_for("chat1")
     reasoning = [s for s in session.segment_state.segments if s.type.value == "reasoning"]
     assert reasoning and "思考增量" in reasoning[0].text
@@ -764,3 +771,96 @@ async def test_engine_streams_capped_reasoning() -> None:
     biggest = max(reasoning_sends, key=len)
     assert len(biggest) < 1200, f"流式思考应封顶，实测 {len(biggest)}"
     assert "思考原文共" in biggest or "想" * 4000 not in biggest
+
+
+# ── multiplex：多 profile engine 路由（安安/family 场景）──
+
+
+@pytest.mark.asyncio
+async def test_scoped_factory_builds_independent_engines() -> None:
+    """每次 factory 调用（= 每 profile 的 adapter 实例化）独立 engine+client."""
+    import plugin as plugin_pkg
+    from plugin.adapter import create_scoped_adapter_factory
+
+    built = []
+
+    def builder():
+        engine = ChatCardEngine(_mock_client())
+        client = plugin_pkg._LazyClient()
+        built.append((engine, client))
+        return engine, client
+
+    from test_plugin_mode import _FakeBaseAdapter
+
+    import plugin.adapter as padapter
+    real_import = padapter._import_base_adapter
+    padapter._import_base_adapter = lambda: _FakeBaseAdapter
+    try:
+        factory = create_scoped_adapter_factory(builder)
+        f1 = factory(config=None)
+        f2 = factory(config=None)
+    finally:
+        padapter._import_base_adapter = real_import
+    assert f1 is not f2
+    assert len(built) == 2
+    assert built[0][0] is not built[1][0], "engine 必须按 adapter 独立（凭据隔离）"
+    assert f1._engine() is built[0][0] and f2._engine() is built[1][0]
+
+
+@pytest.mark.asyncio
+async def test_usage_hook_routes_by_chat_across_engines() -> None:
+    """usage 按 session_id 里的 chat 路由到拥有该 chat 会话的 engine."""
+    import plugin as plugin_pkg
+
+    e_default = ChatCardEngine(_mock_client())
+    e_family = ChatCardEngine(_mock_client())
+    e_default.on_draft("oc_aaaaaaaaaaaaaaaa0000000000000001", "答", reply_to="om_a")
+    e_family.on_draft("oc_bbbbbbbbbbbbbbbb0000000000000002", "答", reply_to="om_b")
+    plugin_pkg._ENGINES.clear()
+    plugin_pkg._ENGINES.extend([e_default, e_family])
+    try:
+        hook = plugin_pkg._make_usage_hook()
+        hook(session_id="agent:family:feishu:dm:oc_bbbbbbbbbbbbbbbb0000000000000002",
+             usage={"prompt_tokens": 5, "completion_tokens": 1}, model="m")
+        assert "oc_bbbbbbbbbbbbbbbb0000000000000002" in e_family._usage
+        assert not e_default._usage, "不得串到别的 profile 的 engine"
+    finally:
+        plugin_pkg._ENGINES.clear()
+
+
+def test_fanout_registers_profile_scopes() -> None:
+    """补注册把平台条目写进每个 live profile 的 registry scope 桶."""
+    import plugin as plugin_pkg
+
+    registered = {}
+
+    class _FakeRegistry:
+        def register(self, entry, *, scope=None):
+            registered[scope] = entry
+
+    import sys
+    import types
+    fake_reg_mod = types.ModuleType("gateway.platform_registry")
+    fake_reg_mod.platform_registry = _FakeRegistry()
+    fake_reg_mod.PlatformEntry = lambda **kw: kw
+    fake_const_mod = types.ModuleType("hermes_constants")
+    fake_const_mod.hermes_home_key = lambda path=None: f"key:{path or '/h/default'}"
+    fake_prof_mod = types.ModuleType("hermes_cli.profiles")
+    fake_prof_mod.profiles_to_serve = lambda multiplex=False: [
+        ("default", "/h/default"), ("family", "/h/family")]
+    saved = {m: sys.modules.get(m) for m in
+             ("gateway.platform_registry", "hermes_constants", "hermes_cli.profiles")}
+    sys.modules.update({"gateway.platform_registry": fake_reg_mod,
+                        "hermes_constants": fake_const_mod,
+                        "hermes_cli.profiles": fake_prof_mod})
+    try:
+        plugin_pkg._fanout_to_profile_scopes({"name": "feishu"})
+    finally:
+        for m, mod in saved.items():
+            if mod is None:
+                sys.modules.pop(m, None)
+            else:
+                sys.modules[m] = mod
+    assert "key:/h/family" in registered, "family scope 必须被补注册"
+    assert "key:/h/default" not in registered, "注册 scope 本身不重复"
+    assert registered["key:/h/family"]["name"] == "feishu"
