@@ -1,20 +1,47 @@
 name: feishu-streaming-platform
 label: Feishu Streaming Cards (CardKit v2)
 kind: platform
+# manifest v2：manifest_version 管文件格式，api_version 管 hermes 插件 API 代际
+manifest_version: 2
 version: 0.14.0
 description: >-
   Feishu/Lark platform adapter with CardKit v2 draft-streaming cards:
   typewriter streaming, structured tool panel, in-card heartbeat,
-  document delivery under the card, and cron card delivery.
-  Subclasses the bundled FeishuAdapter and replaces it per profile
-  (register_platform name="feishu", last-writer-wins).
+  clarify inline single-select, document delivery under the card,
+  and cron card delivery. Subclasses the bundled FeishuAdapter and
+  replaces it per profile (register_platform name="feishu",
+  last-writer-wins), inheriting the bundled entry's setup/status
+  contract surfaces.
 author: Cheerwhy & contributors
+homepage: https://github.com/Cheerwhy/hermes-lark-streaming
+license: MIT
+tags:
+  - feishu
+  - lark
+  - streaming
+  - cardkit
+# 插件依赖官方 draft-streaming 契约锚点（plugin/contract.py），0.21.1 为已验证下限
+requires_hermes: ">=0.21.1"
 requires_env:
   - name: FEISHU_APP_ID
-    description: Feishu app id
+    description: Feishu app id (from the Feishu open platform app credentials)
   - name: FEISHU_APP_SECRET
     description: Feishu app secret
     password: true
+optional_env:
+  - name: FEISHU_ENCRYPT_KEY
+    description: Event encryption key (webhook mode signature verification)
+  - name: FEISHU_VERIFICATION_TOKEN
+    description: Webhook verification token
+    password: true
+  - name: FEISHU_ALLOWED_USERS
+    description: Comma-separated allowlist of user IDs who may DM the bot
+  - name: FEISHU_ALLOW_ALL_USERS
+    description: Allow every user to DM the bot (overrides the allowlist)
+  - name: FEISHU_HOME_CHANNEL
+    description: Default chat for cron/notification delivery
+  - name: FEISHU_GROUP_POLICY
+    description: Group chat policy (open = respond when @mentioned, disabled = off)
 provides_hooks:
   - on_stream_delta
   - post_api_request

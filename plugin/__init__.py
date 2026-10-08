@@ -25,9 +25,24 @@ from .engine import ChatCardEngine
 _logger = logging.getLogger("hermes_lark_streaming.plugin")
 
 
+def _scoped_env(name: str) -> str:
+    """profile 作用域感知的凭据读取.
+
+    gateway 规则（#72348/#86905）：multiplex 下 os.environ 恒为 default profile
+    的值，secondary profile 的凭据只能经 secret scope 读——所以这里绝不直接
+    os.getenv（旧行为是 default 凭据泄漏到 secondary 的通道）。hermes 不可导入
+    （本地直跑/单测）时返回空：宁缺勿串。
+    """
+    try:
+        from gateway.platforms._shared import get_scoped_secret
+    except ImportError:
+        return ""
+    return str(get_scoped_secret(name, "") or "")
+
+
 class _LazyClient:
     """惰性 FeishuClient — 优先从 adapter 绑定的 client 源取（profile 凭据），
-    未绑定时回退 env（本地直跑/测试）。"""
+    未绑定时回退 scoped env（本地直跑/测试；作用域感知，见 _scoped_env）。"""
 
     def __init__(self) -> None:
         self._client: Any = None
@@ -46,8 +61,8 @@ class _LazyClient:
         from ._vendor.feishu import FeishuClient, FeishuClientConfig
 
         self._client = FeishuClient(FeishuClientConfig(
-            app_id=os.environ.get("FEISHU_APP_ID", ""),
-            app_secret=os.environ.get("FEISHU_APP_SECRET", ""),
+            app_id=_scoped_env("FEISHU_APP_ID"),
+            app_secret=_scoped_env("FEISHU_APP_SECRET"),
         ))
         return self._client
 
@@ -96,6 +111,14 @@ def register(ctx: Any) -> None:
         max_message_length=8000,
         emoji="🪽",
         allow_update_command=True,
+        # 与内置 feishu 条目对齐的契约面——同名顶替后缺了这些，hermes gateway
+        # setup / gateway status / 配置向导对 feishu 整体回归（bundled 条目全有）。
+        # 实现直接复用官方模块（延迟解析，官方改了我们跟着对），见 _official_feishu_attr
+        is_connected=_feishu_is_connected,
+        validate_config=_feishu_is_connected,
+        ensure_deps_fn=_feishu_ensure_deps,
+        apply_yaml_config_fn=_feishu_apply_yaml_config,
+        setup_fn=_feishu_interactive_setup,
     )
     ctx.register_platform(**entry_kwargs)
     _diag_log("platform registered via ctx (scope entry)")
@@ -103,9 +126,19 @@ def register(ctx: Any) -> None:
 
     # reasoning 流观察（off token path）：钩子不带 chat，引擎路由按全局单活跃会话兜底
     if hasattr(ctx, "register_hook"):
-        ctx.register_hook("on_stream_delta", _make_reasoning_hook())
+        reasoning_hook = _make_reasoning_hook()
+        usage_hook = _make_usage_hook()
+        ctx.register_hook("on_stream_delta", reasoning_hook)
         # usage 聚合（footer tokens/t/s）：session_id 含 chat_id 路由到所属 engine
-        ctx.register_hook("post_api_request", _make_usage_hook())
+        ctx.register_hook("post_api_request", usage_hook)
+        # hook 注册表按 profile 分 manager（get_plugin_manager 按 home 缓存，各自
+        # 独立 _hooks）——与平台条目分桶同病：这里注册的回调只落在当前 scope，
+        # secondary profile 的流线程查自己的 manager 为空 → reasoning 流静默
+        # 丢弃（安安侧折叠条消失的根因）。补注册到每个 live profile 的 manager。
+        _fanout_hooks_to_profile_scopes({
+            "on_stream_delta": reasoning_hook,
+            "post_api_request": usage_hook,
+        }, manifest=getattr(ctx, "manifest", None))
 
 
 def _build_scoped_engine() -> tuple[ChatCardEngine, Any]:
@@ -183,6 +216,55 @@ def _fanout_to_profile_scopes(entry_kwargs: dict[str, Any]) -> None:
         _diag_log(f"profile scope fan-out FAILED: {exc!r}")
 
 
+# 钩子 fan-out 已注册的回调身份（reload-plugins/重跑幂等；官方 append 无去重）
+_FANED_HOOK_IDS: set[int] = set()
+
+
+def _fanout_hooks_to_profile_scopes(hooks: dict[str, Any], manifest: Any = None) -> None:
+    """把 hook 回调补注册到每个 live profile 的 PluginManager（**全程公开面**）.
+
+    manager 按解析到的 home 缓存（_plugin_home_key → get_hermes_home contextvar），
+    插件只在 discovery scope 注册一次，secondary profile 的 manager 查不到本插件
+    的回调 → 其流线程按自己的 manager 迭代钩子为空（安安侧 reasoning 丢失根因）。
+    官方 startup 的 per-profile discover_plugins() 并不会把本插件重复装进 secondary
+    manager（生产实证 register() 每进程仅一次）——因此这里显式补注册。catalog 准入
+    "no core override" 红线禁止写 hermes 私有字段，全程走公开面：home override
+    （hermes_constants 公开 contextvar API）→ get_plugin_manager()（官方：缺席即建
+    +缓存）→ PluginContext.register_hook（官方 facade 方法）。
+    """
+    try:
+        from hermes_cli import plugins as plugins_mod
+        from hermes_cli.profiles import profiles_to_serve  # type: ignore[import-not-found]
+        from hermes_constants import (  # type: ignore[import-not-found]
+            hermes_home_key,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+    except Exception as exc:
+        _diag_log(f"hook fan-out imports failed: {exc!r}")
+        return
+    current = hermes_home_key()
+    for profile_name, home in profiles_to_serve(multiplex=True):
+        key = hermes_home_key(home)
+        if key == current or _profile_disabled_plugin(home):
+            continue
+        try:
+            token = set_hermes_home_override(str(home))
+            try:
+                manager = plugins_mod.get_plugin_manager()
+            finally:
+                reset_hermes_home_override(token)
+            context = plugins_mod.PluginContext(manifest, manager)
+            for name, callback in hooks.items():
+                if id(callback) in _FANED_HOOK_IDS:
+                    continue
+                context.register_hook(name, callback)
+                _FANED_HOOK_IDS.add(id(callback))
+            _diag_log(f"hooks fanned out to profile '{profile_name}' (scope={key})")
+        except Exception as exc:
+            _diag_log(f"hook fan-out to profile '{profile_name}' FAILED: {exc!r}")
+
+
 # 跨 engine 钩子路由（multiplex 下每 profile 一个 engine）
 _ENGINES: list[ChatCardEngine] = []
 _ENGINES_LOCK = threading.Lock()
@@ -222,7 +304,75 @@ def _feishu_deps_present() -> bool:
         return False
 
 
+# 内置 feishu 注册辅助的延迟解析缓存（函数对象；影子模块的纯函数与真身等价）
+_OFFICIAL_HELPERS: dict[str, Any] = {}
+
+
+def _official_feishu_attr(attr: str) -> Any:
+    """官方 feishu adapter 模块里的注册辅助函数（延迟解析，缓存命中后不再查）.
+
+    bundled feishu 是 deferred loader——discover_plugins 时模块多半未加载，
+    所以 PlatformEntry 的辅助字段不能在 register() 现场取，只能包一层首调
+    解析。解析顺序：sys.modules 里的运行时真身（hermes_plugins.*）→ 源码路径
+    回退。这些辅助（is_connected/setup/apply_yaml/ensure_deps）是纯函数或 CLI
+    流程，与类身份无关，源码路径的影子模块安全。
+    """
+    if attr in _OFFICIAL_HELPERS:
+        return _OFFICIAL_HELPERS[attr]
+    import importlib
+    import sys
+
+    mod = next((m for n, m in sys.modules.items()
+                if n.startswith("hermes_plugins.") and n.endswith(".adapter")
+                and hasattr(m, "FeishuAdapter")), None)
+    if mod is None:
+        try:
+            mod = importlib.import_module("plugins.platforms.feishu.adapter")
+        except Exception:
+            return None
+    fn = getattr(mod, attr, None)
+    if callable(fn):
+        _OFFICIAL_HELPERS[attr] = fn
+        return fn
+    return None
+
+
+def _feishu_is_connected(config: Any) -> bool:
+    """复用内置判定：extra 里有 app_id 即视为已连接（gateway status / setup 用）."""
+    fn = _official_feishu_attr("_is_connected")
+    try:
+        return bool(fn(config)) if fn else False
+    except Exception:
+        return False
+
+
+def _feishu_ensure_deps() -> bool:
+    """ACTIVE 安装器（复用内置 check_feishu_requirements：缺依赖时经 pm 安装）."""
+    fn = _official_feishu_attr("check_feishu_requirements")
+    try:
+        return bool(fn()) if fn else False
+    except Exception:
+        return False
+
+
+def _feishu_apply_yaml_config(yaml_cfg: Any, feishu_cfg: Any) -> Any:
+    """复用内置 YAML 桥（config.yaml feishu.allow_bots → env/extra，multiplex 安全）."""
+    fn = _official_feishu_attr("_apply_yaml_config")
+    return fn(yaml_cfg, feishu_cfg) if fn else None
+
+
+def _feishu_interactive_setup() -> None:
+    """复用内置交互配置向导（二维码/手动录入凭据、写 .env、授权与群策略）."""
+    fn = _official_feishu_attr("interactive_setup")
+    if fn is None:
+        raise RuntimeError("官方 feishu adapter 不可导入，无法进入交互配置；"
+                           "请手动设置 FEISHU_APP_ID / FEISHU_APP_SECRET")
+    fn()
+
+
 def _make_reasoning_hook() -> Any:
+    dropped = {"n": 0}
+
     def on_stream_delta(**kwargs: Any) -> None:
         if kwargs.get("kind") != "reasoning":
             return
@@ -237,6 +387,14 @@ def _make_reasoning_hook() -> Any:
         actives = [(e, s) for e, s in actives if s]
         if len(actives) == 1 and len(actives[0][1]) == 1:
             actives[0][0].on_reasoning("", text)
+        else:
+            # 多会话并发时防串扰丢弃——但要可见（曾静默丢成「折叠条消失」）
+            dropped["n"] += 1
+            if dropped["n"] == 1 or dropped["n"] % 50 == 0:
+                logging.getLogger("gateway.run").info(
+                    "[feishu-streaming] reasoning dropped (multi-session): "
+                    "engines=%d sessions=%s total_dropped=%d",
+                    len(actives), [len(s) for _, s in actives], dropped["n"])
 
     return on_stream_delta
 

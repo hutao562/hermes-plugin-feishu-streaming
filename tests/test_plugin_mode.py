@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -384,6 +385,73 @@ def test_plugin_manifest_is_platform_kind() -> None:
     # manifest 名只须唯一且带 -platform 后缀；平台名由 register_platform(name="feishu") 决定
     assert manifest["name"].endswith("-platform")
     assert "FEISHU_APP_ID" in [e["name"] for e in manifest["requires_env"]]
+    # manifest v2：hermes 版本下限必须声明且真实（catalog 准入要求）
+    assert manifest.get("requires_hermes")
+    assert manifest.get("optional_env"), "可选 env（webhook/allowlist/home channel）应进 setup 向导"
+    assert manifest.get("homepage") and manifest.get("license")
+
+
+def test_register_passes_official_contract_surfaces(monkeypatch) -> None:
+    """同名顶替后必须继承内置 feishu 条目的契约面（is_connected/validate_config/
+    ensure_deps_fn/apply_yaml_config_fn/setup_fn），否则 gateway setup/status 对
+    feishu 整体回归。实现延迟解析自官方模块——此处注入桩验证接线，不依赖源树。"""
+    from types import SimpleNamespace
+
+    import plugin as plugin_pkg
+    from plugin import register
+
+    monkeypatch.setattr(plugin_pkg, "_OFFICIAL_HELPERS", {
+        "_is_connected": lambda cfg: bool((getattr(cfg, "extra", None) or {}).get("app_id")),
+        "check_feishu_requirements": lambda: True,
+        "_apply_yaml_config": lambda yaml_cfg, feishu_cfg: {"allow_bots": True},
+        "interactive_setup": lambda: None,
+    })
+
+    ctx = MagicMock()
+    register(ctx)
+    kwargs = ctx.register_platform.call_args.kwargs
+    assert callable(kwargs["is_connected"]) and callable(kwargs["validate_config"])
+    assert callable(kwargs["ensure_deps_fn"]) and callable(kwargs["setup_fn"])
+    assert callable(kwargs["apply_yaml_config_fn"])
+    connected = kwargs["is_connected"]
+    assert connected(SimpleNamespace(extra={"app_id": "cli_x"})) is True
+    assert connected(SimpleNamespace(extra={})) is False
+
+
+def test_scoped_env_fallback_reads_through_secret_scope(monkeypatch) -> None:
+    """_LazyClient 无绑定回退必须走 get_scoped_secret（multiplex 下绝不裸读 os.environ）.
+
+    开发 venv 导不进 gateway.platforms._shared（缺 hermes_yaml，真实运行时才有），
+    所以用桩模块验证接线；hermes 不可导入时返回空（宁缺勿串）。
+    """
+    import os
+    import types
+
+    from plugin import _LazyClient, _scoped_env
+
+    stub = types.ModuleType("gateway.platforms._shared")
+    # 单 profile/default 作用域的官方回退语义 = 本 profile 的 os.getenv
+    stub.get_scoped_secret = lambda name, default=None: os.environ.get(name, default)
+    monkeypatch.setitem(sys.modules, "gateway.platforms._shared", stub)
+
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_scoped_probe")
+    assert _scoped_env("FEISHU_APP_ID") == "cli_scoped_probe"
+    monkeypatch.delenv("FEISHU_APP_ID")
+    assert _scoped_env("FEISHU_APP_ID") == ""
+
+    # _build 无绑定时经 scoped 凭据构造 vendor client（空凭据抛 ValueError，
+    # 与旧行为一致——回退从来只在有凭据时可用）
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_build_probe")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "sec_probe")
+    built = _LazyClient()._build()
+    assert built is not None and built.config.app_id == "cli_build_probe"
+
+    # hermes 不可导入 → 空字符串，不回退 os.environ。
+    # 完整 dotted name 置 None 才能让 `from gateway.platforms._shared import ...`
+    # 抛 ImportError（子模块槽位被 stub 占着时 parent 置 None 不会触发导入）
+    monkeypatch.setitem(sys.modules, "gateway.platforms._shared", None)
+    monkeypatch.setitem(sys.modules, "gateway", None)
+    assert _scoped_env("FEISHU_APP_ID") == ""
 
 
 def test_register_replaces_bundled_feishu() -> None:

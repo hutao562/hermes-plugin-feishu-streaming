@@ -197,6 +197,9 @@ class ChatCardEngine:
         # 重新锚定回合身份）——两个锚都算本回合，防 followup 边界拦腰拆卡
         new.accepted_anchors = {a for a in (session.redirect_anchor,
                                             session.reply_to) if a}
+        # 立刻置终态：seal 是异步任务（cardkit close+update 要走网络），期间旧
+        # 会话若仍计为 streaming，全局 reasoning 路由会把新回合的思考误送旧卡
+        session.state = "completed"
         self._sessions[chat_id] = new
         self._ensure_session(chat_id)  # 新卡立刻建，不等首条 draft
         self._seal_session(session, notice="↪ 任务已按新指令重启，结果见下方新卡片")
@@ -547,7 +550,10 @@ class ChatCardEngine:
             return
         session.card_id = card_id
         session.card_msg_id = card_msg_id
-        session.state = "streaming"
+        if session.state == "creating":
+            # 建 card 期间会话可能已被 redirect 边界同步置终态（旧卡 seal 流程）：
+            # 不得复活为 streaming，否则全局 reasoning 路由把新回合思考当串扰丢掉
+            session.state = "streaming"
         if session.flush is not None:
             session.flush.set_card_message_ready(True)
         self._schedule(session)
