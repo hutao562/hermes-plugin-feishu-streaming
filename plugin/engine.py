@@ -431,9 +431,10 @@ class ChatCardEngine:
                 footer_show_label=self._footer_show_label,
                 footer_enabled=self._footer_enabled,
                 # 被打断的卡红色收尾（用户决策）：redirect 旧卡一眼可辨，
-                # NOTICE 文案说明结果在新卡。注入模式原为绿色，此处按需变更
+                # NOTICE 文案说明结果在新卡。注入模式原为绿色，此处按需变更。
+                # 红标只活在 header 里——异常态强制显示 header，不受配置默认关闭影响
                 is_aborted=bool(notice),
-                header_enabled=self._header_enabled,
+                header_enabled=self._header_enabled or bool(notice),
                 body_text_size=self._body_text_size,
                 show_tool_use=self._show_tool_use,
                 width_mode=self._width_mode,

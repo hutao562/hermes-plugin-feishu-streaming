@@ -67,6 +67,9 @@ def register(ctx: Any) -> None:
         footer_fields=_footer_config("fields"),
         footer_show_label=_footer_config("show_label", False),
         footer_enabled=_footer_config("enabled", True),
+        # header（完成态状态条）与注入模式同源读 streaming.header 段；
+        # 漏接会让红卡等 header 依赖特性静默失效
+        header_enabled=_header_config(),
     )
 
     ctx.register_platform(
@@ -106,6 +109,16 @@ def _footer_config(key: str, default: Any = None) -> Any:
         return value if value is not None else default
     except Exception:
         return default
+
+
+def _header_config() -> bool:
+    """读 HERMES_HOME/config.yaml 的 streaming.header.enabled（默认 false）."""
+    try:
+        from ._vendor.config import Config
+
+        return Config().header_enabled
+    except Exception:
+        return False
 
 
 def _feishu_deps_present() -> bool:
