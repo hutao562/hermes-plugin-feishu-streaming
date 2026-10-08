@@ -140,7 +140,8 @@ class StreamingFeishuMixin:
             # ↪ redirect（用户纠正、interrupt 注入新指令）额外打标记：下一个
             # draft 收旧卡开新卡（interrupt 不换 event_message_id，锚检测覆盖不到）
             if content.lstrip().startswith("↪"):
-                engine.mark_redirect(chat_id)
+                # ack 的 reply_to = 用户纠正消息 id（hermes 锚到新消息）→ 新卡 reply 引用它
+                engine.mark_redirect(chat_id, anchor=reply_to)
             engine.on_heartbeat(chat_id, content)
             return _compat.send_result(success=True,
                                        message_id=f"lark-card:{session.card_msg_id}")
