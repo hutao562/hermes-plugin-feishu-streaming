@@ -25,6 +25,7 @@ from ._vendor.cardkit.builder import (
     HEARTBEAT_ELEMENT_ID,
     build_complete_card,
     build_streaming_card_v2,
+    cap_reasoning_text,
 )
 from ._vendor.cardkit.markdown import optimize_markdown_style
 from ._vendor.streaming.flush import FlushController
@@ -568,7 +569,11 @@ class ChatCardEngine:
         for seg in segments:
             if not seg.created or not seg.dirty:
                 continue
-            content = optimize_markdown_style(seg.text) or " "
+            # 思考面板摘录口径与完成重渲一致（cap_reasoning_text），防长思考
+            # 流式全文把卡片体积推过飞书上限；回答正文是交付物，不截断
+            raw = (cap_reasoning_text(seg.text)
+                   if seg.type == SegmentType.REASONING else seg.text)
+            content = optimize_markdown_style(raw) or " "
             session.sequence += 1
             try:
                 await self._client.cardkit_stream_element(
