@@ -706,3 +706,61 @@ async def test_interrupted_card_forces_red_header_even_if_disabled() -> None:
     new_card = json.dumps(engine._client.cardkit_update.call_args_list[-1].args[1],
                           ensure_ascii=False)
     assert '"header"' not in new_card
+
+
+# ── 折叠区摘要化：思考头尾摘录 + 工具步数封顶（防卡片体积爆炸）──
+
+
+def test_cap_reasoning_text_head_tail_excerpt() -> None:
+    from plugin._vendor.cardkit.builder import cap_reasoning_text
+
+    short = "短思考" * 50  # 150 字
+    assert cap_reasoning_text(short) == short
+
+    long_text = "思" * 3000
+    capped = cap_reasoning_text(long_text)
+    assert len(capped) < 1100, "摘录应远小于原文"
+    assert "思考原文共 3000 字" in capped
+    assert capped.startswith("思" * 600)
+    assert capped.endswith("思" * 300)
+
+
+def test_reasoning_panel_single_element_bounded() -> None:
+    from plugin._vendor.cardkit.builder import _build_reasoning_panel
+
+    panel = _build_reasoning_panel("考" * 5000, expanded=False)
+    md = [e for e in panel["elements"] if e.get("tag") == "markdown"]
+    assert len(md) == 1, "摘录后应单元素（原 2400 分块已移除）"
+    assert len(md[0]["content"]) < 1100
+    assert "中间省略" in md[0]["content"]
+
+
+def test_tool_panel_caps_steps_to_recent() -> None:
+    from plugin._vendor.cardkit.builder import _build_tool_panel
+
+    steps = [{"title": f"step{i}", "status": "done", "icon": "✅",
+              "label": f"步骤{i}"} for i in range(20)]
+    panel = _build_tool_panel(steps)
+    title = panel["header"]["title"]["content"]
+    assert "20" in title, "标题计数保持全量"
+    body = str(panel["elements"])
+    assert "已折叠前 5 步" in body
+    assert "step19" in body and "step15" in body
+    assert "step0" not in body and "step4" not in body, "只显示最近 15 步"
+
+
+@pytest.mark.asyncio
+async def test_engine_streams_capped_reasoning() -> None:
+    """流式路径：长思考经 cardkit_stream_element 下发的是摘录不是全文."""
+    engine = ChatCardEngine(_mock_client())
+    engine.on_draft("chat1", "回答", reply_to="om_a")
+    await _settle(engine)
+    engine.on_reasoning("chat1", "想" * 4000)
+    await _settle(engine)
+
+    contents = [c.args[2] for c in engine._client.cardkit_stream_element.call_args_list]
+    reasoning_sends = [c for c in contents if isinstance(c, str) and len(c) > 50]
+    assert reasoning_sends, "应有思考文本流式下发"
+    biggest = max(reasoning_sends, key=len)
+    assert len(biggest) < 1200, f"流式思考应封顶，实测 {len(biggest)}"
+    assert "思考原文共" in biggest or "想" * 4000 not in biggest

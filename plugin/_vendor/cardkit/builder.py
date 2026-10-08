@@ -125,6 +125,10 @@ def _build_heartbeat_element(content: str = " ") -> dict:
     }
 
 
+# 工具面板显示步数上限：长 agent 回合动辄几十步，全量渲染会撑爆卡片体积
+_TOOL_STEPS_SHOWN = 15
+
+
 def _build_tool_panel(
     steps: list[ToolDisplayStep],
     elapsed_ms: float = 0,
@@ -145,15 +149,29 @@ def _build_tool_panel(
     else:
         prefix = "🛠️ "
         en_parts, zh_parts = [en_t], [zh_t]
+    total_steps = len(steps)
+    if total_steps > _TOOL_STEPS_SHOWN:
+        # 步数封顶：只渲染最近 N 步（running 步骤恒在末尾），标题计数仍是全量
+        hidden = total_steps - _TOOL_STEPS_SHOWN
+        steps = steps[-_TOOL_STEPS_SHOWN:]
+    else:
+        hidden = 0
     if steps:
         tpl_en, tpl_zh = _T["steps"]
-        en_parts.append(tpl_en.format(len(steps), "s" if len(steps) > 1 else ""))
-        zh_parts.append(tpl_zh.format(len(steps), ""))
+        en_parts.append(tpl_en.format(total_steps, "s" if total_steps > 1 else ""))
+        zh_parts.append(tpl_zh.format(total_steps, ""))
     if elapsed_ms > 0:
         en_parts.append(f"({_format_elapsed(elapsed_ms)})")
         zh_parts.append(f"({_format_elapsed(elapsed_ms)})")
 
     children: list[dict] = []
+    if hidden:
+        children.append({
+            "tag": "markdown",
+            "content": f"…（已折叠前 {hidden} 步，共 {total_steps} 步）…",
+            "text_size": "notation",
+            "text_color": "grey",
+        })
     for s in steps:
         children.extend(_build_tool_step_elements(s))
 
@@ -275,6 +293,22 @@ def _escape_md(value: str) -> str:
     return re.sub(r"([`*_{}\[\]<>])", r"\\\1", value.replace("\\", "\\\\"))
 
 
+# 思考面板摘录上限：飞书卡片无滚动组件，长思考全文填充会撑爆卡片体积
+# （工具面板 200860 前车之鉴），折叠区只保留头尾摘录 + 总量标注
+_REASONING_HEAD_CHARS = 600
+_REASONING_TAIL_CHARS = 300
+
+
+def cap_reasoning_text(text: str, *, head: int = _REASONING_HEAD_CHARS,
+                       tail: int = _REASONING_TAIL_CHARS) -> str:
+    """长思考截断为头尾摘录；短文原样返回（流式与完成重渲共用同一口径）."""
+    if len(text) <= head + tail + 80:
+        return text
+    omitted = len(text) - head - tail
+    return (f"{text[:head]}\n\n…（思考原文共 {len(text)} 字，"
+            f"中间省略 {omitted} 字）…\n\n{text[-tail:]}")
+
+
 def _build_reasoning_panel(
     text: str, elapsed_ms: float = 0, *, expanded: bool = False, element_id: str | None = None,
     text_element_id: str | None = REASONING_TEXT_ELEMENT_ID,
@@ -286,14 +320,13 @@ def _build_reasoning_panel(
         en_label, zh_label = _T["thinking_panel"]
     else:
         en_label, zh_label = _T["thought"]
-    # 2026-08-07 A方案：reasoning 合并为单面板后文本可能超长，按 2400 字符分块
-    # 放多个 markdown 元素，避免单元素超飞书长度上限导致整卡被拒。
-    chunks = _split_long_text(text) if text.strip() else [text]
+    # 摘录封顶后恒 ≤ head+tail+标注，单 markdown 元素足够；原 2400 字符分块
+    # 仅服务无上限全文，随摘录方案移除
+    chunks = [cap_reasoning_text(text)] if text.strip() else [text]
     inner_elements: list[dict] = []
     for i, chunk in enumerate(chunks):
         el: dict = {"tag": "markdown", "content": chunk, "text_size": "notation"}
         if text_element_id and i == 0:
-            # 流式更新只精确到第一个分块元素（旧行为兼容）；后续分块无 element_id
             el["element_id"] = text_element_id
         inner_elements.append(el)
     panel = _collapsible_panel(
