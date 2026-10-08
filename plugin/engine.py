@@ -57,8 +57,11 @@ class ChatSession:
     card_id: str | None = None
     card_msg_id: str | None = None
     answer_seg: Segment | None = None
-    redirected: bool = False  # ↪ redirect ack 已见：下一 draft 收旧开新
+    redirected: bool = False  # 诊断标记：本回合被 ↪ redirect 重启（seal/replace 日志用）
     redirect_anchor: str | None = None  # redirect 新卡锚（用户纠正消息 id，来自 ack reply_to）
+    # redirect 残尾拦截：旧 model 请求被取消前挤出的快照是老回合内容的超集，
+    # 前缀比对命中即丢弃，防老答案闪进新卡；首个不相关内容通过后清空
+    straggler_guard: str = ""
     # 本回合可接受的 draft 锚集合（followup 边界判定用）。redirect 场景同回合
     # 会出现两个锚（新指令消息 + 老回合消息），都算本回合不算新回合。
     accepted_anchors: set[str] = field(default_factory=set)
@@ -166,18 +169,37 @@ class ChatCardEngine:
         # typing 2s 心跳循环的重复调用：会话健在时静默（此前每 2s 刷一条）
 
     def mark_redirect(self, chat_id: str, anchor: str | None = None) -> None:
-        """↪ redirect ack（用户纠正、interrupt 模式）→ 标记当前会话：下一个
-        draft 到来时收旧开新（同锚——interrupt 注入新指令不换 event_message_id，
-        锚变化检测覆盖不到，此为唯一信号）。anchor 是 ack 的 reply_to（= 用户
-        纠正消息 id，hermes _send_busy_reply 用 _reply_anchor_for_event(event)
-        锚到新消息）——新卡 reply 引用它；不带时回退旧锚。"""
+        """↪ redirect ack（用户纠正、interrupt 模式）→ **立即收旧开新**.
+
+        hermes redirect 是同一运行回合改锚续跑（agent.redirect 取消当前 model
+        请求、注入纠正、循环重试），不换消息身份——draft 锚不变，锚变化检测
+        覆盖不到。此前边界挂在「首个有内容的 draft」上：思考/工具阶段全部画
+        在老卡，新卡开卡即接近成品。现在 ack 一到就拆：旧卡红标 NOTICE 收尾，
+        新卡立刻以纠正消息为锚建卡（loading 起步），本回合后续 reasoning/
+        工具/正文从第一毫秒起全部流进新卡。
+
+        anchor 是 ack 的 reply_to（= 用户纠正消息 id，hermes _send_busy_reply
+        锚到新消息）——新卡 reply 引用它；不带时回退旧锚。旧请求取消前的
+        残尾快照由 straggler_guard 在 on_draft 里前缀拦截。"""
         session = self.active_session(chat_id)
-        if session is not None:
-            session.redirected = True
-            if anchor:
-                session.redirect_anchor = anchor
-            _logger.info("[feishu-streaming] redirect marked: chat=%s anchor=%s",
-                         chat_id[:12], (anchor or "-")[:12])
+        if session is None:
+            return
+        self._capture_loop()
+        session.redirected = True  # 诊断：seal/replace 日志标识这是被重启的回合
+        if anchor:
+            session.redirect_anchor = anchor
+        _logger.info("[feishu-streaming] redirect boundary at ack: chat=%s anchor=%s",
+                     chat_id[:12], (anchor or "-")[:12])
+        new = ChatSession(
+            chat_id=chat_id, reply_to=session.redirect_anchor or session.reply_to,
+            straggler_guard=(session.answer_seg.text if session.answer_seg else ""))
+        # redirected 回合的 draft 锚会中途变回老消息 id（工具边界换 consumer
+        # 重新锚定回合身份）——两个锚都算本回合，防 followup 边界拦腰拆卡
+        new.accepted_anchors = {a for a in (session.redirect_anchor,
+                                            session.reply_to) if a}
+        self._sessions[chat_id] = new
+        self._ensure_session(chat_id)  # 新卡立刻建，不等首条 draft
+        self._seal_session(session, notice="↪ 任务已按新指令重启，结果见下方新卡片")
 
     # ── 会话查询 ──
 
@@ -210,22 +232,15 @@ class ChatCardEngine:
         """
         self._capture_loop()
         session = self._ensure_session(chat_id)
-        if (session.redirected and content and content.strip()
-                and (session.state != "creating" or session.tool_tracker.build_display_steps())):
-            # redirect 后首个有内容 draft：旧卡 NOTICE 收尾 + 开新卡。
-            # 新卡锚用用户纠正消息 id（ack reply_to）——draft 帧带的还是老回合
-            # 锚（interrupt 不换 message_id），回复引用要指向新指令。
-            _logger.info("[feishu-streaming] redirect boundary: sealing card, opening new")
-            old_session = session
-            new = ChatSession(
-                chat_id=chat_id, reply_to=session.redirect_anchor or session.reply_to)
-            # redirected 回合的 draft 锚会中途变回老消息 id（工具边界换 consumer
-            # 重新锚定回合身份）——两个锚都算本回合，防 followup 边界拦腰拆卡
-            new.accepted_anchors = {a for a in (session.redirect_anchor,
-                                                session.reply_to) if a}
-            self._sessions[chat_id] = new
-            session = self._ensure_session(chat_id)
-            self._seal_session(old_session, notice="↪ 任务已按新指令重启，结果见下方新卡片")
+        guard = session.straggler_guard
+        if guard and content and (content.startswith(guard) or guard.startswith(content)):
+            # redirect 残尾：旧请求取消前挤出的快照（老回合内容的超集），
+            # 丢弃——否则新卡开头闪现老答案，思考型模型下要挂到新请求出文本
+            _logger.info("[feishu-streaming] redirect straggler draft dropped: len=%d",
+                         len(content))
+            return
+        if guard:
+            session.straggler_guard = ""  # 首个真实新内容已过，不再拦（防误伤后续帧）
         accepted = session.accepted_anchors or (
             {session.reply_to} if session.reply_to else set())
         if (session.state != "creating" and reply_to and session.reply_to
