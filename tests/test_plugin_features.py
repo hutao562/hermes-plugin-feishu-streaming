@@ -477,6 +477,123 @@ async def test_adapter_redirect_ack_opens_new_card_immediately(adapter) -> None:
     assert any("已重定向" in t for t in heartbeat_pushes)
 
 
+# ── hook 跨 profile fan-out（安安侧 reasoning 流丢失的根因修复）──
+
+
+def _stub_hermes_plugin_scope(monkeypatch: Any, profiles: list[tuple[str, str]]) -> Any:
+    """替身 hermes_cli.plugins / profiles / hermes_constants（公开面形态）.
+
+    替身暴露 get_plugin_manager()（按 override 栈顶 home 建+缓存 manager）+
+    PluginContext（官方 facade 形态：register_hook 落 manager._hooks）。必须用
+    ModuleType（SimpleNamespace 缺 __name__，`from X import Y` 的子模块回退会
+    拿不到位置信息直接 ImportError）。
+    """
+    import sys
+    import types
+
+    managers: dict[str, Any] = {}
+
+    plugins_mod = types.ModuleType("hermes_cli.plugins")
+
+    class _Mgr:
+        def __init__(self, scope_key: str | None = None) -> None:
+            self.scope_key = scope_key
+            self._hooks: dict[str, list[Any]] = {}
+
+    class _Ctx:
+        def __init__(self, manifest: Any, manager: Any) -> None:
+            self.manifest = manifest
+            self._manager = manager
+
+        def register_hook(self, name: str, cb: Any) -> None:
+            self._manager._hooks.setdefault(name, []).append(cb)
+
+    stack = [str(profiles[0][1])]  # 模拟 override 栈：栈顶 = 当前 home（discovery scope）
+
+    def get_plugin_manager() -> Any:
+        mgr = managers.get(stack[-1])
+        if mgr is None:
+            mgr = _Mgr(scope_key=stack[-1])
+            managers[stack[-1]] = mgr
+        return mgr
+
+    plugins_mod.PluginManager = _Mgr
+    plugins_mod.PluginContext = _Ctx
+    plugins_mod.get_plugin_manager = get_plugin_manager
+    plugins_mod._managers = managers  # 测试断言入口
+
+    pkg = types.ModuleType("hermes_cli")
+    pkg.plugins = plugins_mod
+    profiles_mod = types.ModuleType("hermes_cli.profiles")
+    profiles_mod.profiles_to_serve = lambda multiplex=True: profiles
+    constants_mod = types.ModuleType("hermes_constants")
+
+    def set_override(home: str) -> int:
+        stack.append(str(home))
+        return len(stack)
+
+    def reset_override(token: int) -> None:
+        del stack[token - 1:]
+
+    constants_mod.hermes_home_key = lambda home=None: str(home) if home else stack[-1]
+    constants_mod.set_hermes_home_override = set_override
+    constants_mod.reset_hermes_home_override = reset_override
+    monkeypatch.setitem(sys.modules, "hermes_cli", pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins_mod)
+    monkeypatch.setitem(sys.modules, "hermes_cli.profiles", profiles_mod)
+    monkeypatch.setitem(sys.modules, "hermes_constants", constants_mod)
+    return plugins_mod
+
+
+def test_hook_fanout_registers_into_other_profile_manager(monkeypatch: Any) -> None:
+    import plugin as plugin_pkg
+
+    plugins_mod = _stub_hermes_plugin_scope(
+        monkeypatch, [("default", "/hermes"), ("family", "/home-family")])
+    cb = lambda **kw: None  # noqa: E731
+    plugin_pkg._FANED_HOOK_IDS.clear()
+
+    plugin_pkg._fanout_hooks_to_profile_scopes({"on_stream_delta": cb}, manifest=object())
+    mgr = plugins_mod._managers["/home-family"]
+    assert mgr._hooks["on_stream_delta"] == [cb]
+    # 当前 scope 不重复注册（profiles 里 default == current 被跳过）
+    assert "/hermes" not in plugins_mod._managers
+
+
+def test_hook_fanout_reuses_existing_manager_and_dedupes(monkeypatch: Any) -> None:
+    import plugin as plugin_pkg
+
+    plugins_mod = _stub_hermes_plugin_scope(
+        monkeypatch, [("default", "/hermes"), ("family", "/home-family")])
+    cb = lambda **kw: None  # noqa: E731
+    plugin_pkg._FANED_HOOK_IDS.clear()
+
+    plugin_pkg._fanout_hooks_to_profile_scopes({"on_stream_delta": cb}, manifest=object())
+    plugin_pkg._fanout_hooks_to_profile_scopes({"on_stream_delta": cb}, manifest=object())  # 重跑幂等
+    assert len(plugins_mod._managers) == 1, "重跑经 override 后的官方缓存复用同一 manager"
+    mgr = next(iter(plugins_mod._managers.values()))
+    assert mgr.scope_key == "/home-family"
+    assert mgr._hooks["on_stream_delta"] == [cb]
+
+
+@pytest.mark.asyncio
+async def test_redirect_old_session_terminal_immediately() -> None:
+    """ack 即把旧会话置终态（不等异步 seal）：reasoning 全局路由立刻只看新会话.
+
+    seal 要走 cardkit close+update 两跳网络，期间旧会话若仍计为 streaming，
+    多会话守卫会把新回合的思考流判成串扰丢弃或错送旧卡。
+    """
+    engine = ChatCardEngine(_mock_client())
+    engine.on_draft("chat1", "旧回答", reply_to="om_a")
+    await _settle(engine)
+    old = engine.session_for("chat1")
+    assert old.state == "streaming"
+
+    engine.mark_redirect("chat1", anchor="om_new")
+    assert old.state == "completed"  # 同步置终态，不等异步 seal
+    assert engine.streaming_sessions() == []  # 旧卡已出全局流式路由，新卡尚在 creating
+
+
 # ── footer：形态对齐注入模式配置 ──
 
 

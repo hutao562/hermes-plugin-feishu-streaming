@@ -233,8 +233,7 @@ def check_deploy_freshness(report: Report, repo_plugin_dir: Path | None, deploye
             stale.append(rel)
     if stale:
         report.add("部署一致性", WARN, f"{len(stale)} 个文件落后于仓库（如 {stale[0]}）",
-                   "rm -rf ~/.hermes/plugins/feishu-streaming && cp -R plugin ~/.hermes/plugins/feishu-streaming"
-                   " && 网关重启")
+                   "删除旧的部署目录后重新拷贝 plugin/（命令见 README「更新」章节），并重启网关")
     else:
         report.add("部署一致性", OK, "部署目录与仓库一致")
 
