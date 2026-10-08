@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from hermes_lark_streaming.feishu import FeishuAPIError, FeishuClient
+from plugin._vendor.feishu import FeishuAPIError, FeishuClient
 
 
 class _Resp:

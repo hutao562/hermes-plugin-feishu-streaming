@@ -129,7 +129,7 @@ async def test_tool_lifecycle_updates_tracker_and_panel(engine: ChatCardEngine) 
 
 @pytest.mark.asyncio
 async def test_heartbeat_goes_to_heartbeat_element(engine: ChatCardEngine) -> None:
-    from hermes_lark_streaming.cardkit.builder import HEARTBEAT_ELEMENT_ID
+    from plugin._vendor.cardkit.builder import HEARTBEAT_ELEMENT_ID
 
     engine.on_draft("chat1", "工作中")
     await _settle(engine)

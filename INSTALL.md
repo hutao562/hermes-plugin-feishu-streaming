@@ -1,152 +1,97 @@
-# Installation Guide — hermes-lark-streaming
+# Installation Guide — feishu-streaming (platform plugin)
 
-A step-by-step guide to install the hermes-lark-streaming plugin into an existing
-Hermes Agent deployment. Intended to be read and executed by an AI agent or a
-human following the commands verbatim.
+A step-by-step guide to install the feishu-streaming platform plugin into an
+existing Hermes Agent deployment. Intended to be read and executed by an AI
+agent or a human following the commands verbatim.
+
+本插件是 `kind: platform` 的 hermes 插件：**自包含、零 pip 安装**——部署 =
+拷贝目录 + 两处 config 开关 + 重启网关。
 
 ## Requirements
 
-- Hermes Agent `>= 0.14.0` is installed and the `hermes` command is on `PATH`
-  (`hermes --version` works).
-- If `hermes` is not on `PATH`, stop — fix the Hermes installation first.
+- Hermes Agent `>= 0.21.1`，`hermes` 命令可用（`hermes --version` 正常），
+  且飞书平台已配置（官方 FeishuAdapter 能收发消息）。
+- 若 `hermes` 不在 PATH，先修 Hermes 安装。
+- 无需 pip 安装任何包：插件自包含，只依赖 hermes 运行环境已有的 `lark-oapi`。
 
-## Step 1 — Locate Hermes's Python
-
-The plugin MUST be installed into Hermes's own venv (the gateway imports it at
-runtime). Find that venv's Python interpreter:
+## Step 1 — Deploy the plugin directory
 
 ```bash
-# Read the venv path from the hermes CLI wrapper, then derive python3
-HERMES_PYTHON=$(grep -oE 'exec "[^"]+"' "$(which hermes)" | sed 's/exec "//;s/"//')
-HERMES_PYTHON=$(dirname "$HERMES_PYTHON")/python3
-
-# Fallback (per-user default) if the command above yields nothing
-[ -z "$HERMES_PYTHON" ] || [ ! -x "$HERMES_PYTHON" ] && HERMES_PYTHON=~/.hermes/hermes-agent/venv/bin/python3
+git clone https://github.com/Cheerwhy/hermes-lark-streaming.git
+cp -R hermes-lark-streaming/plugin ~/.hermes/plugins/feishu-streaming
 ```
 
-Verify it exists and is Python 3.11+:
+部署后自检（可选但推荐）：
 
 ```bash
-"$HERMES_PYTHON" --version
+python3 ~/.hermes/plugins/feishu-streaming/doctor.py
 ```
 
-## Step 2 — Install the plugin into Hermes's venv
+## Step 2 — Enable in config.yaml
 
-```bash
-# Clone only if not already present (re-runs / updates skip this)
-[ -d hermes-lark-streaming ] || git clone https://github.com/Cheerwhy/hermes-lark-streaming.git
-cd hermes-lark-streaming
-"$HERMES_PYTHON" -m pip install -e .
-```
-
-## Step 3 — Verify environment and compatibility
-
-```bash
-"$HERMES_PYTHON" -m hermes_lark_streaming status
-"$HERMES_PYTHON" -m hermes_lark_streaming verify
-```
-
-`status` must show:
-
-- `Hermes Python:` pointing to `$HERMES_PYTHON`
-- `Hermes install dir:` pointing to the Hermes source tree
-- No `warning:` line under `Hermes Python:`
-
-`verify` must print `Compatible.` for both targets. If it reports
-`Incompatible:`, the Hermes version is unsupported — do not proceed.
-
-If a status warning appears, the CLI ran under the wrong interpreter — rerun
-using the exact `$HERMES_PYTHON` path printed.
-
-## Step 4 — Configure Feishu / Lark credentials
-
-The plugin needs app credentials for Feishu (or Lark / Larksuite). Set them as
-environment variables **persisted to Hermes's `.env`** (so the gateway sees them
-after restart), or in `~/.hermes/config.yaml`:
-
-```bash
-# Option A — write to ~/.hermes/.env (read by the gateway on start)
-cat >> ~/.hermes/.env <<'EOF'
-FEISHU_APP_ID=cli_xxxxx
-FEISHU_APP_SECRET=xxxxx
-EOF
-chmod 600 ~/.hermes/.env
-```
+编辑 `~/.hermes/config.yaml`（**两处开关缺一不可**，这是历史上最常见的
+「装了没卡片」原因）：
 
 ```yaml
-# Option B — ~/.hermes/config.yaml
-feishu:
-  app_id: cli_xxxxx
-  app_secret: xxxxx
-```
-
-For **Lark / Larksuite** (international), use the `lark` section and set the SDK
-base URL:
-
-```yaml
-lark:
-  app_id: cli_xxxxx
-  app_secret: xxxxx
-  base_url: https://open.larksuite.com
-```
-
-Also enable streaming in the same config:
-
-```yaml
+plugins:
+  enabled:
+    - feishu-streaming-platform   # platform 插件是 opt-in，必须显式列出
 streaming:
-  enabled: true
+  enabled: true                   # 官方 draft transport 总开关
+display:
+  platforms:
+    feishu:
+      streaming: true             # 官方 draft 契约开关
 ```
 
-## Step 5 — Install the hooks
+凭据复用官方飞书平台的配置（`FEISHU_APP_ID` / `FEISHU_APP_SECRET` 环境变量或
+`~/.hermes/.env`），本插件不单独管理凭据。
 
-```bash
-"$HERMES_PYTHON" -m hermes_lark_streaming install
-```
+multiplex 网关（多 profile）：插件注册后会自动 fan-out 到每个 live profile；
+某个 profile 要退出流式，在自己的 config.yaml 写
+`plugins.disabled: [feishu-streaming-platform]`。
 
-This patches `gateway/run.py` and `cron/scheduler.py` in place. A `.hermes_lark.bak`
-backup is created next to each file.
-
-## Step 6 — Restart the gateway
+## Step 3 — Restart the gateway
 
 ```bash
 hermes gateway restart
 ```
 
-## Step 7 — Post-install verification
+重启约 50 秒，会打断进行中的回合。确认插件装配：
 
 ```bash
-"$HERMES_PYTHON" -m hermes_lark_streaming status
+grep "adapter factory" ~/.hermes/logs/gateway.log | tail
+# 每个 profile 应有一行 "... -> StreamingFeishuAdapter"
 ```
 
-All hooks should read `installed`, and `Feishu credentials:` should read
-`configured`.
+## Step 4 — Verify
+
+```bash
+python3 ~/.hermes/plugins/feishu-streaming/doctor.py
+```
+
+发一条飞书消息：应立即出现流式卡片（带工具的回合，工具面板从第一步就滚动）。
 
 ## Uninstall
 
 ```bash
-"$HERMES_PYTHON" -m hermes_lark_streaming uninstall
-"$HERMES_PYTHON" -m pip uninstall hermes-lark-streaming
+rm -rf ~/.hermes/plugins/feishu-streaming
+# config.yaml 的 plugins.enabled 移除 feishu-streaming-platform
+hermes gateway restart    # 回退官方内置飞书适配器（无流式卡片）
 ```
 
-## Update
+## Rollback to the archived injection mode
+
+v0.14.0 之前的 AST 注入形态已归档（完整实现保留在 git tag 里）：
 
 ```bash
-cd hermes-lark-streaming
-git pull
-"$HERMES_PYTHON" -m pip install -e .
-"$HERMES_PYTHON" -m hermes_lark_streaming uninstall   # remove old injection
-"$HERMES_PYTHON" -m hermes_lark_streaming verify
-"$HERMES_PYTHON" -m hermes_lark_streaming install
-hermes gateway restart
+git checkout archive/injection-mode
+# 按该版本的 README/INSTALL.md 操作（pip install -e . + install 命令）
 ```
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `ModuleNotFoundError: hermes_lark_streaming` | Plugin not installed in the Python you used | Reinstall using the exact `HERMES_PYTHON` from Step 1 |
-| `status` shows `warning: running under ...` | CLI invoked with wrong interpreter | Rerun with the `$HERMES_PYTHON` path shown in the warning |
-| `verify` reports `Incompatible:` | Hermes version unsupported or changed anchors | Check Hermes version `>= 0.14.0`; wait for a plugin update |
-| `gateway/run.py not found` | Hermes install layout not recognized | Run `cat "$(which hermes)"` to find the venv, then set `HERMES_PYTHON` manually |
-| Credentials `MISSING` in `status` | Env vars / config not set, or not persisted | Complete Step 4; ensure credentials are in `~/.hermes/.env` or `config.yaml`, then restart the gateway |
-| Gateway fails to load plugin after restart | Plugin installed into the wrong venv | Confirm `status` shows no warning before restarting |
+- 一切异常先跑 `doctor.py`；它覆盖本插件历史上所有静默失效模式。
+- 网关日志诊断：`grep '\[feishu-streaming\]' ~/.hermes/logs/gateway.log`。
+- 常见病征（卡片超体积 / sequence 冲突 / 非法 reply 目标）doctor 会直接标出，
+  详见仓库 AGENTS.md。

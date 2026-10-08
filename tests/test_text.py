@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_lark_streaming.streaming.text import (
+from plugin._vendor.streaming.text import (
     extract_thinking_content,
     split_reasoning_text,
     strip_reasoning_tags,

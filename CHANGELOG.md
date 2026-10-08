@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.14.0] - 2026-10-08
+
+### Breaking / 破坏
+
+- **注入形态归档**：仓库只保留 platform 插件形态（`plugin/`，`kind: platform`）。AST 注入形态（`hermes_lark_streaming/` 包、`install`/`uninstall` CLI、watchdog、self-heal）完整保留在 git tag `archive/injection-mode`。仓库不再是可 pip 安装的包——分发物 = 插件目录拷贝。
+- 生产形态自 2026-10-07 起已是插件模式；本次为代码层面的正式收敛。
+
+### Added / 新增
+
+- **doctor 自检脚本**（`plugin/doctor.py`）：只读诊断，随插件目录分发、零安装依赖。覆盖 config 双开关、multiplex profile 退出开关、凭据、插件目录完整性与部署漂移、上游契约锚点、运行时 venv 的 lark-oapi、网关装配日志与错误病征、注入模式残留。支持 `--json`。
+- **上游契约单一定义源**（`plugin/contract.py`）：draft-streaming 契约锚点清单，三个通道共用——CI pinned-revision 回归（`tests/test_upstream_compat.py`）、每日对上游 main 的 hermes-check（失败自动开 issue）、doctor 本机验证。
+- `hermes-check.yml` 从「注入锚点 verify」改写为「draft 契约锚点检查」，路径触发改为 `plugin/**`。
+- `test.yml` 适配无 pip 包形态（开发依赖直装），mypy 覆盖面补上生产现役的 `plugin/`。
+
+### Changed / 变更
+
+- redirect 即刻拆卡（v0.13.x 生产演进，随本次一并记录）：↪ ack 一到立即收旧开新，思考/工具期不再画在老卡；`straggler_guard` 拦截旧请求残尾快照。
+- 注入模式专属的单测（patcher/split/controller/self-heal 等 13 个文件）随形态移除；streaming 核心单测重指到 `plugin/_vendor`（现役唯一拷贝）。
+- `plugin.yaml` 版本与项目版本统一为 0.14.0。
+
+### Removed / 移除
+
+- `hermes_lark_streaming/` 包、`reinstall_after_upgrade.sh`、`ADAPT_NEW_GATEWAY.md`（均保留于归档 tag）。
+
+### Breaking (English)
+
+- **Injection mode archived**: the repo now ships only the platform-plugin form (`plugin/`, `kind: platform`). The AST-injection implementation (the `hermes_lark_streaming/` package, the `install`/`uninstall` CLI, watchdog, self-heal) is preserved in full under git tag `archive/injection-mode`. The repo is no longer a pip-installable package — the distribution artifact is the plugin directory itself.
+- **doctor** (`plugin/doctor.py`): a read-only, dependency-free self-check script shipped inside the plugin directory (`--json` supported).
+- **Upstream contract single source** (`plugin/contract.py`): draft-streaming contract anchors consumed by CI pinned-revision tests, the daily upstream-main check (auto-files an issue on break), and doctor.
+
+---
+
 ## [0.13.0] - 2026-09-22
 
 ### 变更

@@ -1,14 +1,14 @@
 name: feishu-streaming-platform
 label: Feishu Streaming Cards (CardKit v2)
 kind: platform
-version: 0.1.0
+version: 0.14.0
 description: >-
   Feishu/Lark platform adapter with CardKit v2 draft-streaming cards:
   typewriter streaming, structured tool panel, in-card heartbeat,
   document delivery under the card, and cron card delivery.
   Subclasses the bundled FeishuAdapter and replaces it per profile
   (register_platform name="feishu", last-writer-wins).
-author: Cheerwhy fork (浮浮酱)
+author: Cheerwhy & contributors
 requires_env:
   - name: FEISHU_APP_ID
     description: Feishu app id

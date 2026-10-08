@@ -1,4 +1,8 @@
-"""Revision-pinned Hermes fixtures: reuse verified local files, download missing ones."""
+"""Revision-pinned Hermes fixtures: reuse verified local files, download missing ones.
+
+插件模式的上游契约检查（tests/test_upstream_compat.py）消费这些固定版本源码，
+保证「插件依赖的 draft 契约锚点」在 CI 里始终对 pinned 上游 revision 验证。
+"""
 
 from __future__ import annotations
 
@@ -12,18 +16,17 @@ import urllib.request
 from functools import cache
 from pathlib import Path
 
-from hermes_lark_streaming.split_gateway import GATEWAY_FILES, inject_gateway
-
 SAMPLES_DIR = Path(__file__).parent / "samples"
 MANIFEST_PATH = Path(__file__).with_suffix(".json")
+
+# draft-streaming 契约相关上游文件（契约锚点见 plugin/contract.py）
 TREE_FILES = (
-    "gateway/run.py",
-    *(f"gateway/{name}" for name in GATEWAY_FILES),
-    # fork 本地扩展注入目标（ADAPTER_INIT / DOC_DELIVER / BG_WATCHER）
-    "gateway/run_startup.py",
-    "gateway/run_notifications.py",
-    "cron/scheduler.py",
-    "cron/scheduler_delivery.py",
+    "gateway/stream_consumer.py",
+    "gateway/stream_consumer_transport.py",
+    "gateway/stream_consumer_think.py",
+    "gateway/stream_consumer_fallback.py",
+    "gateway/stream_consumer_fences.py",
+    "gateway/run_busy.py",
 )
 
 
@@ -67,9 +70,3 @@ def _validate(relative: str, data: bytes, expected: str) -> None:
             f"Hermes fixture checksum mismatch: {relative}; "
             "remove the cached file to download the pinned version again"
         )
-
-
-@cache
-def patched_gateway(filename: str) -> str:
-    """Cache generated text only; execution namespaces remain isolated per test."""
-    return inject_gateway(filename, source_at(f"gateway/{filename}"))

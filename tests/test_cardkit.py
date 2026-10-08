@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from hermes_lark_streaming.cardkit.builder import (
+from plugin._vendor.cardkit.builder import (
     REASONING_TEXT_ELEMENT_ID,
     TOOL_PANEL_ELEMENT_ID,
     _build_footer_elements,
@@ -20,14 +20,14 @@ from hermes_lark_streaming.cardkit.builder import (
     build_complete_card,
     build_streaming_card_v2,
 )
-from hermes_lark_streaming.cardkit.markdown import (
+from plugin._vendor.cardkit.markdown import (
     _downgrade_tables,
     _find_tables_outside_code_blocks,
     _split_long_text,
     _strip_invalid_image_keys,
     optimize_markdown_style,
 )
-from hermes_lark_streaming.streaming.segments import Segment, SegmentState
+from plugin._vendor.streaming.segments import Segment, SegmentState
 
 # --- Markdown 优化 ---
 
@@ -529,7 +529,7 @@ class TestBuildSegmentCompleteCard:
 
 class TestBuildCronCard:
     def test_basic_card_structure(self) -> None:
-        from hermes_lark_streaming.cardkit.builder import build_cron_card
+        from plugin._vendor.cardkit.builder import build_cron_card
 
         card = build_cron_card("Hello **world**")
         assert card["schema"] == "2.0"
@@ -537,7 +537,7 @@ class TestBuildCronCard:
         assert "Hello **world**" in card["body"]["elements"][0]["content"]
 
     def test_summary_from_content(self) -> None:
-        from hermes_lark_streaming.cardkit.builder import build_cron_card
+        from plugin._vendor.cardkit.builder import build_cron_card
 
         card = build_cron_card("Line 1\nLine 2\n" + "x" * 200)
         summary = card["config"]["summary"]["content"]
@@ -545,20 +545,20 @@ class TestBuildCronCard:
         assert len(summary) <= 120
 
     def test_empty_content(self) -> None:
-        from hermes_lark_streaming.cardkit.builder import build_cron_card
+        from plugin._vendor.cardkit.builder import build_cron_card
 
         card = build_cron_card("")
         assert card["body"]["elements"] == []
 
     def test_table_content_preserved(self) -> None:
-        from hermes_lark_streaming.cardkit.builder import build_cron_card
+        from plugin._vendor.cardkit.builder import build_cron_card
 
         content = "| A | B |\n|---|---|\n| 1 | 2 |"
         card = build_cron_card(content)
         assert "| A | B |" in card["body"]["elements"][0]["content"]
 
     def test_image_keys_rendered_as_markdown(self) -> None:
-        from hermes_lark_streaming.cardkit.builder import build_cron_card
+        from plugin._vendor.cardkit.builder import build_cron_card
 
         card = build_cron_card("desc", image_keys=["img_v3_abc", "img_v3_def"])
         elements = card["body"]["elements"]
@@ -568,7 +568,7 @@ class TestBuildCronCard:
         assert elements[2] == {"tag": "markdown", "content": "![image](img_v3_def)"}
 
     def test_image_keys_none_no_image_elements(self) -> None:
-        from hermes_lark_streaming.cardkit.builder import build_cron_card
+        from plugin._vendor.cardkit.builder import build_cron_card
 
         card = build_cron_card("desc")
         elements = card["body"]["elements"]
@@ -576,7 +576,7 @@ class TestBuildCronCard:
         assert elements[0]["content"] == "desc"
 
     def test_header_with_task_name(self) -> None:
-        from hermes_lark_streaming.cardkit.builder import build_cron_card
+        from plugin._vendor.cardkit.builder import build_cron_card
 
         card = build_cron_card("Hello", task_name="daily-digest")
         assert card["header"]["title"]["content"] == ":Alarm: daily-digest"
@@ -584,13 +584,13 @@ class TestBuildCronCard:
         assert card["header"]["template"] == "blue"
 
     def test_no_header_without_task_name(self) -> None:
-        from hermes_lark_streaming.cardkit.builder import build_cron_card
+        from plugin._vendor.cardkit.builder import build_cron_card
 
         card = build_cron_card("Hello")
         assert "header" not in card
 
     def test_header_with_task_name_and_run_time(self) -> None:
-        from hermes_lark_streaming.cardkit.builder import build_cron_card
+        from plugin._vendor.cardkit.builder import build_cron_card
 
         card = build_cron_card(
             "Hello",
@@ -600,19 +600,19 @@ class TestBuildCronCard:
         assert card["header"]["title"]["content"] == ":Alarm: daily-digest · 2026-06-10 14:30"
 
     def test_header_with_run_time_only(self) -> None:
-        from hermes_lark_streaming.cardkit.builder import build_cron_card
+        from plugin._vendor.cardkit.builder import build_cron_card
 
         card = build_cron_card("Hello", run_time="2026-06-10T14:30:00+08:00")
         assert card["header"]["title"]["content"] == ":Alarm: 2026-06-10 14:30"
 
     def test_header_invalid_run_time_falls_back_to_raw(self) -> None:
-        from hermes_lark_streaming.cardkit.builder import build_cron_card
+        from plugin._vendor.cardkit.builder import build_cron_card
 
         card = build_cron_card("Hello", run_time="not-a-date")
         assert card["header"]["title"]["content"] == ":Alarm: not-a-date"
 
     def test_header_run_time_without_timezone(self) -> None:
-        from hermes_lark_streaming.cardkit.builder import build_cron_card
+        from plugin._vendor.cardkit.builder import build_cron_card
 
         card = build_cron_card("Hello", run_time="2026-06-10T14:30:00")
         assert card["header"]["title"]["content"] == ":Alarm: 2026-06-10 14:30"
@@ -738,7 +738,7 @@ def test_complete_card_without_answer_keeps_done_placeholder() -> None:
 
 def test_tool_output_block_capped_for_card_size() -> None:
     """超长工具输出截断（head+tail+标记）：防卡片 JSON 撑爆飞书体积上限（200860）."""
-    from hermes_lark_streaming.streaming.tooluse import _fenced_block
+    from plugin._vendor.streaming.tooluse import _fenced_block
 
     huge = "x" * 5000
     block = _fenced_block("text", huge)

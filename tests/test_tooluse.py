@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from hermes_lark_streaming.streaming.tooluse import (
+from plugin._vendor.streaming.tooluse import (
     ToolUseTracker,
     _basename_only,
     _build_display_block,
@@ -327,7 +327,7 @@ class TestToolUseTracker:
         steps = tracker.build_display_steps()
         assert "secret_value" not in steps[0]["detail"]
 
-    @patch("hermes_lark_streaming.streaming.tooluse.time")
+    @patch("plugin._vendor.streaming.tooluse.time")
     def test_step_elapsed_ms_recorded(self, mock_time: object) -> None:
         mock_time.time.side_effect = [100.0, 102.5]
         tracker = ToolUseTracker()

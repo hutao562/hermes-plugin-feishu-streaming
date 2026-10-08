@@ -2,196 +2,78 @@
 
 ## Project
 
-Hermes Gateway plugin that injects hooks into Hermes split gateway modules and `cron/scheduler_delivery.py` via AST patching to provide real-time streaming Feishu/Lark CardKit v2.0 cards with typewriter effect.
+Hermes Gateway **platform 插件**（`plugin/`，`kind: platform`）：子类化官方 `FeishuAdapter` 实现 draft-streaming 契约（`supports_draft_streaming`/`send_draft` → CardKit v2），以 `register_platform(name="feishu")` 同名注册顶替 bundled（registry last-writer-wins），把每回合回复渲染成打字机流式卡片。
 
-**⚠️ 当前生产运行形态（2026-10-07 切换）：官方 platform 插件模式**（`plugin/`，部署于 `~/.hermes/plugins/feishu-streaming/`，config `plugins.enabled: feishu-streaming-platform`）。注入模式已卸载（gateway 源码零 hook、watchdog 移除、三个 PM 环境 venv 的 entry-point 已 pip uninstall）。回滚注入模式：`pip install -e ~/ai/hermes-lark-streaming`（装回 **installs/*/environments/*/venv** 的运行环境，不是开发 venv）→ `python -m hermes_lark_streaming install` → config `plugins.enabled` 移除 `feishu-streaming-platform` → restart；config 备份在 `~/.hermes/config.yaml.bak-plugin-switch`。
+**形态（v0.14.0 收敛）**：本仓库只有这一种形态，不再是可 pip 安装的包——分发物 = `plugin/` 目录拷贝（**自包含**：底层件 vendor 在 `plugin/_vendor/`，运行环境无需安装本包）。旧 AST 注入形态已归档在 git tag `archive/injection-mode`（回滚：checkout 该 tag 按当时 README 操作）。
 
-**platform 插件形态**（`plugin/`，kind: platform）：子类化官方 `FeishuAdapter` 实现 draft-streaming 契约（`supports_draft_streaming`/`send_draft` → CardKit v2），以 `register_platform(name="feishu")` 同名注册顶替 bundled（registry last-writer-wins）。**自包含**：底层件 vendor 在 `plugin/_vendor/`（cardkit/streaming/feishu/config），运行环境无需安装本包。**凭据**：引擎的 lark client 绑定官方 adapter 实例的 client（profile secret 作用域），不读 env。**锚点**：draft 帧 metadata 的 `reply_to_message_id`（transport `_draft_metadata()` 注入）→ 卡片 reply 用户消息；无锚直发 chat（chat_id 做 reply 目标会 230001）。**sequence**：cardkit close/update 必须各自独立 +1（同号 300317）。**短回答**：transport `_MIN_NEW_MSG_CHARS=4` 吞帧 + finalize 时 draft 让位真发 → send() 无会话兜底现场开卡即完成。诊断日志 grep `[feishu-streaming]`（engine logger 走 gateway.run）。部署需 `streaming.enabled: true`（transport: auto）。
-
-**fork 特性对齐状态（2026-10-07 五特性补齐，端到端验收）**：clarify 内联单选（Mixin 类定义期覆写 `send_clarify`/`_on_card_action_trigger`/`retire_clarify_card`，零 monkey-patch；卡片构建在 `plugin/_clarify.py`；**send_clarify 绝不能走 self.send**——终态拦截会误完成 streaming 卡，text 兜底直发 `_feishu_send_with_retry`）；followup 边界（draft 锚变化=新回合→旧卡绿色收尾+开新卡）；**redirect 即刻拆卡**（2026-10-08：hermes redirect 是同回合改锚续跑、draft 锚不变，↪ ack 一到 `mark_redirect` **立即**收旧开新——旧卡红标 NOTICE 收尾、新卡以纠正消息为锚 loading 起步，思考/工具期不再画在老卡；旧请求取消前的残尾快照由 `straggler_guard` 前缀比对丢弃（防老答案闪进新卡）；ack 早于建卡完成的 creating 窗口也接得住，此时 ack 返回无 id 成功——合成 `lark-card:None` 会让后续 edit 打到原生链路）；t/s footer（`post_api_request` 钩子聚合 usage，session_id 是内部 UUID 提取不出 chat→"" 桶 fallback，`_pop_usage` 消费）；跨回合合并（send 无 notify+thread_id metadata=bg 交付特征→NOTICE 段追加进最近完成卡，**须查 session_for 含终态而非 active_session**）；心跳/busy-ack（`_interim_send`→心跳行，生产已拦截）。clarify 回调点击验证留待实际使用（单测+retire 钩子已生产触发）。
+**锚点**：draft 帧 metadata 的 `reply_to_message_id`（transport `_draft_metadata()` 注入）→ 卡片 reply 用户消息；无锚直发 chat（chat_id 做 reply 目标会 230001）。**sequence**：cardkit close/update 必须各自独立 +1（同号 300317）。**短回答**：transport `_MIN_NEW_MSG_CHARS=4` 吞帧 + finalize 时 draft 让位真发 → send() 无会话兜底现场开卡即完成。诊断日志 grep `[feishu-streaming]`（插件 logger 不进 gateway.log，engine logger 走 `gateway.run`）。部署需 `streaming.enabled: true` + `display.platforms.feishu.streaming: true`（transport: auto）。
 
 ## Commands
 
 ```bash
-# All commands must use Hermes's venv Python
 HERMES_PYTHON=~/.hermes/hermes-agent/venv/bin/python3
 
-$HERMES_PYTHON -m hermes_lark_streaming verify     # Check compatibility (safe, no file changes)
-$HERMES_PYTHON -m hermes_lark_streaming install    # Inject hooks into split gateway and cron delivery modules
-$HERMES_PYTHON -m hermes_lark_streaming uninstall  # Remove hooks
-$HERMES_PYTHON -m hermes_lark_streaming restore    # Restore from .hermes_lark.bak backup
-$HERMES_PYTHON -m hermes_lark_streaming status     # Show patch status
-
-# Install for development
-$HERMES_PYTHON -m pip install -e .
-$HERMES_PYTHON -m pip install -e ".[dev]"  # test dependencies
-
-# Lint
-$HERMES_PYTHON -m ruff check hermes_lark_streaming tests
-$HERMES_PYTHON -m mypy hermes_lark_streaming/
-
-# Run tests (reuse tests/samples cache; download missing files at pinned 0.21.1 commit)
+# 测试（上游样本按 pinned commit 缓存 tests/samples/，缺失时下载校验；e2e 默认跳过）
 $HERMES_PYTHON -m pytest tests/ -q
-
-# E2E 测试（需 Hermes 运行 + lark-cli 配置，默认跳过；CI 无飞书环境安全）
+# E2E（需 Hermes 运行 + lark-cli 配置，默认跳过）
 HERMES_HOME=~/.hermes $HERMES_PYTHON -m pytest -m e2e tests/e2e/ -v
 
-# Optional local Hermes smoke test; only an isolated temporary copy is patched
-$HERMES_PYTHON -m pytest tests/test_multifile_patcher.py -k installed_hermes --local-hermes -q
+# Lint / 类型（mypy 配置在 pyproject，files=plugin）
+$HERMES_PYTHON -m ruff check plugin tests
+$HERMES_PYTHON -m mypy
+
+# 部署（plugin/ 自包含，改完拷贝 + 重启；重启约 50s，会打断进行中回合）
+rm -rf ~/.hermes/plugins/feishu-streaming && cp -R plugin ~/.hermes/plugins/feishu-streaming
+launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway
+
+# 自检（只读；仓库内运行会额外比对部署目录漂移）
+$HERMES_PYTHON plugin/doctor.py          # 或 python3 ~/.hermes/plugins/feishu-streaming/doctor.py
 ```
+
+**上游契约检查**：`plugin/contract.py` 是单一定义源，三个通道共用——
+① `tests/test_upstream_compat.py` 对 pinned revision 回归；② 每日 hermes-check.yml 对上游 main 检查（失败自动开 hermes-compat issue）；③ doctor 对本机 hermes 验证。上游改 draft 契约时：核对语义 → 改 `plugin/adapter.py` → 同步锚点清单 + `tests/hermes_sources.json` revision。
 
 ## Architecture
 
 ```
-gateway/run_inbound.py, run_turn.py, run_turn_runner.py, run_busy.py (Hermes)
-  └─ AST-injected hooks (patcher.py defines markers; split_gateway.py locates anchors)
-       │
-       ├─ on_feishu_normalize   → patch.on_feishu_normalize() (inline, fixes false thread_id)
-       ├─ on_message_started    → controller.on_message_started()
-       ├─ on_tool_updated       → controller.on_tool_update()
-       ├─ on_answer_delta       → controller.on_answer()
-       ├─ on_thinking_delta     → controller.on_thinking()
-       ├─ on_reasoning_delta    → controller.on_reasoning()
-       ├─ on_background_review_message → controller.defer_background_review()
-       ├─ on_message_interrupted → controller.on_interrupted()
-       ├─ on_queued_followup_result   → patch.on_queued_followup_result() (carry deepest completion ID through recursive merge)
-       ├─ on_message_completed_wait → controller.on_completed_wait()
-       ├─ on_message_aborted    → controller.on_aborted()
-       ├─ on_session_aborted    → controller.on_session_aborted() (busy-session /stop)
-       ├─ on_background_deliver → controller.on_background_deliver()
-       ├─ on_document_deliver   → controller.on_document_deliver() (run_notifications _deliver_media_from_response；文件回复到卡片消息下方)
-       └─ on_busy_ack           → controller.on_busy_ack() (run_busy _send_busy_reply；redirect/queue 提示进卡片心跳状态行)
-  └─ ADAPTER_INIT (injected AFTER gateway:startup emit in start()) → clarify.patch_feishu_adapter(self.adapters)
-       └─ patches FeishuAdapter.send_clarify (class method) + replaces SDK card-action processor.f (clarify inline single-select)
-
-cron/scheduler_delivery.py (Hermes)
-  └─ CronPatcher + split_cron inject into live and standalone delivery lanes
-       └─ intercepts feishu/lark targets → build_cron_card → send_card_to_chat
-
-StreamCardController (singleton, controller.py)
-  ├─ CardSession per message (state machine: IDLE→CREATING→STREAMING→COMPLETED/FAILED/ABORTED)
-  │   └─ stream segments: CardSession.segment_state (SegmentState)
-  ├─ _session_keys — Hermes session_key → active CardSession mapping for precise /stop handling
-  ├─ _interrupt_map — old_message_id → new_message_id mapping for interrupt redirect
-  ├─ FlushController (streaming/flush.py) — throttles CardKit updates (100ms)
-  ├─ ToolUseTracker (streaming/tooluse.py) — tracks tool call lifecycle with icon/status mapping
-  ├─ UnavailableGuard (streaming/unavailable_guard.py) — auto-terminates on message delete/recall
-  └─ ImageResolver (streaming/image.py) — async download + re-upload markdown images as Feishu img_key
-
-Streaming card runtime (streaming/)
-  ├─ controller.py — StreamingController: create card, flush, split/rollover, and cron delivery orchestration
-  ├─ session.py — CardSession per message (state machine: IDLE→CREATING→STREAMING→COMPLETED/FAILED/ABORTED)
-  ├─ segments.py — SegmentState: flat segment list (reasoning / answer / tool), same-type appends, cross-type creates new
-  ├─ segment_helper.py — CardKit action builders, element estimates, and tool split point selection
-  ├─ text.py — reasoning tag parsing and final answer text cleanup
-  ├─ flush.py — FlushController: throttles CardKit updates (100ms)
-  ├─ tooluse.py — ToolUseTracker: tool call lifecycle tracking with icon/status mapping
-  ├─ image.py — ImageResolver: async download + re-upload markdown images as Feishu img_key
-  └─ unavailable_guard.py — UnavailableGuard: auto-terminates on message delete/recall
-
-FeishuClient (feishu.py) — lark-oapi SDK wrapper
-  ├─ CardKit streaming API — update single elements at 100ms intervals
-
-Clarify inline single-select (clarify.py) — monkey-patches FeishuAdapter at runtime
-  ├─ patch_feishu_adapter(adapters) — patches send_clarify class method + replaces SDK card-action processor.f
-  ├─ _find_feishu_adapter_class — scans sys.modules for the real FeishuAdapter (hermes_plugins.feishu_platform, not the source-path shadow)
-  ├─ _build_clarify_card — schema-1.0 card: markdown question + numbered options list + numbered buttons (button plain_text can't wrap, so full text lives in markdown)
-  └─ _handle_clarify_card_action — choice → resolve_gateway_clarify + resolved card; other → mark_awaiting_text + awaiting card
-
-Self-heal & watchdog (升级自愈三层防御)
-  ├─ __init__.py: register(ctx) — hermes_agent.plugins entry point; 网关启动时检测 run.py 补丁态，未完整则 verify+apply 重打 + launchctl kickstart 重启（streaming.self_heal 默认 true）
-  └─ watchdog.py — launchd WatchPaths 守护（com.hermes-lark.watchdog）：run.py 一变即 uninstall+install+kickstart（防抖 10s），install/uninstall 命令自动装/卸
-
-Card templates (cardkit/)
-  ├─ builder.py — builds Feishu card JSON
-  │   ├─ _build_header — card-level header with status-based theming (blue/green/red)
-  │   ├─ build_streaming_card_v2 — initial loading CardKit v2 card (header_enabled, width_mode)
-  │   ├─ build_complete_card — final card, renders segments in order (header_enabled, body_text_size, footer_enabled, footer_text_size)
-  │   ├─ build_cron_card — static card for cron delivery
-  │   └─ build_background_card — static card for background task delivery
-  ├─ markdown.py — CardKit markdown normalization and table/image helpers
-  └─ i18n.py — localized CardKit labels
+plugin/
+  __init__.py      register(ctx)：register_platform(name="feishu") + 钩子注册
+                   + _fanout_to_profile_scopes（multiplex 每 profile 补注册）
+  adapter.py       StreamingFeishuMixin：send_draft/send/edit_message/send_typing/
+                   supports_draft_streaming/format_tool_event/send_document 覆写；
+                   clarify 内联单选（类定义期覆写，零 monkey-patch）
+  engine.py        ChatCardEngine：chat 键会话（draft 帧无 message 身份）；
+                   ANSWER 整段置换（draft=全量快照）；redirect/followup 边界；
+                   straggler_guard；NOTICE 追加（跨回合合并）
+  contract.py      上游契约锚点清单（见上）
+  doctor.py        只读自检（config 开关/凭据/部署漂移/契约/运行时/病征）
+  _clarify.py      clarify 按钮卡构建 + 卡片回调处理（CLARIFY_STATE）
+  _vendor/         streaming 核心（segments/flush/tooluse/segment_helper/text）+
+                   cardkit builder/markdown + feishu client + config —— 现役唯一拷贝，
+                   tests/test_cardkit|flush|segments|tooluse|text|config|feishu 直接测它
 ```
+
+会话生命周期：探针/typing 即建卡（`on_turn_started`）→ draft 快照整段置换 ANSWER（100ms FlushController）→ reasoning 增量/工具事件进面板 → 终态 close + 完成卡重渲（footer 统计）。会话以 **chat** 为键（draft 帧天然不带 message 身份）；终态会话保留在 `_sessions` 直到被顶替（跨回合合并的前提）。
 
 ## Key Constraints
 
-- Hermes `>= 0.21.1` (2026.9.7) split layout is required. `split_gateway.py` and `split_cron.py` validate function-scoped AST anchors and reject missing or ambiguous matches. `gateway/run.py` and `cron/scheduler.py` are entry points, not injection targets.
-- The interrupt hook runs before the recursive `_run_agent` call in `_run_agent_queued_followup`. It separates inbound identity from the reply anchor and starts or redirects the next card. `_interrupt_map` handles nested interrupts (A→B→C).
-- The completion hook in `run_turn.py` is async: `on_message_completed_wait` awaits card creation/finalization before setting `already_sent`. Reinstall hooks after upgrading. Legacy markers remain removable; `on_queued_followup_boundary` remains only as a shim for previously installed hooks.
-- The split interim callback uses `not already_streamed` to avoid duplicating answer text as thinking, while preserving streaming TTS boundaries.
-- NORMALIZE runs at both `source = event.source` admission sites in `_hm_admit_event` (`run_inbound.py`). It clears false Feishu quote thread IDs before routing so reply anchors remain correct.
-- The `anchor_id` mechanism: for Feishu quoted messages, `_reply_anchor_for_event(event)` returns `reply_to_message_id` instead of `event.message_id`. The START hook passes both — `message_id` for session identity and streaming callback lookup, `anchor_id` for card delivery (reply target). Sessions are registered under both keys.
-- Reasoning display depends on upstream providing `<thinking>`/`<thought>`/`<antthinking>` tags or `Reasoning:\n` prefix in text. Native API reasoning blocks (Anthropic extended thinking, DeepSeek reasoning_content) are available via `on_reasoning_delta` hook when `display.platforms.feishu.show_reasoning` is enabled.
-- CardKit v2.0 elements (collapsible_panel, streaming_mode) only work with `"schema": "2.0"` cards.
-- Streaming cards use a single CardKit card for the message lifecycle: elements are dynamically created in event arrival order. When CardKit creation fails, the plugin yields to the Hermes Gateway default reply.
-- Follow-up completion runs in `_run_agent_deliver_first_response` before native delivery, setting `response_previewed`/`already_sent` without destroying attachment-bearing text. `on_queued_followup_result` runs after recursive completion and uses `setdefault` to preserve the deepest completion identity.
-- The COMPLETE hook uses `_lark_completion_id = agent_result.get('_hermes_lark_completion_id') or event.message_id` — in follow-up scenarios the deepest message_id propagates up via `on_queued_followup_result`, ensuring the correct card session is finalized. Non-follow-up scenarios fall back to `event.message_id`.
-- The background deliver hook (`on_background_deliver`) is injected in `_run_background_task` after `adapter.extract_images(response)`. It uses `ReplyMessage` API with `event_message_id` as anchor, so cards land in the correct topic. On success, `text_content` is cleared to avoid duplicate text delivery, while images and media files continue through the original Hermes loops. On failure, the original Hermes delivery logic runs as fallback.
-- **Clarify 内联单选** (`clarify.py`)：飞书 adapter 没实现 `send_clarify`，默认走 base.py 的数字列表 text fallback。本插件 monkey-patch 补上单选按钮卡，两处 patch：(1) `FeishuAdapter.send_clarify` 类方法 → 渲染 schema-1.0 卡（markdown 编号列表展示完整选项 + 编号按钮，因飞书 button `plain_text` 不支持换行/长文本截断）；(2) **替换 lark SDK 卡片回调 processor.f** —— SDK 在 `connect()` 时把 `adapter._on_card_action_trigger`（绑定方法）快照进 `event_handler._callback_processor_map["p2.card.action.trigger"].f`（注意 key 是**点号** `p2.card.action.trigger`，不是下划线——register 函数名 `register_p2_card_action_trigger` 带下划线，但 dict key 带点号，极易搞混），事后 patch 类无效，所以直接换该 processor 的 `.f` 指向 wrapper。wrapper 检测 `hermes_clarify_action` key → 进 clarify handler，否则转发原逻辑（approval/update-prompt 不受影响）。点选项 → 同步返回 resolved 卡 + 异步 `resolve_gateway_clarify` 唤醒 agent 线程；点「其他」→ `mark_awaiting_text` + 下条非斜杠消息由 gateway 文本拦截接手。**关键时序**：注入点 `HERMES_LARK_ADAPTER_INIT` 在 run.py 的 `await self.hooks.emit("gateway:startup", ...)` 之后（所有 adapter 已 connect、event_handler 已建），此时才能拿到 feishu 实例去替换它的 processor。**模块路径陷阱**：hermes plugin loader 把 `plugins/platforms/feishu` 加载成 `hermes_plugins.feishu_platform`（slug 派生），和源码 import 路径不同——直接按源码路径 import 会拿到影子类，patch 打上去对运行实例无效（症状：日志显示 patched 但按钮卡/回调不生效）。`_find_feishu_adapter_class` 扫 `sys.modules` 找真身（优先 `hermes_plugins.*`）。**entry 失活陷阱**：gateway text-intercept（`_maybe_intercept_clarify_text`，`include_choice_prompts=True`）会在用户发**任意**文字时提前 resolve 掉按钮卡 clarify（即使没点「其他」），之后按钮点击因 entry 已清会失败——button value 里多带一份 `"text": choice` 兜底，`_handle_clarify_card_action` 优先用 value text 而非 entry round-trip。配置开关 `streaming.clarify_inline`（默认 true）关闭后退回 text fallback。改了 `clarify.py` 后只需 `gateway restart`（editable install 即时生效），但改了 `patcher.py` 的注入点逻辑必须 `uninstall && install` 重打 run.py。
-- Background delivery runs after `adapter.extract_images(response)` in `_run_background_task_inner`. On successful card delivery only text is cleared; native image/media delivery continues. Failed card delivery falls back to Hermes.
-- Commit messages: body should use bullet list format (unnumbered `- item`).
+- **官方契约依赖**（`plugin/contract.py` 锚点）：probe 带 `chat_id`（插件在探针时机建卡）；`_draft_metadata` 的 `reply_to_message_id`（reply 锚来源）；`draft_stream_is_message`（一回合一张卡，工具边界不封卡）；`_MIN_NEW_MSG_CHARS`（短回答吞帧 → send() 兜底开卡）。
+- **Clarify 内联单选**（`adapter.py` + `_clarify.py`）：`send_clarify` 类定义期覆写，**绝不能走 self.send**——终态拦截会误完成 streaming 卡，text 兜底直发 `_feishu_send_with_retry`。按钮 value 携带完整 choice 文本（gateway text-intercept 会提前 resolve entry，按钮点击靠 value 兜底）。
+- **redirect 即刻拆卡**：hermes redirect 是**同回合改锚续跑**（`agent.redirect` 取消当前 model 请求、注入纠正、循环重试），draft 锚不变。↪ ack 一到 `mark_redirect` 立即收旧开新：旧卡红标 NOTICE（红 header 强制显示，不受配置约束），新卡以 ack 的 reply_to（=用户纠正消息 id）为锚 loading 起步，本回合 reasoning/工具/正文从第一毫秒起全落新卡。`straggler_guard` 前缀比对拦截旧请求取消前的残尾快照（老内容超集），首个不相关内容通过后解除。adapter busy-ack 分支含 `creating` 会话（ack 早于建卡也不漏标记），此时返回**无 id 成功**（合成 `lark-card:None` 会让后续 edit 打到原生链路）。
+- **followup 边界**：draft 锚变成回合未知新锚 = 新回合（queued followup 被 drain）→ 旧卡按已有内容绿色收尾，新卡以新锚开卡。redirect 回合的 `accepted_anchors` 含新旧两锚——工具边界会换 consumer 重锚，锚回摆不算新回合（曾把新卡拦腰拆成双卡）。
+- **跨回合合并**：send 带 `thread_id` metadata 且无 notify = bg 交付特征 → `append_notice` 进最近卡片（**须查 `session_for` 含终态而非 active_session**——bg 回合常在主回合完成后到达）；无可用卡片回原生文本。
+- **busy ack 进心跳行**：`_BUSY_ACK_PREFIXES`（↪⏳⚡⚠️♻️）识别，进卡片末尾状态行，完成卡重渲自然消失；不渲染成卡、不并进完成卡。
+- **卡片体积上限**：飞书 JSON 体积上限 200860 "card over max size"——思考面板头尾摘录（`cap_reasoning_text`）、工具步数封顶 15、单步结果 900+240 截断、回答正文不截。
+- **multiplex / scope 桶**：插件 `register()` 进程级只跑一次；平台注册表按 profile scope 分桶，`_fanout_to_profile_scopes` 把条目补注册到每个 live profile（profile 在自己 config 的 `plugins.disabled` 写 `feishu-streaming-platform` 可退出，fail-open）。每 profile 独立 engine + client（凭据按 profile 作用域绑定 adapter 实例的 lark client）。诊断特征：gateway.log 每 boot 只 1 行 `adapter factory`（应为每 profile 1 行）。
+- **诊断黑洞**：`hermes_lark_streaming.plugin` logger 不进 gateway.log（hermes logging 配置）；诊断日志统一 `logging.getLogger("gateway.run").info("[feishu-streaming] ...")`；register() 期 hermes logging 未配置，关键生命周期事件走 `_diag_log` 落 `~/.hermes/logs/feishu-streaming-plugin.log`。
+- **live 运行时**：`ps aux | grep gateway run` → shim 进程，真源码在 `~/.hermes/installs/*/environments/*/venv` 的 editable 指向 workspace；`~/.hermes/hermes-agent/` 有副本但不被 import。判「包装没装进某 venv」必须看 site-packages，cwd import 会假报警。
+- **测试**：注入形态的单测已随归档移除；streaming 核心单测（cardkit/flush/segments/tooluse/text/config/feishu）测 `plugin._vendor`；插件行为测试在 `test_plugin_mode.py`/`test_plugin_features.py`（`_FakeBaseAdapter` + `_mock_client`，不依赖 hermes 源树）；契约测试 `test_upstream_compat.py`（pinned 样本）；doctor 测试 `test_doctor.py`（tmp HERMES_HOME 树）。
+- Commit messages: body 用无序 bullet list（`- item`）。
 
-## 跨回合合并（浮浮酱的本地改动，官方上游没有）
+## hermes 升级影响
 
-官方 Cheerwhy 是「单消息单卡」——每个 agent 回合（message_id）一张卡。hermes background process 完成会注入 `synth_event(message_id=None, internal=True)`（`run.py:14588`）触发新回合，官方对 `message_id=None` 直接跳过（`on_message_started` return）+ `_get_active_session` 对终态返 None → background 回合内容走纯文本，「一个对话任务」被拆成多段散落（卡片外）。
+插件模式对上游改动的敏感面比注入模式小得多（不改上游源码），但依赖契约锚点。升级 hermes 后跑一次 `doctor.py`（「上游契约」项变 ✗ 即是破坏）+ 发一条消息实测流式。已知锚点破坏的症状：探针签名变化 → 卡片不建/迟建；`_draft_metadata` 变化 → 卡片 reply 锚丢失（230001 或直发）；`draft_stream_is_message` 移除 → 工具边界封卡真发、一回合多卡。
 
-**改动目标**：让 `message_id=None` 的回合复用同 chat 最近卡片（即使已 COMPLETED），实现「一个对话任务（用户消息 + 触发的所有 background 回合）全合并一张卡」。用 `message_id` 区分：用户新消息（`om_xxx`）→ 新卡；background/内部回合（`None`）→ 复用同 chat 卡。
+## 注入模式（已归档）
 
-**改的 7 文件**（`hermes_lark_streaming/`）：
-- `controller.py`：加 `_chat_index`（chat→msg 反查）+ `_find_session_by_chat` + `_reactivate_session`（COMPLETED→STREAMING + `flush.reset_for_reactivate` + `segment_state.begin_new_turn` + `reused=True`）+ `_resolve_session`（message_id 优先，None 时 chat fallback + 终态重激活）；`on_message_started` None 分支复用（不新建）；delta 回调（`on_answer`/`on_thinking`/`on_reasoning`/`on_tool_update`）+ `on_completed_wait` 加 `chat_id: str | None` 参数；`_apply_completion_payload` 复用场景（`session.reused`）强制新建 ANSWER segment（绕过原 `not any(ANSWER)` 检查）；`_completion_session` 加 chat_id fallback 接受 COMPLETED 复用
-- `streaming/segments.py`：加 `_force_new_segment` 标志 + `begin_new_turn()`（终结末尾 segment + 强制下个 delta 新建，回合分隔，避免两回合 answer 拼在一起）；`on_reasoning_delta`/`on_answer_delta`/`on_tool_event` 加 `and not self._force_new_segment` 检查
-- `streaming/session.py`：加 `reused: bool` 字段
-- `streaming/flush.py`：加 `reset_for_reactivate()`（撤销 `mark_completed`，重置 `_completed`/`_flush_in_progress`/timer）
-- `streaming/controller.py`：`_do_complete_card` finally 改为 **COMPLETED 不立即 cleanup**（`if session.state != COMPLETED: cleanup`）——保留供 background 复用，靠 `_prune_stale_sessions` TTL 清理。**关键 bug 修复**：原 `if not reused: cleanup` 因首回合完成时 `reused=False` 会立即清掉 session，background 回合 `_find_session_by_chat` 找不到
-- `patcher.py`：单体版 delta hook（`_tool_hook`/`_answer_hook`/`_thinking_hook`/`_reasoning_hook`）+ `_complete_hook` 加 `chat_id` 透传
-- `split_gateway.py`（**split 布局的真正注入源，2026-09-21 踩坑**）：上游拆分网关合并后 delta/tool hook 实际由 `split_gateway.py` 的 `guarded("TOOL"/"ANSWER")` 模板生成——合并时 fork 的 chat_id 透传在这丢了（症状：日志 `delta NO session ... chat=`（空），busy redirect 回合整段走纯文本跑出卡片外）。已修：TOOL/ANSWER/THINKING 调用带 `chat_id=ctx.source.chat_id`，ANSWER 门加 `or _lark_ctrl.has_chat_card(ctx.source.chat_id)`（redirect 会切 `inbound_message_id`，message_id 查不到原回合卡片时按 chat 命中）；`controller.has_chat_card` 是无副作用门查询，重激活仍由 `_resolve_session` 做。**以后同步上游 split_gateway 代码时必须检查这几个 hook 的 chat_id 还在**
-- `patch.py`：delta 函数（`on_answer_delta` 等）加 `chat_id` 透传给 controller + `message_id` 类型放宽 `str | None`
-
-**踩坑**：曾试合成 message_id `bg_proc_{session_id}` 给 background 回合，但飞书 API 拒绝（message_id 必须 `om_xxx`）→ 改成按 chat 复用（不创建新卡，避开 API 校验）。
-
-**keep_completed_sessions 默认值（2026-09-22 修复）**：上游拆分网关合并一度把「完成保留 session」改成 opt-in 配置且默认关（上游语义：完成即清理），导致跨回合合并、文档交付、非对话通知这些按 chat 找回最近卡片的特性全部静默失效。现已改回 fork 默认 `True`（`config.py`），并在两个 profile 的 config.yaml 显式写上 `streaming.keep_completed_sessions: true`（带 `.bak-lark-card-features` 备份）。设 False 会退回上游语义，上述特性一起失效。
-
-**测试**：`tests/test_merge_background.py`（5 个：复用+重激活 / 无可复用跳过 / 用户新消息新卡 / delta chat fallback / 重激活仅 COMPLETED）+ 原 430 回归 = **435 全绿**。**改了 `patcher.py` 后必须 `uninstall && install` 重打 AST patch**（否则 run.py 还是旧 hook），再 restart。
-
-**诊断**：`hermes_lark_streaming` logger 不进 `gateway.log`（hermes logging 配置问题），合并诊断用 `logging.getLogger("gateway.run").info("[cheerwhy-merge] ...")`（在 `on_message_started` None 分支 + `_reactivate_session`），grep `[cheerwhy-merge]` 看合并是否触发（`bg turn msg=None ... reactivated=True` / `session reactivated ... cross-turn merge`）。
-
-## hermes 升级后自愈（三层防御）
-
-hermes 自动升级是**原子流程**：拉新代码覆盖 `gateway/run.py`（清掉 AST hook）→ 立即 `gateway restart`。补丁赶不上这趟车。为此建了三层防御，升级后**通常无需手动操作**：
-
-**bg watcher 通知进卡（2026-09-22）**：`on_bg_watcher_notify` 原行为是「同 chat 有卡片即过滤丢弃」（认为 agent 已跟踪 process）。现改为 `notices_in_card`（默认 true）开启时把通知以灰色 NOTICE segment 追加进最近卡片并重完成（跨回合合并同款 reactivate→append→re-complete 流程）；FAILED/ABORTED 卡片返回 False 走原生文本保底；无卡片仍发独立 background 卡片；关闭 `notices_in_card` 退回旧的过滤行为。NOTICE segment（`SegmentType.NOTICE`）渲染为灰色 notation markdown，截断 300 字符。
-
-**文档交付进卡（2026-09-22）**：飞书卡片两种 schema 都**不支持 file 组件**（实测 cardkit_create 报 `not support tag: file`，file_v3 key 只能用于 IM 消息）——所以文档/文件交付采用「上传 file → reply 到卡片消息（card_msg_id）」：topic 群里文件落在卡片同一线程，DM 里是引用卡片的回复。注入点在 `run_notifications.py` `_deliver_media_from_response` 的非图片媒体循环体开头（marker `DOC_DELIVER`），`on_document_deliver` 成功返回 True 跳过原生 `send_document`，上传/回复失败或无可复用卡片返回 False 原生保底。语音/视频/图片不走此钩子（原生体验更好）。
-
-**busy ack 进卡（2026-09-22）**：busy 时用户发消息的确认文本（`↪ Redirected current run` / `⏳ Queued for the next turn` 等，`run_busy.py` `_send_busy_reply` 是唯一出口）注入 marker `BUSY_ACK` 接管：feishu + 同 chat 有 STREAMING 卡片且预留了心跳行时，ack 文本写进卡片心跳状态行（`on_busy_ack` 复用 heartbeat 机制，回合完成时状态行自然消失）；不为 ack 重激活已完成卡片，其余场景原生 ack 文本保底。**注意 ack 查找不能走 `_find_session_by_chat`**（它过滤未建卡 session）——ack 常在建卡完成前到达，需直接查 `_chat_index`；IDLE/CREATING 未建卡时暂存心跳文本等 `_do_create_card` 推送。
-
-**卡片体积上限（2026-09-23）**：飞书卡片除元素数硬上限 200 外还有 **JSON 体积上限**，错误码 200860 "card over max size"——工具面板曾把 execute_code 完整输出无截断塞进代码块，88 个元素（远低于 180 的拆分阈值）就超限：所有更新被拒 → 卡片冻结「处理中」、思考/回答溢出卡外、完成重渲失败走文本兜底。三层修复：结果块截断（head 900 + tail 240，`_fenced_block`）、`_do_batch_update` 收到 200860 就地强制换卡（截断后整卡替换体积变小可成功）、完成渲染超限降级丢工具面板保回答。诊断特征：errors.log 连续 `card over max size`。另：僵尸守护杀卡前查 `turn_registry.is_live()`（agent 弱引用存活 = 回合真在跑，长工具静默期不误杀）；COMPLETE hook 已补传 chat_id（防御式 getattr）。这两个是 25min 配乐回合整段跑出卡外的根因（2013de9）。
-
-**busy redirect 开新卡（2026-09-22）**：交互设计决策——**用户主动意图（redirect 纠正）开新卡，系统内部延续（message_id=None 后台回合）维持合并**。注入 marker `REDIRECT`（`_handle_active_session_busy_message` 的 `effective_mode, redirected = ...` 赋值后）：`on_redirect_started` 给旧卡补「↪ 任务已按新指令重启，结果见下方新卡片」NOTICE 后正常完成（绿色收尾，不用 ABORTED），为新消息 id 建新卡（anchor=纠正消息）。redirect 后流式回调携带新消息 id 自然落新卡；完成信号带旧 id，经 `_interrupt_map`（old→new，复用中断 A→B 通路）在 `_completion_session` 路由到新卡。steer/queue 行为不变（steer 无新消息身份、queue 走 drain 本来就开新卡）。新注入点 18：`on_redirect_started`。
-
-### 第 1 层：`register()` 启动时自愈（核心）
-`hermes_lark_streaming/__init__.py` 的 `register(ctx)` 是 `hermes_agent.plugins` entry point（`pyproject.toml` 已声明）。网关每次启动（含升级后自动 restart）经 `discover_plugins()`（`gateway/run.py` 的 startup）调用到这里。`register()` 逻辑（`streaming.self_heal` 默认 true，关闭后退回手动）：
-1. `Patcher.is_fully_patched()` 检测 run.py 磁盘标记。
-2. 未完整打补丁（升级抹掉了）→ `verify_target()` + `apply()` 原地重打 + 同步 cron hook。
-3. 已打补丁但 run.py mtime 晚于本进程启动时间（补丁是后打的）→ 判定当前进程没加载补丁。
-4. 任一返回 True → `_maybe_restart_gateway()` 用 detached `nohup sleep 2 && launchctl kickstart gui/$UID/ai.hermes.gateway` 延迟重启，让补丁版重新加载。
-5. `verify_target()` 失败（hermes 改了函数名）→ 只记日志不 crash，降级为等手动 reinstall。
-
-**防无限 restart 循环**：重打后磁盘变完整，下次启动 `is_fully_patched()`=True，再走 mtime 比较——restart 后新进程启动时间 > run.py mtime → 不再触发。**关键前提**：插件必须列在 `config.yaml` 的 `plugins.enabled`（entry-point 插件 opt-in），`install` 命令自动追加 `hermes-lark-streaming`，`uninstall` 自动移除。**日志走 `gateway.run` logger**（`hermes_lark_streaming` logger 不进 gateway.log），grep `[hermes-lark] self-heal` 看自愈是否触发。
-
-### 第 2 层：launchd WatchPaths 守护（双保险）
-`hermes_lark_streaming/watchdog.py` 装 launchd job（label `com.hermes-lark.watchdog`）监听 `gateway/run.py` 变化，一变就跑 `~/.hermes/.hermes_lark_watchdog.sh`（防抖 10s）：`uninstall && install && launchctl kickstart`。由 `install`/`uninstall` 命令自动装/卸到 `~/Library/LaunchAgents/`。即便 `register()` 路径出问题（如插件没 enable），run.py 一变守护也会重打+重启。日志 `~/.hermes/logs/hermes_lark_watchdog.log`。
-
-### 第 3 层：`status` 运行时检测 + 一键脚本兜底
-`status` 命令新增运行时检测：比较最近 `gateway run` 进程的启动时间与 run.py mtime，若 run.py 在进程启动后被改过 → 打印 `⚠️ hooks patched but NOT loaded by running gateway — restart needed`（直接暴露「补丁打了但进程没加载」的失效症状）。还修复了 `Feishu credentials: MISSING` 误报（status 常在非网关 shell 跑，env 里没凭据 → 现在也读 `~/.hermes/.env`）。一键兜底脚本：
-
-```bash
-bash ~/ai/hermes-lark-streaming/reinstall_after_upgrade.sh
-```
-
-脚本做：`pip install -e .` → `verify` → `install`（自动装守护 + 启用插件）→ 检查 streaming 段 → 检查合并改动 → 检查 bg_watcher 注入（≥4 处）→ 检查守护 plist → restart。
-
-### background watcher 自动注入（不再手贴）
-`on_bg_watcher_notify`（注入点 12）原是手贴 hook（reinstall 脚本 step 5.5 检查但只警告不修复）。现已纳入 `patcher.py` 自动注入——两个 marker（`BG_WATCHER_FINISHED` / `BG_WATCHER_RUNNING`）注入到 `_run_process_watcher` 的 "finished with exit code" 和 "is still running~" 两个分支，调用 `on_bg_watcher_notify(chat_id, message_text)`，handled 时通过改写守卫 `if adapter and chat_id and not _hermes_lark_bg_handled:` 跳过原 adapter.send 纯文本。和其它 14 个 hook 一样自动化，`install` 自动打。
-
-**风险**：新 hermes 改了 hook 注入点函数名（`_handle_message_with_agent`/`progress_callback`/`_stream_delta_cb`/`_interim_assistant_cb`/`reasoning_callback`/background `synth_event` 注入点/bg_watcher 锚点）→ `verify` 失败 → 自愈降级（只记日志不重打），三选一：a) `git pull` 等上游适配 b) 回退 hermes 版本 c) 手动适配 `patcher.py` 的 marker（改函数名匹配）。clarify 单选的注入点锚点是 `self.hooks.emit("gateway:startup"`（start() 内），若 hermes 改了这行 → `verify` 报 "gateway startup emit anchor" 缺失 → 手动适配 `patcher.py` 的 `_find_adapter_init_site`。完整升级流程 + 改动清单见记忆 `reference_cheerwhy-migration.md`。
+完整实现（patcher/split_gateway/split_cron/watchdog/self-heal 及其测试）在 git tag `archive/injection-mode`。生产已切插件模式（2026-10-07），注入模式的 pip entry-point 已从运行环境卸载、gateway 源码零 marker。**不要在主干复活注入代码**；回滚需求走 tag checkout。

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from hermes_lark_streaming.config import Config
+from plugin._vendor.config import Config
 
 
 def _make_config(raw: dict[str, Any]) -> Config:
