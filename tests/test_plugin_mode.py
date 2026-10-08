@@ -212,7 +212,7 @@ async def test_reasoning_single_session_routing(engine: ChatCardEngine) -> None:
 class _FakeBaseAdapter:
     """最小基类替身 — 记录原生调用."""
 
-    def __init__(self) -> None:
+    def __init__(self, config: Any = None) -> None:
         self.native_sends: list[tuple] = []
         self.native_edits: list[tuple] = []
         self.native_docs: list[tuple] = []
