@@ -58,6 +58,9 @@ class ChatSession:
     answer_seg: Segment | None = None
     redirected: bool = False  # ↪ redirect ack 已见：下一 draft 收旧开新
     redirect_anchor: str | None = None  # redirect 新卡锚（用户纠正消息 id，来自 ack reply_to）
+    # 本回合可接受的 draft 锚集合（followup 边界判定用）。redirect 场景同回合
+    # 会出现两个锚（新指令消息 + 老回合消息），都算本回合不算新回合。
+    accepted_anchors: set[str] = field(default_factory=set)
     _reasoning_logged: bool = False
     tool_seg: Segment | None = None
     heartbeat_text: str = ""
@@ -213,24 +216,35 @@ class ChatCardEngine:
             # 锚（interrupt 不换 message_id），回复引用要指向新指令。
             _logger.info("[feishu-streaming] redirect boundary: sealing card, opening new")
             old_session = session
-            self._sessions[chat_id] = ChatSession(
+            new = ChatSession(
                 chat_id=chat_id, reply_to=session.redirect_anchor or session.reply_to)
+            # redirected 回合的 draft 锚会中途变回老消息 id（工具边界换 consumer
+            # 重新锚定回合身份）——两个锚都算本回合，防 followup 边界拦腰拆卡
+            new.accepted_anchors = {a for a in (session.redirect_anchor,
+                                                session.reply_to) if a}
+            self._sessions[chat_id] = new
             session = self._ensure_session(chat_id)
             self._seal_session(old_session, notice="↪ 任务已按新指令重启，结果见下方新卡片")
-        if session.state != "creating" and reply_to and session.reply_to and reply_to != session.reply_to:
-            # draft 锚变化 = 新回合开始（排队 followup 被 drain，新消息身份）：
-            # 旧卡按已有内容收尾（绿色完成态，避免永挂"处理中"），新回合开新卡。
+        accepted = session.accepted_anchors or (
+            {session.reply_to} if session.reply_to else set())
+        if (session.state != "creating" and reply_to and session.reply_to
+                and reply_to not in accepted):
+            # draft 锚变成回合未知新锚 = 新回合开始（排队 followup 被 drain，
+            # 新消息身份）：旧卡按已有内容收尾（绿色完成态），新回合开新卡。
             # 与注入模式的 FOLLOWUP_COMPLETE hook 等价，信号反而更可靠——
             # 锚来自每回合 consumer 的 initial_reply_to_id（即用户消息 id）。
             _logger.info(
                 "[feishu-streaming] followup boundary: anchor %s -> %s, sealing old card",
                 session.reply_to[:12], reply_to[:12])
             old_session = session
-            self._sessions[chat_id] = ChatSession(chat_id=chat_id, reply_to=reply_to)
+            new = ChatSession(chat_id=chat_id, reply_to=reply_to)
+            new.accepted_anchors = {reply_to}
+            self._sessions[chat_id] = new
             session = self._ensure_session(chat_id)  # 新会话补建卡 task
             self._seal_session(old_session)
         if session.reply_to is None and reply_to:
             session.reply_to = reply_to
+            session.accepted_anchors = {reply_to}
         if session.answer_seg is None:
             # 空文本走 on_answer_delta：在正确位置（reasoning 之后）新建空 ANSWER 段
             session.segment_state.on_answer_delta("")
@@ -481,9 +495,6 @@ class ChatCardEngine:
         if session is not None:
             return session
         active = [s for s in self._sessions.values() if not s.is_terminal]
-        if len(active) == 1:
-            _logger.info("[feishu-streaming] reasoning fallback: asked=%s target=%s",
-                         (chat_id or "-")[:12], active[0].chat_id[:12])
         return active[0] if len(active) == 1 else None
 
     def _schedule(self, session: ChatSession) -> None:

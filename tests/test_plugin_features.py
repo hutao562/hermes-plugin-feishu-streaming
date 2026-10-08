@@ -360,6 +360,37 @@ async def test_redirect_new_card_anchors_user_correction_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_redirect_same_turn_anchor_swing_does_not_split_card() -> None:
+    """redirect 同回合锚回摆（老锚 draft 跟随新锚 draft 到达）不触发 followup 拆卡.
+
+    15:49 实测：redirected 回合 draft 锚中途变回老消息 id（工具边界换 consumer
+    重锚）——旧逻辑把回摆误判成新回合，把新卡拦腰密封成两张卡+第三张引错锚。
+    """
+    engine = ChatCardEngine(_mock_client())
+    engine.on_draft("chat1", "散文开头", reply_to="om_old")
+    await _settle(engine)
+
+    engine.mark_redirect("chat1", anchor="om_new")
+    engine.on_draft("chat1", "改成诗歌的计划", reply_to="om_old")  # 触发 redirect 边界
+    await _settle(engine)
+    session = engine.session_for("chat1")
+    assert session.reply_to == "om_new"
+
+    # 同回合锚回摆：老锚 draft（老回合尾巴/重锚后的 consumer）→ 不拆卡
+    engine.on_draft("chat1", "诗歌正文", reply_to="om_old")
+    await _settle(engine)
+    assert engine.session_for("chat1") is session, "锚回摆不应拆卡"
+    assert session.answer_seg is not None and "诗歌正文" in session.answer_seg.text
+
+    # 真正的新锚（下一条用户消息的 followup drain）→ 拆卡
+    engine.on_draft("chat1", "新回合内容", reply_to="om_next")
+    await _settle(engine)
+    new_session = engine.session_for("chat1")
+    assert new_session is not session
+    assert new_session.reply_to == "om_next"
+
+
+@pytest.mark.asyncio
 async def test_queued_ack_does_not_mark_redirect() -> None:
     """⏳ queued ack 不打标记（queue 回合 drain 成新消息新锚，走锚变化路径）."""
     engine = ChatCardEngine(_mock_client())
