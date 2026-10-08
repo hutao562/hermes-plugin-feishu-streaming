@@ -188,6 +188,28 @@ class StreamingFeishuMixin:
         self._engine().on_turn_started(chat_id)
         return await super().send_typing(chat_id, metadata)  # type: ignore[misc]
 
+    # ── processing 生命周期（Typing 徽章）观测 — 官方实现加/删用户消息上的
+    # reaction；埋点进 gateway.log 是因为徽章失败只落 DEBUG，出问题静默无痕 ──
+
+    async def on_processing_start(self, event: Any) -> None:
+        super_method = getattr(super(), "on_processing_start", None)
+        if callable(super_method):
+            await super_method(event)
+        msg_id = getattr(event, "message_id", "") or "?"
+        logging.getLogger("gateway.run").info(
+            "[feishu-streaming] processing_start msg=%s typing_badge=%s",
+            msg_id[:16],
+            msg_id in getattr(self, "_pending_processing_reactions", {}))
+
+    async def on_processing_complete(self, event: Any, outcome: Any = None) -> None:
+        msg_id = getattr(event, "message_id", "") or "?"
+        logging.getLogger("gateway.run").info(
+            "[feishu-streaming] processing_complete msg=%s outcome=%s",
+            msg_id[:16], getattr(outcome, "name", outcome))
+        super_method = getattr(super(), "on_processing_complete", None)
+        if callable(super_method):
+            await super_method(event, outcome)
+
     # ── clarify 内联单选（类定义期覆写；SDK connect() 注册的绑定方法即本版本）──
 
     async def send_clarify(
