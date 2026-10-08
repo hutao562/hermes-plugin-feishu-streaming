@@ -623,3 +623,31 @@ async def test_interrupted_card_seals_red() -> None:
     new_card = json.dumps(engine._client.cardkit_update.call_args_list[-1].args[1],
                           ensure_ascii=False)
     assert '"green"' in new_card
+
+
+@pytest.mark.asyncio
+async def test_interrupted_card_forces_red_header_even_if_disabled() -> None:
+    """header 配置关闭时，被打断的卡仍强制红 header（红标唯一载体）.
+
+    回归：register() 曾漏接 streaming.header 配置 + 红标只活在 header 里，
+    导致生产（header 关）redirect 旧卡毫无红色痕迹。
+    """
+    import json
+
+    engine = ChatCardEngine(_mock_client())  # header_enabled 默认 False
+    engine.on_draft("chat1", "写到一半的内容", reply_to="om_a")
+    await _settle(engine)
+
+    engine.mark_redirect("chat1")
+    engine.on_draft("chat1", "新回合", reply_to="om_a")
+    await _settle(engine)
+
+    old_card = json.dumps(engine._client.cardkit_update.call_args_list[0].args[1],
+                          ensure_ascii=False)
+    assert '"red"' in old_card, "打断卡必须强制显示红 header"
+
+    # 正常完成路径不受强制 header 影响：仍无 header
+    await engine.complete("chat1", "新回合的完整回答")
+    new_card = json.dumps(engine._client.cardkit_update.call_args_list[-1].args[1],
+                          ensure_ascii=False)
+    assert '"header"' not in new_card
