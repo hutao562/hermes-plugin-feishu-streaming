@@ -336,6 +336,30 @@ async def test_redirect_ack_then_draft_seals_old_with_notice() -> None:
 
 
 @pytest.mark.asyncio
+async def test_redirect_new_card_anchors_user_correction_message() -> None:
+    """redirect 新卡的 reply 锚 = 用户纠正消息 id（ack 的 reply_to），非老回合锚.
+
+    interrupt 不换 event_message_id，draft 帧仍带老锚——新卡引用必须来自
+    ↪ ack 的 reply_to，否则回复引用指向被打断的老指令（用户实测踩坑）。
+    """
+    engine = ChatCardEngine(_mock_client())
+    engine.on_draft("chat1", "老指令的回答", reply_to="om_old")
+    await _settle(engine)
+
+    # ↪ ack 到达：reply_to 是用户新指令消息 id；随后新 draft 仍带老锚（同锚）
+    engine.mark_redirect("chat1", anchor="om_new")
+    engine.on_draft("chat1", "新指令的回答", reply_to="om_old")
+    await _settle(engine)
+
+    new = engine.session_for("chat1")
+    assert new.reply_to == "om_new", "新卡锚应为用户纠正消息 id"
+
+    # 建卡后以新锚 reply 落位（卡片落在用户纠正消息下方）
+    reply_call = engine._client.reply_card_by_id.call_args
+    assert reply_call.args[0] == "om_new"
+
+
+@pytest.mark.asyncio
 async def test_queued_ack_does_not_mark_redirect() -> None:
     """⏳ queued ack 不打标记（queue 回合 drain 成新消息新锚，走锚变化路径）."""
     engine = ChatCardEngine(_mock_client())

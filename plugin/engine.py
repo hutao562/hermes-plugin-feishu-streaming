@@ -57,6 +57,7 @@ class ChatSession:
     card_msg_id: str | None = None
     answer_seg: Segment | None = None
     redirected: bool = False  # ↪ redirect ack 已见：下一 draft 收旧开新
+    redirect_anchor: str | None = None  # redirect 新卡锚（用户纠正消息 id，来自 ack reply_to）
     _reasoning_logged: bool = False
     tool_seg: Segment | None = None
     heartbeat_text: str = ""
@@ -160,14 +161,19 @@ class ChatCardEngine:
             _logger.info("[feishu-streaming] turn started: chat=%s", chat_id[:12])
         # typing 2s 心跳循环的重复调用：会话健在时静默（此前每 2s 刷一条）
 
-    def mark_redirect(self, chat_id: str) -> None:
+    def mark_redirect(self, chat_id: str, anchor: str | None = None) -> None:
         """↪ redirect ack（用户纠正、interrupt 模式）→ 标记当前会话：下一个
         draft 到来时收旧开新（同锚——interrupt 注入新指令不换 event_message_id，
-        锚变化检测覆盖不到，此为唯一信号）。"""
+        锚变化检测覆盖不到，此为唯一信号）。anchor 是 ack 的 reply_to（= 用户
+        纠正消息 id，hermes _send_busy_reply 用 _reply_anchor_for_event(event)
+        锚到新消息）——新卡 reply 引用它；不带时回退旧锚。"""
         session = self.active_session(chat_id)
         if session is not None:
             session.redirected = True
-            _logger.info("[feishu-streaming] redirect marked: chat=%s", chat_id[:12])
+            if anchor:
+                session.redirect_anchor = anchor
+            _logger.info("[feishu-streaming] redirect marked: chat=%s anchor=%s",
+                         chat_id[:12], (anchor or "-")[:12])
 
     # ── 会话查询 ──
 
@@ -202,11 +208,13 @@ class ChatCardEngine:
         session = self._ensure_session(chat_id)
         if (session.redirected and content and content.strip()
                 and (session.state != "creating" or session.tool_tracker.build_display_steps())):
-            # redirect 后首个有内容 draft：旧卡 NOTICE 收尾 + 开新卡（同锚）。
-            # 等价注入模式 REDIRECT marker（on_redirect_started）语义。
+            # redirect 后首个有内容 draft：旧卡 NOTICE 收尾 + 开新卡。
+            # 新卡锚用用户纠正消息 id（ack reply_to）——draft 帧带的还是老回合
+            # 锚（interrupt 不换 message_id），回复引用要指向新指令。
             _logger.info("[feishu-streaming] redirect boundary: sealing card, opening new")
             old_session = session
-            self._sessions[chat_id] = ChatSession(chat_id=chat_id, reply_to=session.reply_to)
+            self._sessions[chat_id] = ChatSession(
+                chat_id=chat_id, reply_to=session.redirect_anchor or session.reply_to)
             session = self._ensure_session(chat_id)
             self._seal_session(old_session, notice="↪ 任务已按新指令重启，结果见下方新卡片")
         if session.state != "creating" and reply_to and session.reply_to and reply_to != session.reply_to:
