@@ -6,8 +6,8 @@ import time
 
 import pytest
 
-from hermes_lark_streaming.streaming import segments as segments_module
-from hermes_lark_streaming.streaming.segments import Segment, SegmentState
+from plugin._vendor.streaming import segments as segments_module
+from plugin._vendor.streaming.segments import Segment, SegmentState
 
 
 class TestSegmentDefaults:

@@ -1,36 +1,7 @@
-[build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "hermes-lark-streaming"
-version = "0.13.0"
-description = "Real-time streaming card plugin for Hermes Gateway via Feishu/Lark CardKit v2.0"
-readme = "README.md"
-requires-python = ">=3.11"
-keywords = ["Hermes", "Feishu", "Lark", "streaming-card"]
-dependencies = [
-  "lark-oapi>=1.4.0",
-  "PyYAML>=6.0",
-]
-
-[project.scripts]
-hermes-lark-streaming = "hermes_lark_streaming.__main__:main"
-
-[project.entry-points."hermes_agent.plugins"]
-hermes-lark-streaming = "hermes_lark_streaming"
-
-[project.optional-dependencies]
-dev = [
-  "pytest>=7.0",
-  "pytest-asyncio>=0.21",
-  "ruff>=0.8",
-  "mypy>=1.11",
-  "types-PyYAML",
-]
-
-[tool.setuptools.packages.find]
-include = ["hermes_lark_streaming*"]
+# 本仓库不再是一个可 pip 安装的包：分发物 = plugin/ 目录（hermes platform 插件，
+# 自包含）+ plugin/doctor.py 自检脚本。注入模式的 pip 包形态已在 v0.14.0 归档
+# （git tag: archive/injection-mode）。本文件只承载工具链配置。
+# （历史 pip 元数据见归档 tag 的 pyproject.toml）
 
 [tool.ruff]
 target-version = "py311"
@@ -56,6 +27,7 @@ python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+files = ["plugin"]
 
 [[tool.mypy.overrides]]
 module = "lark_oapi.*"
@@ -64,5 +36,11 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 # Hermes runtime modules (tools.*, plugins.*, gateway.*) are not on the static
 # analysis path — they live in the hermes install, imported only at runtime.
-module = ["tools.*", "plugins.*", "gateway.*"]
+module = ["tools.*", "plugins.*", "gateway.*", "hermes_cli.*", "hermes_constants"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# doctor.py 以脚本直跑（python3 plugin/doctor.py）也以 plugin.doctor 导入，
+# 顶部的双形态 import 由 except 分支覆盖
+module = "plugin.doctor"
+disable_error_code = ["import-not-found"]

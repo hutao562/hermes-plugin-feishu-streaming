@@ -1,12 +1,16 @@
 name: Hermes Compat Check
 
+# 每日对上游 hermes main 验证插件依赖的 draft-streaming 契约锚点
+# （锚点清单 = plugin/contract.py，与 doctor / pinned 测试同一份）。
+# 失败自动开 issue（hermes-compat label）。
+
 on:
   schedule:
     - cron: '0 0 * * *'  # daily at 08:00 CST
   push:
     paths:
-      - 'hermes_lark_streaming/patcher.py'
-      - 'hermes_lark_streaming/split_*.py'
+      - 'plugin/contract.py'
+      - 'plugin/adapter.py'
       - '.github/workflows/hermes-check.yml'
   workflow_dispatch:
 
@@ -20,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Fetch consistent Hermes source tree
+      - name: Fetch Hermes main tree
         uses: actions/checkout@v6
         with:
           repository: NousResearch/hermes-agent
@@ -29,55 +33,55 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             gateway
-            cron
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
-      - name: Install plugin
-        run: pip install -e .
-
-      - name: Run verify
-        id: verify
+      - name: Check contract anchors against upstream main
+        id: check
         continue-on-error: true
         run: |
           set +e
-          python -c "
-          import pathlib
-          from hermes_lark_streaming.patcher import Patcher, CronPatcher
-          p = Patcher(pathlib.Path('hermes-source/gateway/run.py'))
-          p.verify_target()
-          cp = CronPatcher(pathlib.Path('hermes-source/cron/scheduler.py'))
-          cp.verify_target()
-          print('Both targets compatible.')
-          " > /tmp/verify.log 2>&1
+          python - << 'PY' > /tmp/check.log 2>&1
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "plugin")
+          from contract import check_tree, render_misses, pinned_revision
+
+          misses = check_tree(Path("hermes-source"))
+          if misses:
+              print(f"{len(misses)} contract anchor(s) missing on upstream main "
+                    f"(plugin pinned revision: {pinned_revision()}):")
+              print(render_misses(misses))
+              sys.exit(1)
+          print("All draft-streaming contract anchors present on upstream main.")
+          PY
           code=$?
           {
             echo "exit=${code}"
-            if [ -s /tmp/verify.log ]; then
-              echo "log<<VERIFY_EOF"
-              cat /tmp/verify.log
-              echo "VERIFY_EOF"
+            if [ -s /tmp/check.log ]; then
+              echo "log<<CHECK_EOF"
+              cat /tmp/check.log
+              echo "CHECK_EOF"
             fi
           } >> "$GITHUB_OUTPUT"
           exit "$code"
 
       - name: Open issue on failure
-        if: always() && steps.verify.outcome != 'success'
+        if: always() && steps.check.outcome != 'success'
         uses: actions/github-script@v7
         env:
-          VERIFY_LOG: ${{ steps.verify.outputs.log }}
+          CHECK_LOG: ${{ steps.check.outputs.log }}
         with:
           script: |
             const label = 'hermes-compat';
-            const title = 'Hermes compatibility check failed';
-            const log = process.env.VERIFY_LOG || '(no output captured — verify step may have been skipped, e.g. upstream fetch / install failure)';
+            const title = 'Hermes compatibility check failed (draft-streaming contract)';
+            const log = process.env.CHECK_LOG || '(no output captured — upstream fetch failure)';
             const run = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
-            const body = `The Hermes compatibility check failed.\n\nPlease check if Hermes has updated function names or injection anchors in its gateway or cron delivery modules.\n\n<details><summary>verify output</summary>\n\n\`\`\`\n${log}\n\`\`\`\n\n</details>\n\nWorkflow run: ${run}`;
+            const body = `插件依赖的上游契约锚点在 hermes main 上缺失了。\n\n锚点清单见 \`plugin/contract.py\`；处理流程：核对上游新语义 → 更新 \`plugin/adapter.py\` 兼容 → 同步锚点清单与 \`tests/hermes_sources.json\` 的 pinned revision。\n\n<details><summary>check output</summary>\n\n\`\`\`\n${log}\n\`\`\`\n\n</details>\n\nWorkflow run: ${run}`;
 
-            // Ensure label exists
             try {
               await github.rest.issues.createLabel({
                 owner: context.repo.owner,
@@ -89,7 +93,6 @@ jobs:
               // Label already exists, ignore
             }
 
-            // Only create if no open issue with this label
             const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -107,5 +110,5 @@ jobs:
             }
 
       - name: Fail job on compatibility break
-        if: always() && steps.verify.outcome != 'success'
+        if: always() && steps.check.outcome != 'success'
         run: exit 1

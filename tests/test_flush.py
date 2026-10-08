@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from hermes_lark_streaming.streaming.flush import (
+from plugin._vendor.streaming.flush import (
     BATCH_AFTER_GAP_MS,
     LONG_GAP_MS,
     FlushController,

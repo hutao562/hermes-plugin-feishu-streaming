@@ -20,14 +20,15 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      # 仓库不是 pip 包（分发物 = plugin/ 目录）；开发依赖直装
+      - name: Install dev dependencies
+        run: pip install pytest pytest-asyncio ruff mypy types-PyYAML PyYAML lark-oapi
 
       - name: Run ruff
-        run: python -m ruff check .
+        run: python -m ruff check plugin tests
 
       - name: Run mypy
-        run: python -m mypy hermes_lark_streaming/
+        run: python -m mypy
 
       - name: Cache pinned Hermes sources
         uses: actions/cache@v4

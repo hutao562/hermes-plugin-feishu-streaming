@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from hermes_lark_streaming.streaming.segment_helper import (
+from plugin._vendor.streaming.segment_helper import (
     ELEMENT_THRESHOLD,
     FOOTER_RESERVE,
     estimate_segment_elements,
@@ -10,8 +10,8 @@ from hermes_lark_streaming.streaming.segment_helper import (
     find_tool_split_offset,
     tool_segment_end,
 )
-from hermes_lark_streaming.streaming.segments import Segment, SegmentType
-from hermes_lark_streaming.streaming.tooluse import ToolDisplayStep
+from plugin._vendor.streaming.segments import Segment, SegmentType
+from plugin._vendor.streaming.tooluse import ToolDisplayStep
 
 
 def _step(*, detail: str = "", result: bool = False, error: bool = False) -> ToolDisplayStep:
