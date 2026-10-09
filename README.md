@@ -1,110 +1,106 @@
 # Hermes Lark Streaming
 
-[![Tests](https://github.com/Cheerwhy/hermes-lark-streaming/actions/workflows/test.yml/badge.svg)](https://github.com/Cheerwhy/hermes-lark-streaming/actions/workflows/test.yml)
-[![Hermes Compat](https://github.com/Cheerwhy/hermes-lark-streaming/actions/workflows/hermes-check.yml/badge.svg)](https://github.com/Cheerwhy/hermes-lark-streaming/actions/workflows/hermes-check.yml)
+[![Tests](https://github.com/hutao562/hermes-lark-streaming/actions/workflows/test.yml/badge.svg)](https://github.com/hutao562/hermes-lark-streaming/actions/workflows/test.yml)
+[![Hermes Compat](https://github.com/hutao562/hermes-lark-streaming/actions/workflows/hermes-check.yml/badge.svg)](https://github.com/hutao562/hermes-lark-streaming/actions/workflows/hermes-check.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[Hermes](https://github.com/NousResearch/hermes-agent) Gateway 飞书流式卡片插件 — 基于 CardKit v2.0 的 platform 插件，把每回合回复渲染成打字机效果的实时流式卡片。
+Real-time streaming card plugin for [Hermes](https://github.com/NousResearch/hermes-agent) Gateway via Feishu/Lark CardKit v2.0 — a `kind: platform` plugin that renders every turn as a typewriter-effect streaming card.
 
-灵感来源于 [openclaw-lark](https://github.com/larksuite/openclaw-lark) 和 [hermes-feishu-streaming-card](https://github.com/baileyh8/hermes-feishu-streaming-card)。
+Inspired by [openclaw-lark](https://github.com/larksuite/openclaw-lark) and [hermes-feishu-streaming-card](https://github.com/baileyh8/hermes-feishu-streaming-card).
 
-[English](README.en.md)
+[中文文档](README.zh-CN.md)
 
 ![](assets/cover.jpg)
 
 ---
 
-## 形态说明
+## Distribution Model
 
-本插件自 v0.14.0 起只有一种形态：**hermes platform 插件**（`plugin/` 目录，`kind: platform`）。它子类化官方 `FeishuAdapter`、以同名 `feishu` 注册顶替内置适配器，**自包含、零 pip 安装**——把目录拷到 `~/.hermes/plugins/` 即完成部署。
+Since v0.14.0 this plugin ships in exactly one form: a **Hermes platform plugin** (the self-contained `plugin/` directory, `kind: platform`). It subclasses the official `FeishuAdapter` and registers under the same `feishu` platform name (registry last-writer-wins). **No pip install** — copying the directory into `~/.hermes/plugins/` is the whole deployment.
 
-> 早期的 AST 注入形态（向 gateway 源码插 hook）已于 v0.14.0 归档，完整实现见
-> git tag `archive/injection-mode`。如需回滚：`git checkout archive/injection-mode`
-> 后按该版本的 README 操作。
-
----
-
-## 功能
-
-- **流式输出** — AI 回复实时显示在交互卡片中，打字机效果（CardKit v2 draft-streaming）
-- **单卡单回合** — 思考、工具调用、回答按事件顺序在同一张卡片内动态渲染
-- **思考过程** — 思考型模型的推理增量实时进卡片折叠面板（头尾摘录防超体积）
-- **工具调用面板** — 结构化工具事件实时渲染状态图标与结果块，步数封顶防体积爆炸
-- **打断即开新卡** — busy redirect 时旧卡红标收尾，新卡立刻以纠正消息为锚开出，思考/工具/正文全程流进新卡
-- **跨回合合并** — 后台回合、watcher 通知、文档交付合并进最近卡片，不散落纯文本
-- **Clarify 内联单选** — 澄清问题渲染为飞书按钮卡，点击即回调，无需打字
-- **心跳状态行** — busy ack（↪ 重定向 / ⏳ 排队）与进度文本进卡片状态行，完成即消失
-- **终态卡片** — 完成后重渲完整结果，含 token 用量、耗时、t/s、上下文信息
-- **Cron 卡片推送** — 定时任务结果以飞书卡片形式推送
-- **多 profile** — multiplex 网关下每个 profile 独立引擎与凭据（footer/header 按 profile 配置）
-- **多语言** — 卡片文本内置中英双语，按飞书客户端语言自动切换
+> The legacy AST-injection form (hooking gateway sources) was archived in v0.14.0.
+> Its full implementation lives under the git tag `archive/injection-mode`.
 
 ---
 
-## 卡片展示
+## Features
+
+- **Streaming output** — replies render live in an interactive card, typewriter effect (CardKit v2 draft-streaming)
+- **One card per turn** — reasoning, tool calls and the answer render in event order inside a single card
+- **Reasoning panel** — thinking-model reasoning deltas stream into a collapsible panel (head/tail excerpted to stay under card size limits)
+- **Tool panel** — structured tool events render live status icons and result blocks, step-capped
+- **Interrupt opens a new card immediately** — on busy redirect the old card seals with a red banner and the new card opens at once, anchored to your correction message; reasoning/tools/answer all stream into it from the first millisecond
+- **Cross-turn merge** — background turns, watcher notices and document deliveries merge into the most recent card
+- **Clarify inline single-select** — clarification prompts render as Feishu button cards; a click resolves the callback
+- **Heartbeat status line** — busy acks (↪ redirected / ⏳ queued) and progress text render in the card's status line until completion
+- **Final card** — re-rendered on completion with token usage, duration, t/s and context stats
+- **Cron cards** — scheduled-task results push as Feishu cards
+- **Multi-profile** — under a multiplex gateway each profile gets its own engine and credentials
+- **i18n** — card labels ship in English and Chinese, switched by the Feishu client locale
+
+---
+
+## Card Preview
 
 ![](assets/streaming.jpg)
 
 ---
 
-## 运行要求
+## Requirements
 
-- Hermes `>= 0.21.1`，已配置飞书平台（官方飞书适配器可用）
-- 飞书应用权限：消息卡片（CardKit）读写、消息发送与回复、文件上传
-- 无需 pip 安装任何东西——插件自包含，仅依赖 hermes 运行环境已有的 `lark-oapi`
+- Hermes `>= 0.21.1` with the Feishu platform configured
+- Feishu app scopes: card (CardKit) read/write, message send/reply, file upload
+- Nothing to pip-install — the plugin is self-contained and only relies on the `lark-oapi` already present in the Hermes runtime
 
 ---
 
-## 安装
+## Install
 
-完整步骤见 [INSTALL.md](INSTALL.md)。概要：
+See [INSTALL.md](INSTALL.md) for the full walkthrough:
 
 ```bash
-# 1. 部署插件目录（自包含）
-git clone https://github.com/Cheerwhy/hermes-lark-streaming.git
+git clone https://github.com/hutao562/hermes-lark-streaming.git
 cp -R hermes-lark-streaming/plugin ~/.hermes/plugins/feishu-streaming
 
-# 2. config.yaml 启用（两处开关缺一不可）
-#    plugins.enabled: [feishu-streaming-platform]
-#    streaming.enabled: true  +  display.platforms.feishu.streaming: true
+# config.yaml: plugins.enabled: [feishu-streaming-platform]
+#             streaming.enabled: true
+#             display.platforms.feishu.streaming: true
 
-# 3. 重启网关
 hermes gateway restart
-
-# 4. 自检
 python3 ~/.hermes/plugins/feishu-streaming/doctor.py
 ```
 
-## 自检（doctor）
+## Doctor (self-check)
 
-只读诊断脚本，部署在插件目录内、随仓库分发，零安装依赖：
+A read-only diagnostic script shipped inside the plugin directory — zero install, stdlib only:
 
 ```bash
-python3 ~/.hermes/plugins/feishu-streaming/doctor.py          # 人读报告
-python3 ~/.hermes/plugins/feishu-streaming/doctor.py --json   # CI/脚本友好
+python3 ~/.hermes/plugins/feishu-streaming/doctor.py          # human-readable
+python3 ~/.hermes/plugins/feishu-streaming/doctor.py --json   # CI/script friendly
 ```
 
-检查面 = 这个项目历史上真实静默失效过的每一类问题：两处 config 开关、multiplex
-profile 退出开关、凭据（env / `.env`，不回显值）、插件目录完整性与部署漂移、
-上游 hermes 契约锚点、运行时 venv 的 lark-oapi、网关进程与装配日志、错误病征
-扫描（卡片超体积 / sequence 冲突 / 非法 reply 目标）、注入模式残留。
+It checks exactly the failure classes this project has historically hit silently:
+both config switches, multiplex profile opt-outs, credentials (env / `.env`, values
+never printed), plugin directory integrity and deploy drift, upstream hermes
+contract anchors, runtime-venv `lark-oapi`, gateway process and wiring logs,
+error signatures (card size / sequence / reply-target), and injection-mode residue.
 
 ---
 
-## 配置
+## Configuration
 
-在 `~/.hermes/config.yaml`：
+In `~/.hermes/config.yaml`:
 
 ```yaml
 plugins:
   enabled:
-    - feishu-streaming-platform   # platform 插件是 opt-in，必须显式启用
+    - feishu-streaming-platform   # platform plugins are opt-in
 streaming:
-  enabled: true                   # 官方 draft transport 总开关
-  transport: auto                 # auto/draft 走 draft-streaming 卡片
-  width_mode: default             # 卡片宽度：default / compact / fill
+  enabled: true                   # master switch for the official draft transport
+  transport: auto                 # auto/draft enables draft-streaming cards
+  width_mode: default             # default / compact / fill
   header:
-    enabled: false                # 卡片 header（异常态红标不受此项约束，强制显示）
+    enabled: false                # card header; abort red banner shows even when off
   body:
     text_size: normal_v2
   footer:
@@ -113,103 +109,63 @@ streaming:
     fields:
       - [status, elapsed, context, model]
     show_label: false
-  panel_expanded: false           # 完成态面板保持展开
-  clarify_inline: true            # clarify 内联单选按钮卡（false 回退文本列表）
+  panel_expanded: false
+  clarify_inline: true
 display:
   platforms:
     feishu:
-      streaming: true             # 官方 draft 契约开关（关着流式不启动）
+      streaming: true             # official draft contract switch
       show_tool_use: true
-      show_reasoning: true        # 思考型模型的 reasoning 增量进卡
+      show_reasoning: true
 ```
 
-**凭据**不在本插件配置——复用官方飞书平台凭据（环境变量 `FEISHU_APP_ID` /
-`FEISHU_APP_SECRET` 或 `~/.hermes/.env`），按 profile 作用域绑定。
-
-**Header**（`streaming.header.enabled`）：完成后卡片顶部状态栏，按状态着色（流式蓝/完成绿/打断红）。打断收尾的红标不依赖此开关——异常态强制显示 header。默认关闭。
-
-**Footer 字段**（`footer.fields`）：二维数组，每个子数组一行，字段间用 `·` 连接。可用字段：`status` / `elapsed` / `model` / `tokens` / `context`。
+Credentials are not configured here — the plugin reuses the official Feishu platform credentials (`FEISHU_APP_ID` / `FEISHU_APP_SECRET` env or `~/.hermes/.env`), bound per profile scope.
 
 ---
 
-## 更新
+## Update
 
 ```bash
-cd hermes-lark-streaming
-git pull
+cd hermes-lark-streaming && git pull
 rm -rf ~/.hermes/plugins/feishu-streaming
 cp -R plugin ~/.hermes/plugins/feishu-streaming
-hermes gateway restart          # 重启窗口约 50s，会打断进行中的回合
+hermes gateway restart
 python3 ~/.hermes/plugins/feishu-streaming/doctor.py
 ```
 
-## 卸载
+## Uninstall
 
 ```bash
 rm -rf ~/.hermes/plugins/feishu-streaming
-# config.yaml 的 plugins.enabled 移除 feishu-streaming-platform 后重启网关，
-# 即回退官方内置飞书适配器（无流式卡片）
+# remove feishu-streaming-platform from plugins.enabled and restart —
+# falls back to the bundled Feishu adapter (no streaming cards)
 ```
 
 ---
 
-## 工作原理
+## How It Works
 
-插件以 `kind: platform` 注册同名 `feishu` 平台（registry last-writer-wins 顶替内置适配器），子类化官方 `FeishuAdapter` 实现 draft-streaming 契约：
+The plugin registers a `feishu` platform entry under the same name (last-writer-wins over the bundled adapter) and subclasses the official `FeishuAdapter` to implement the draft-streaming contract:
 
 ```
-用户消息 → hermes 回合开始（探针时机即建卡，卡片 reply 用户消息）
-  → send_draft 全量快照帧 → 引擎整段置换 ANSWER（100ms 节流 flush）
-  → reasoning 增量 / 工具事件 → 折叠面板 / 工具面板流式更新
-  → 回合终态 → CardKit close + 完成卡整体重渲（footer 统计）
+user message → turn starts (card created at probe time, replying to the user message)
+  → send_draft full-snapshot frames → engine swaps the ANSWER segment (100ms throttled flush)
+  → reasoning deltas / tool events → collapsible & tool panels update live
+  → turn final → CardKit close + full re-render with footer stats
 ```
 
-关键边界：draft 锚变化 = 新回合（followup drain）→ 旧卡绿色收尾开新卡；↪ redirect
-ack = 同回合改锚续跑 → **立即**收旧开新（锚取自 ack 的 reply_to，即用户纠正消息）；
-`message_id=None` 的后台回合 → 跨回合合并进最近卡片。上游契约锚点集中在
-[`plugin/contract.py`](plugin/contract.py)，由三个通道共同守护：
+Key boundaries: a draft anchor change means a new turn (followup drain) → seal the old card green and open a new one; a ↪ redirect ack means the same turn was re-anchored → seal and open **immediately** (anchor taken from the ack's reply_to, i.e. the correction message); `message_id=None` background turns merge into the most recent card. Upstream contract anchors live in [`plugin/contract.py`](plugin/contract.py), guarded by three channels: pinned-revision regression in CI, a daily check against upstream main (auto-files an issue on break), and local `doctor.py`.
 
-- CI 对固定 revision 上游样本回归（`tests/test_upstream_compat.py`）
-- 每日对上游 main 的 [hermes-check](https://github.com/Cheerwhy/hermes-lark-streaming/actions/workflows/hermes-check.yml)，失败自动开 issue
-- 本机 `doctor.py` 实时验证
-
-## 开发测试
+## Development
 
 ```bash
 HERMES_PYTHON=~/.hermes/hermes-agent/venv/bin/python3
 
 $HERMES_PYTHON -m ruff check plugin tests
 $HERMES_PYTHON -m mypy
-$HERMES_PYTHON -m pytest tests/ -q        # 上游样本按 pinned commit 缓存于 tests/samples/（见 tests/HERMES_SAMPLES.md）
-
-# E2E（需 Hermes 运行 + lark-cli，默认跳过）
-HERMES_HOME=~/.hermes $HERMES_PYTHON -m pytest -m e2e tests/e2e/ -v
+$HERMES_PYTHON -m pytest tests/ -q
 ```
 
-改动 `plugin/` 后部署即生效：`rm -rf ~/.hermes/plugins/feishu-streaming && cp -R plugin ~/.hermes/plugins/feishu-streaming && hermes gateway restart`。
-
-## 贡献者
-
-感谢以下贡献者的 Issue 和 PR：
-## 贡献者
-
-感谢以下贡献者的 Issue 和 PR：
-
-<a href="https://github.com/Mxin-9527"><img src="https://avatars.githubusercontent.com/u/178271393?v=4&s=64" width="48" height="48" style="border-radius:50%" /></a>
-<a href="https://github.com/gitteeee"><img src="https://avatars.githubusercontent.com/u/128769493?v=4&s=64" width="48" height="48" style="border-radius:50%" /></a>
-<a href="https://github.com/Bandersnatch0x"><img src="https://avatars.githubusercontent.com/u/13325067?v=4&s=64" width="48" height="48" style="border-radius:50%" /></a>
-<a href="https://github.com/runfali"><img src="https://avatars.githubusercontent.com/u/39327978?v=4&s=64" width="48" height="48" style="border-radius:50%" /></a>
-<a href="https://github.com/thunderfight127-svg"><img src="https://avatars.githubusercontent.com/u/275854191?v=4&s=64" width="48" height="48" style="border-radius:50%" /></a>
-<a href="https://github.com/willggy"><img src="https://avatars.githubusercontent.com/u/74762604?v=4&s=64" width="48" height="48" style="border-radius:50%" /></a>
-<a href="https://github.com/atomperson"><img src="https://avatars.githubusercontent.com/u/14934637?v=4&s=64" width="48" height="48" style="border-radius:50%" /></a>
-<a href="https://github.com/linjunxin01"><img src="https://avatars.githubusercontent.com/u/63715504?v=4&s=64" width="48" height="48" style="border-radius:50%" /></a>
-<a href="https://github.com/mouxangithub"><img src="https://avatars.githubusercontent.com/u/48978046?v=4&s=64" width="48" height="48" style="border-radius:50%" /></a>
-<a href="https://github.com/numuly"><img src="https://avatars.githubusercontent.com/u/137970054?v=4&s=64" width="48" height="48" style="border-radius:50%" /></a>
-<a href="https://github.com/wzgrx"><img src="https://avatars.githubusercontent.com/u/39661556?v=4&s=64" width="48" height="48" style="border-radius:50%" /></a>
-<a href="https://github.com/zhaomingcheng01"><img src="https://avatars.githubusercontent.com/u/46734892?v=4&s=64" width="48" height="48" style="border-radius:50%" /></a>
-
----
-
-## 许可证
+## License
 
 [MIT](LICENSE)

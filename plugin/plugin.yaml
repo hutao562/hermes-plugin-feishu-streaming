@@ -12,8 +12,8 @@ description: >-
   replaces it per profile (register_platform name="feishu",
   last-writer-wins), inheriting the bundled entry's setup/status
   contract surfaces.
-author: Cheerwhy & contributors
-homepage: https://github.com/Cheerwhy/hermes-lark-streaming
+author: hutao562 & Cheerwhy
+homepage: https://github.com/hutao562/hermes-lark-streaming
 license: MIT
 tags:
   - feishu
