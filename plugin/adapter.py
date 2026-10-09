@@ -128,7 +128,10 @@ class StreamingFeishuMixin:
         # （send_typing 不被调），这里是"回合开始"最可靠信号：立即建卡，带工具
         # 回合的工具面板从第一步就可见（对齐注入模式 on_message_started 体感）。
         if chat_id:
-            self._engine().on_turn_started(chat_id)
+            # 话题回合：metadata 带 thread_id（hermes dm:oc_x:omt_y 会话键）——
+            # 卡片会话必须同粒度隔离，否则话题与主聊互相串写
+            self._engine().on_turn_started(
+                chat_id, thread_id=(metadata or {}).get("thread_id"))
         return True
 
     async def send_draft(self, chat_id: str, draft_id: int, content: str,
@@ -138,7 +141,8 @@ class StreamingFeishuMixin:
             logging.getLogger("gateway.run").info(
                 "[feishu-streaming] draft chat=%s len=%d", chat_id[:12], len(content))
         reply_to = (metadata or {}).get("reply_to_message_id")
-        self._engine().on_draft(chat_id, content, reply_to=reply_to)
+        self._engine().on_draft(chat_id, content, reply_to=reply_to,
+                                thread_id=(metadata or {}).get("thread_id"))
         return _compat.send_result(success=True, message_id=None)
 
     # ── 结构化流事件 ──
@@ -165,15 +169,16 @@ class StreamingFeishuMixin:
             bool((metadata or {}).get("_interim_send")))
         engine = self._engine()
         interim = bool((metadata or {}).get("_interim_send"))
-        session = engine.active_session(chat_id)
+        thread_id = (metadata or {}).get("thread_id")
+        session = engine.active_session(chat_id, thread_id)
 
         if interim and session is not None:
             # 心跳/进度 → 卡片末尾状态行（不产生真消息）
-            engine.on_heartbeat(chat_id, content)
+            engine.on_heartbeat(chat_id, content, thread_id=thread_id)
             return _compat.send_result(success=True,
                                        message_id=f"lark-card:{session.card_msg_id}")
 
-        card_session = engine.session_for(chat_id)  # 含终态（bg 通知常在主回合完成后到达）
+        card_session = engine.latest_session_for_chat(chat_id)  # 含终态 + 任意 thread（bg 通知常在主回合完成后到达）
         if (not interim and card_session is not None and card_session.card_id
                 and content.strip()
                 and not content.lstrip().startswith(_BUSY_ACK_PREFIXES)
@@ -181,11 +186,13 @@ class StreamingFeishuMixin:
                 and (metadata or {}).get("thread_id")):
             # background 回合交付 / watcher 通知（特征：无 notify 标记 + thread
             # metadata，与普通 final 的 _mark_notify_metadata 相区分）→ 追加进
-            # 最近卡片（跨回合合并），不再散落纯文本。
-            card_msg_id = await engine.append_notice(chat_id, content)
+            # 该 chat 最近一张卡（跨回合合并；thread_id 是来源标记，合并目标是
+            # 最新卡），不再散落纯文本。
+            card_msg_id = await engine.append_notice(chat_id, content,
+                                                     thread_id=card_session.thread_id)
             if card_msg_id is not None:
                 return _compat.send_result(success=True, message_id=card_msg_id)
-            # 无可用卡片 → 落回原生文本
+            # 无可用卡片 → 落回原生文本（append_notice 已带 thread）
 
         if (session is not None and session.state in ("creating", "streaming") and not interim
                 and content and len(content) <= 200
@@ -196,9 +203,9 @@ class StreamingFeishuMixin:
             # 接不到）。含 creating：ack 可早于建卡完成，此时也不能漏标记。
             if content.lstrip().startswith("↪"):
                 # ack 的 reply_to = 用户纠正消息 id（hermes 锚到新消息）→ 新卡 reply 引用它
-                engine.mark_redirect(chat_id, anchor=reply_to)
-                session = engine.active_session(chat_id)  # mark_redirect 可能已顶替会话
-            engine.on_heartbeat(chat_id, content)
+                engine.mark_redirect(chat_id, anchor=reply_to, thread_id=thread_id)
+                session = engine.active_session(chat_id, thread_id)  # mark_redirect 可能已顶替会话
+            engine.on_heartbeat(chat_id, content, thread_id=thread_id)
             # 新卡尚在建（card_msg_id 未落）时返回无 id 的成功——ack 无后续 edit，
             # 合成 "lark-card:None" 会让后续 edit 打到原生链路上
             return _compat.send_result(
@@ -211,7 +218,7 @@ class StreamingFeishuMixin:
             # 此处接管渲染；已发送标记由 gateway 流机制去重）
             if session.reply_to is None and reply_to:
                 session.reply_to = reply_to
-            msg_id = await engine.complete(chat_id, content)
+            msg_id = await engine.complete(chat_id, content, thread_id=thread_id)
             if msg_id is not None:
                 return _compat.send_result(success=True, message_id=msg_id)
             # 建卡失败 → 落回原生文本
@@ -222,8 +229,8 @@ class StreamingFeishuMixin:
             # reply_to 有锚 = 对话回合；无锚通知（watcher 等）保持原生文本。
             # busy-ack（↪/⏳）除外——回合早期的 ack 到达时卡还没建，误开卡会把
             # ack 文本当回答渲染成完成卡。
-            engine.on_draft(chat_id, content, reply_to=reply_to)
-            msg_id = await engine.complete(chat_id, content)
+            engine.on_draft(chat_id, content, reply_to=reply_to, thread_id=thread_id)
+            msg_id = await engine.complete(chat_id, content, thread_id=thread_id)
             if msg_id is not None:
                 return _compat.send_result(success=True, message_id=msg_id)
         elif (not interim and (metadata or {}).get("job_id")
@@ -249,17 +256,18 @@ class StreamingFeishuMixin:
         # 心跳首条被截获时返回合成 id，后续 edit 打回卡片心跳行
         if message_id.startswith("lark-card:"):
             card_msg_id = message_id.split(":", 1)[1]
-            session = self._engine().session_for(chat_id)
-            if session is not None and session.card_msg_id == card_msg_id:
-                self._engine().on_heartbeat(chat_id, content)
-                return _compat.send_result(success=True, message_id=message_id)
+            for session in self._engine()._sessions.values():
+                if session.card_msg_id == card_msg_id:
+                    self._engine().on_heartbeat(session.chat_id, content,
+                                                thread_id=session.thread_id)
+                    return _compat.send_result(success=True, message_id=message_id)
         return await super().edit_message(chat_id, message_id, content,  # type: ignore[misc]
                                           finalize=finalize, **kwargs)
 
     async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> Any:
         """回合开始的 typing 指示 → 立即建卡（带工具回合的 draft 要等工具跑完，
         此前用户什么都看不到）。官方实现是 no-op，此处附加建卡后转调。"""
-        self._engine().on_turn_started(chat_id)
+        self._engine().on_turn_started(chat_id, thread_id=(metadata or {}).get("thread_id"))
         return await super().send_typing(chat_id, metadata)  # type: ignore[misc]
 
     # ── processing 生命周期（Typing 徽章）观测 — 官方实现加/删用户消息上的
@@ -516,7 +524,11 @@ class StreamingFeishuMixin:
                             file_name: str | None = None, **kwargs: Any) -> Any:
         """文档交付：有卡片时上传后 reply 到卡片消息下方（飞书卡片无 file 组件）."""
         engine = self._engine()
-        card_msg_id = engine.last_card_msg_id(chat_id)
+        # 文档锚：话题卡（thread 会话）与主聊卡都算，取最近一条 card_msg_id
+        candidates = [s.card_msg_id for s in engine._sessions.values()
+                      if s.chat_id == chat_id and s.card_msg_id]
+        card_msg_id = next(iter(candidates), None) if candidates \
+            else engine.last_card_msg_id(chat_id)
         if card_msg_id:
             try:
                 file_key = await self._upload_document_for_card(file_path, file_name)
