@@ -524,11 +524,10 @@ class StreamingFeishuMixin:
                             file_name: str | None = None, **kwargs: Any) -> Any:
         """文档交付：有卡片时上传后 reply 到卡片消息下方（飞书卡片无 file 组件）."""
         engine = self._engine()
-        # 文档锚：话题卡（thread 会话）与主聊卡都算，取最近一条 card_msg_id
-        candidates = [s.card_msg_id for s in engine._sessions.values()
-                      if s.chat_id == chat_id and s.card_msg_id]
-        card_msg_id = next(iter(candidates), None) if candidates \
-            else engine.last_card_msg_id(chat_id)
+        # 文档锚：该 chat 任意 thread 的会话都算，取最近创建那张（latest 语义
+        # 与 bg 合并一致——插入序第一张在主聊+话题并存时会挂到旧卡）
+        latest = engine.latest_session_for_chat(chat_id)
+        card_msg_id = latest.card_msg_id if latest else None
         if card_msg_id:
             try:
                 file_key = await self._upload_document_for_card(file_path, file_name)
