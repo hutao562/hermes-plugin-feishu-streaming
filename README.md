@@ -1,7 +1,7 @@
 # Hermes Lark Streaming
 
-[![Tests](https://github.com/hutao562/hermes-lark-streaming/actions/workflows/test.yml/badge.svg)](https://github.com/hutao562/hermes-lark-streaming/actions/workflows/test.yml)
-[![Hermes Compat](https://github.com/hutao562/hermes-lark-streaming/actions/workflows/hermes-check.yml/badge.svg)](https://github.com/hutao562/hermes-lark-streaming/actions/workflows/hermes-check.yml)
+[![Tests](https://github.com/hutao562/hermes-plugin-feishu-streaming/actions/workflows/test.yml/badge.svg)](https://github.com/hutao562/hermes-plugin-feishu-streaming/actions/workflows/test.yml)
+[![Hermes Compat](https://github.com/hutao562/hermes-plugin-feishu-streaming/actions/workflows/hermes-check.yml/badge.svg)](https://github.com/hutao562/hermes-plugin-feishu-streaming/actions/workflows/hermes-check.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Real-time streaming card plugin for [Hermes](https://github.com/NousResearch/hermes-agent) Gateway via Feishu/Lark CardKit v2.0 — a `kind: platform` plugin that renders every turn as a typewriter-effect streaming card.
@@ -59,7 +59,7 @@ Since v0.14.0 this plugin ships in exactly one form: a **Hermes platform plugin*
 See [INSTALL.md](INSTALL.md) for the full walkthrough:
 
 ```bash
-git clone https://github.com/hutao562/hermes-lark-streaming.git
+git clone https://github.com/hutao562/hermes-plugin-feishu-streaming.git
 cp -R hermes-lark-streaming/plugin ~/.hermes/plugins/feishu-streaming
 
 # config.yaml: plugins.enabled: [feishu-streaming-platform]

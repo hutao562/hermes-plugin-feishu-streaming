@@ -17,7 +17,7 @@ agent or a human following the commands verbatim.
 ## Step 1 — Deploy the plugin directory
 
 ```bash
-git clone https://github.com/hutao562/hermes-lark-streaming.git
+git clone https://github.com/hutao562/hermes-plugin-feishu-streaming.git
 cp -R hermes-lark-streaming/plugin ~/.hermes/plugins/feishu-streaming
 ```
 

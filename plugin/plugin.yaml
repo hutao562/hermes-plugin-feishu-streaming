@@ -13,7 +13,7 @@ description: >-
   last-writer-wins), inheriting the bundled entry's setup/status
   contract surfaces.
 author: hutao562 & Cheerwhy
-homepage: https://github.com/hutao562/hermes-lark-streaming
+homepage: https://github.com/hutao562/hermes-plugin-feishu-streaming
 license: MIT
 tags:
   - feishu
