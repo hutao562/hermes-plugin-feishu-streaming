@@ -10,7 +10,8 @@
 - ``format_tool_event``：记录结构化 ToolCallChunk 后返回 None「吃掉」文本行，
   工具面板由引擎按结构化状态渲染（官方契约明确允许）；
 - ``send``：回合终态文本命中活跃卡会话 → 渲染完成卡；interim（_interim_send）
-  → 卡片心跳行；其余走原生。
+  → 卡片心跳行；bg 交付（thread_id metadata）→ NOTICE 并进最近卡；cron 结果
+  （job_id metadata、无锚）→ ⏰ cron 卡片；其余走原生。
 
 官方基类在 gateway 进程内以 ``plugins.platforms.feishu.adapter`` 可导入；为让本包
 在无 hermes 源树的环境（CI/单测）也可导入，基类经工厂延迟绑定。
@@ -19,9 +20,14 @@
 from __future__ import annotations
 
 import logging
+import re
+import uuid
+from datetime import datetime
 from typing import Any, cast
 
 from . import _compat
+from ._vendor.cardkit.builder import build_model_picker_card, build_model_switch_ack_card
+from .contract import CRON_WRAP_DIVIDER, CRON_WRAP_FOOTER_PREFIX, CRON_WRAP_HEADER, CRON_WRAP_JOBID_LINE
 from .engine import ChatCardEngine
 
 _logger = logging.getLogger("hermes_lark_streaming.plugin")
@@ -33,6 +39,54 @@ _logger = logging.getLogger("hermes_lark_streaming.plugin")
 # 不渲染成卡、不并进完成卡（gateway.progress.* / gateway lifecycle locale）
 _BUSY_ACK_PREFIXES = ("↪", "⏳", "⚡", "⚠️", "♻️")
 _draft_log_state: dict[int, int] = {}
+
+# cron 结果 wrap 信封（cron.wrap_response）——常量与锚点 needle 同源于
+# plugin/contract.py（上游改文案 → 每日 hermes-check 锚点报警）；解析范式同
+# gateway/platforms/yuanbao.py 的 strip_cron_wrapper。不匹配时原样降级
+# （无 header 卡片 / 原生文本），不会坏。
+
+# 失败通知形状（cron 失败 header 判定）：⚠️ Cron '...' failed: 是
+# cron/scheduler_failure_copy.py 全部文案的公共前缀（该模块 pinned revision
+# 尚未抽出，未锚——改版只降级为蓝卡）；**Status:** script failed 是脚本门形状。
+_CRON_FAILURE_RE = re.compile(r"Cron '[^']{0,120}' failed: |\*\*Status:\*\* [^\n]{0,60}(?:failed|error)")
+
+
+def _looks_like_cron_failure(body: str) -> bool:
+    """cron 正文是否失败通知（红 header 用；误判只影响配色，不影响投递）."""
+    return _CRON_FAILURE_RE.search(body) is not None
+
+
+def _parse_cron_payload(content: str) -> tuple[str, str, str, bool]:
+    """拆 cron wrap 信封 → ``(task_name, 卡片正文, job_id, is_failure)``.
+
+    正文 = 原始产出 + 管理提示尾（含 job_id，保留原生文本的可追溯性）；形状不
+    匹配（wrap_response=false / 上游改版）时原 content 整体作为正文返回。
+    """
+    if not content.startswith(CRON_WRAP_HEADER):
+        return "", content, "", _looks_like_cron_failure(content)
+    divider_pos = content.find(CRON_WRAP_DIVIDER)
+    footer_pos = content.rfind(CRON_WRAP_FOOTER_PREFIX)
+    if (divider_pos < 0 or footer_pos < 0 or footer_pos <= divider_pos
+            or CRON_WRAP_JOBID_LINE not in content[:divider_pos]):
+        return "", content, "", _looks_like_cron_failure(content)
+    head = content[len(CRON_WRAP_HEADER):divider_pos].split("\n")
+    task_name = head[0].strip()
+    job_id = ""
+    for line in head[1:]:
+        line = line.strip()
+        if line.startswith(CRON_WRAP_JOBID_LINE) and line.endswith(")"):
+            job_id = line[len(CRON_WRAP_JOBID_LINE):-1]
+            break
+    payload = content[divider_pos + len(CRON_WRAP_DIVIDER):footer_pos].strip()
+    body = payload or content
+    hint = content[footer_pos:].lstrip()
+    if hint:
+        body += "\n\n" + hint
+        if job_id:
+            body += f" (job_id: {job_id})"
+    elif job_id:
+        body += f"\n\n(job_id: {job_id})"
+    return task_name, body, job_id, _looks_like_cron_failure(payload)
 
 
 def _import_base_adapter() -> type[Any]:
@@ -172,6 +226,20 @@ class StreamingFeishuMixin:
             msg_id = await engine.complete(chat_id, content)
             if msg_id is not None:
                 return _compat.send_result(success=True, message_id=msg_id)
+        elif (not interim and (metadata or {}).get("job_id")
+                and content.strip() and reply_to is None):
+            # cron 结果投递（scheduler live lane 特征：metadata={job_id, notify}，
+            # 无 thread_id 无 reply 锚——router 对 feishu 不传 reply_to）→ ⏰ cron
+            # 卡片直发 chat，替代「Cronjob Response:」原生富文本；失败通知
+            # （⚠️ Cron...failed / **Status:**...failed）红 header。解析/发送失败
+            # 落回原生文本。带 thread_id 的 bg 交付在上面合并分支已被接走，不相交。
+            task_name, body, cron_job_id, is_failure = _parse_cron_payload(content)
+            msg_id = await engine.send_cron_card(
+                chat_id, body, task_name=task_name, job_id=cron_job_id,
+                run_time=datetime.now().astimezone().isoformat(timespec="minutes"),
+                template="red" if is_failure else "blue")
+            if msg_id is not None:
+                return _compat.send_result(success=True, message_id=msg_id)
 
         return await super().send(chat_id, content, reply_to=reply_to,  # type: ignore[misc]
                                   metadata=metadata, **kwargs)
@@ -281,7 +349,7 @@ class StreamingFeishuMixin:
                 return _compat.send_result(success=False, error=str(exc2))
 
     def _on_card_action_trigger(self, data: Any) -> Any:
-        """SDK 卡片回调 wrapper：hermes_clarify_action → clarify 处理；其余转发官方.
+        """SDK 卡片回调 wrapper：clarify / 模型切换按钮 → 插件处理；其余转发官方.
 
         注入模式必须事后替换 SDK processor.f（绑定方法已快照）；插件模式下本方法
         在类定义期覆写，SDK connect() 拿到的绑定方法就是本版本——零 monkey-patch。
@@ -289,6 +357,30 @@ class StreamingFeishuMixin:
         event = getattr(data, "event", None)
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
+        # v2 behaviors 按钮的 value 在 action.behaviors[*]（action.value 为空）
+        if not action_value:
+            for behavior in getattr(action, "behaviors", None) or []:
+                bv = getattr(behavior, "value", None)
+                if isinstance(bv, dict) and (bv.get("hermes_model_action")
+                                             or bv.get("hermes_clarify_action")):
+                    action_value = bv
+                    break
+        # footer 模型下拉（select_static）：选中项在 action.option/value，形态依
+        # 赖端上实现——宽容提取，提取不到记日志（首次点击校准用）
+        if str(getattr(action, "tag", "") or "").startswith("select"):
+            picked = self._extract_selected_model(action)  # type: ignore[attr-defined]
+            logging.getLogger("gateway.run").info(
+                "[feishu-streaming] model select picked=%s raw_tag=%s", picked,
+                str(getattr(action, "tag", "")))
+            if picked:
+                loop = self._loop  # type: ignore[attr-defined]
+                if not self._loop_accepts_callbacks(loop):  # type: ignore[attr-defined]
+                    return self._card_response()  # type: ignore[attr-defined]
+                # 历史下拉卡（0.17.2）：选中即 switch
+                return self._handle_model_switch_action(
+                    data=data, action_value={"hermes_model_action": "switch",
+                                             "target": picked})
+            return self._card_response()  # type: ignore[attr-defined]
         if isinstance(action_value, dict) and action_value.get("hermes_clarify_action"):
             loop = self._loop  # type: ignore[attr-defined]
             if not self._loop_accepts_callbacks(loop):  # type: ignore[attr-defined]
@@ -297,7 +389,115 @@ class StreamingFeishuMixin:
 
             return _clarify.handle_clarify_card_action(
                 self, event=event, action_value=action_value)
+        if isinstance(action_value, dict) and action_value.get("hermes_model_action"):
+            loop = self._loop  # type: ignore[attr-defined]
+            if not self._loop_accepts_callbacks(loop):  # type: ignore[attr-defined]
+                return self._card_response()  # type: ignore[attr-defined]
+            return self._handle_model_switch_action(
+                data=data, action_value=action_value)
         return super()._on_card_action_trigger(data)  # type: ignore[misc]
+
+    @staticmethod
+    def _extract_selected_model(action: Any) -> str:
+        """从 select_static 回调动作里提取选中的模型名（端上形态不一，宽容取值）."""
+        option = getattr(action, "option", None)
+        candidates = (getattr(option, "value", None), option,
+                      getattr(action, "value", None),
+                      getattr(action, "input_value", None))
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+            if isinstance(candidate, dict):
+                v = candidate.get("value") or candidate.get("model")
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+        return ""
+
+    def _handle_model_switch_action(self, *, data: Any, action_value: dict[str, Any]) -> Any:
+        """footer 🧠⇄（pick）与选择卡按钮（switch）的统一入口.
+
+        pick：鉴权后由引擎 client 补发模型选择卡（原生 interactive 消息）；
+        switch：合成 `/model <target>` 命令事件（官方 synthetic 通道，sender=
+        点击者），hermes 原生切换（session 级 override、重启持久），并同步替换
+        选择卡为确认卡。完成卡本体原地不变。
+        """
+        event = getattr(data, "event", None)
+        action_kind = str(action_value.get("hermes_model_action") or "")
+        target = str(action_value.get("target") or "").strip()
+        open_id = str(getattr(getattr(event, "operator", None), "open_id", "") or "")
+        chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
+        token = str(getattr(event, "token", "") or "")
+        if not open_id or not chat_id or (action_kind == "switch" and not target):
+            return self._card_response()  # type: ignore[attr-defined]
+        # 官方同款 token 去重：防双击重复派发
+        if token and self._is_card_action_duplicate(token):  # type: ignore[attr-defined]
+            return self._card_response()  # type: ignore[attr-defined]
+        if not self._is_interactive_operator_authorized(open_id):  # type: ignore[attr-defined]
+            logging.getLogger("gateway.run").warning(
+                "[feishu-streaming] model switch unauthorized: %s", open_id[:16])
+            return self._card_response()  # type: ignore[attr-defined]
+
+        if action_kind == "pick":
+            submitted = self._submit_on_loop(  # type: ignore[attr-defined]
+                self._loop,  # type: ignore[attr-defined]
+                self._send_model_picker(chat_id=chat_id))
+            logging.getLogger("gateway.run").info(
+                "[feishu-streaming] model picker requested: chat=%s submitted=%s",
+                chat_id[:12], submitted)
+            return self._card_response()  # type: ignore[attr-defined]
+
+        if action_kind == "switch":
+            submitted = self._submit_on_loop(  # type: ignore[attr-defined]
+                self._loop,  # type: ignore[attr-defined]
+                self._dispatch_model_switch(chat_id=chat_id, open_id=open_id,
+                                            target=target, raw=data, message_id=token))
+            logging.getLogger("gateway.run").info(
+                "[feishu-streaming] model switch click: target=%s chat=%s submitted=%s",
+                target, chat_id[:12], submitted)
+            # 同步替换选择卡为确认卡（clarify resolved 同款模式）
+            return self._card_response(  # type: ignore[attr-defined]
+                card_data=build_model_switch_ack_card(target))
+        return self._card_response()  # type: ignore[attr-defined]
+
+    async def _send_model_picker(self, chat_id: str) -> None:
+        data = self._engine().model_picker_data(chat_id)  # type: ignore[attr-defined]
+        if not data:
+            logging.getLogger("gateway.run").warning(
+                "[feishu-streaming] model picker unavailable (cycle <2)")
+            return
+        card = build_model_picker_card(data["current"], data["models"])
+        await self._engine()._client.send_card_to_chat(  # type: ignore[attr-defined]
+            chat_id, card)
+
+    async def _dispatch_model_switch(self, *, chat_id: str, open_id: str,
+                                     target: str, raw: Any, message_id: str) -> None:
+        from types import SimpleNamespace
+
+        try:
+            from gateway.platforms.event import MessageType
+        except ImportError:
+            MessageType = None  # type: ignore[assignment]
+        kwargs: dict[str, Any] = {}
+        if MessageType is not None:
+            kwargs["message_type"] = MessageType.COMMAND
+        # chat_type 必须按真实会话解析：/model 的 override 键从 source.chat_type
+        # 派生（dm:oc_xxx / group:oc_xxx）——官方按钮处理器硬编码 "group"，DM 里
+        # 点按钮会把 override 写进 group 键，真实 dm 会话读不到（2026-10-09 实测）。
+        # 注意用 raw_type（飞书原始形态 p2p/group）：_resolve_source_chat_type 的
+        # 回退分支字面比较 "p2p"，映射后的 "dm" 会被再次错位成 group。
+        try:
+            chat_info = await self.get_chat_info(chat_id)  # type: ignore[attr-defined]
+        except Exception:
+            chat_info = {}
+        chat_type = str((chat_info or {}).get("raw_type") or "") or "p2p"
+        await self._dispatch_synthetic_event(  # type: ignore[attr-defined]
+            text=f"/model {target}",
+            chat_id=chat_id,
+            sender_id=SimpleNamespace(open_id=open_id, user_id=None, union_id=None),
+            event_chat_type=chat_type, raw_message=raw,
+            message_id=message_id or str(uuid.uuid4()),
+            **kwargs,
+        )
 
     async def retire_clarify_card(self, clarify_id: str, notice: Any = None) -> None:
         """官方钩子：clarify 未点击而终结（超时/重置/自由文本取代）时清理状态.

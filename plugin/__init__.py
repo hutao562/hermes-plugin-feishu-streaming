@@ -16,6 +16,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -154,6 +155,7 @@ def _build_scoped_engine() -> tuple[ChatCardEngine, Any]:
         footer_fields=_footer_config("fields"),
         footer_show_label=_footer_config("show_label", False),
         footer_enabled=_footer_config("enabled", True),
+        model_cycle=_model_cycle_config(),
         # header（完成态状态条）与注入模式同源读 streaming.header 段；
         # 漏接会让红卡等 header 依赖特性静默失效
         header_enabled=_header_config(),
@@ -268,6 +270,35 @@ def _fanout_hooks_to_profile_scopes(hooks: dict[str, Any], manifest: Any = None)
 # 跨 engine 钩子路由（multiplex 下每 profile 一个 engine）
 _ENGINES: list[ChatCardEngine] = []
 _ENGINES_LOCK = threading.Lock()
+
+
+def _model_cycle_config() -> list[str]:
+    """footer 模型切换按钮的轮换清单.
+
+    显式 `streaming.footer.model_cycle: [a, b]` 优先；缺省从同目录 config.yaml
+    的 `model.default` + `fallback_providers[].model` 推导（去重保序）。
+    """
+    explicit = _footer_config("model_cycle")
+    if isinstance(explicit, list) and explicit:
+        return [str(m).strip() for m in explicit if str(m).strip()]
+    try:
+        import yaml
+
+        from ._vendor.config import _config_path
+
+        raw = yaml.safe_load(_config_path().read_text(encoding="utf-8")) or {}
+    except Exception:
+        return []
+    models: list[str] = []
+    model_cfg = raw.get("model") or {}
+    default = str((model_cfg or {}).get("default") or "").strip()
+    if default:
+        models.append(default)
+    for fb in raw.get("fallback_providers") or []:
+        name = str((fb or {}).get("model") or "").strip()
+        if name and name not in models:
+            models.append(name)
+    return models
 
 
 def _footer_config(key: str, default: Any = None) -> Any:
@@ -426,27 +457,50 @@ def _make_usage_hook() -> Any:
 
 
 def _route_usage_engine(engines: list[ChatCardEngine], session_id: str) -> ChatCardEngine | None:
-    """session key 里的 chat → 拥有该 chat 会话的 engine；无命中回退唯一 engine."""
+    """session key 里的 chat → 拥有该 chat 会话的 engine；无命中回退唯一 engine.
+
+    multiplex（≥2 engine，10-08 晚 fan-out 后 boot 即建双 engine）下 agent.session_id
+    是 date_hash 形、不含 chat——单 engine 兜底失效即「footer 只剩时间」回归的根因；
+    补「恰好一个 engine 有进行中回合」的兜底（与 on_stream_delta 同一判据，creating
+    也算活跃）。并发歧义时放弃，footer 退化为纯时长。
+    """
     chat = ChatCardEngine._chat_of_session(session_id)
     if chat:
         owners = [e for e in engines if e.session_for(chat) is not None]
         if len(owners) == 1:
             return owners[0]
-    return engines[0] if len(engines) == 1 else None
+    if len(engines) == 1:
+        return engines[0]
+    actives = [(e, e.open_sessions()) for e in engines]
+    actives = [(e, s) for e, s in actives if s]
+    if len(actives) == 1 and len(actives[0][1]) == 1:
+        return actives[0][0]
+    return None
 
 
 def _make_standalone_sender() -> Any:
-    """cron 无网关进程的投递：渲染 cron 卡片后经 FeishuClient 发送."""
+    """cron 无网关进程的投递：渲染 cron 卡片后经 FeishuClient 发送.
+
+    返回 dict（``{"success", "message_id"}``）——hermes 消费端对结果做
+    ``result.get("error"/"warnings")``，裸 str 会在发送成功后炸成 delivery_failed。
+    wrap 信封同 live lane 一样拆掉（⏰ header 用任务名）。
+    """
     from ._vendor.cardkit.builder import build_cron_card
+    from .adapter import _parse_cron_payload
 
     async def standalone_send(pconfig: Any, chat_id: str, message: str, *,
                               thread_id: str | None = None,
                               media_files: list | None = None,
                               force_document: bool = False) -> Any:
-        card = build_cron_card(message)
+        task_name, body, _job_id, is_failure = _parse_cron_payload(message)
+        card = build_cron_card(
+            body, task_name=task_name,
+            run_time=datetime.now().astimezone().isoformat(timespec="minutes"),
+            template="red" if is_failure else "blue")
         client = _LazyClient()
         card_id = await client.cardkit_create(card)
-        return await client.send_card_to_chat(
+        msg_id = await client.send_card_to_chat(
             chat_id, {"type": "card", "data": {"card_id": card_id}})
+        return {"success": True, "message_id": msg_id}
 
     return standalone_send

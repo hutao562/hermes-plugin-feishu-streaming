@@ -355,6 +355,41 @@ def _notice_markdown(text: str) -> str:
     return f"<font color='grey'>{compact}</font>"
 
 
+def build_model_picker_card(current: str, models: list[str]) -> dict[str, Any]:
+    """模型选择卡（原生 interactive 消息，非 cardkit 实体）— 🧠⇄ 点击后补发.
+
+    原生消息路径支持 action 容器（clarify 同款），按钮名 = 模型名渲染有保证；
+    选中经回调合成 `/model <name>`。当前模型打 ✅。"""
+    buttons = [
+        {"tag": "button",
+         "text": {"tag": "plain_text", "content": (f"✅ {m}" if m == current else m)},
+         "type": "default",
+         "value": {"hermes_model_action": "switch", "target": m}}
+        for m in models
+    ]
+    # 每行最多 3 个，多了换行
+    elements = [{"tag": "action", "actions": buttons[i:i + 3]}
+                for i in range(0, len(buttons), 3)]
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text",
+                             "content": f"🧠 切换模型（当前：{current}）"},
+                   "template": "blue"},
+        "elements": elements,
+    }
+
+
+def build_model_switch_ack_card(model: str) -> dict[str, Any]:
+    """模型选择卡点击后的同步确认卡（替换选择卡本体）."""
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": f"✅ 已切换到 {model}"},
+                   "template": "green"},
+        "elements": [{"tag": "markdown",
+                      "content": "下一回合起使用该模型（以 footer 显示为准）。"}],
+    }
+
+
 def _build_footer_elements(
     footer_data: dict | None,
     is_error: bool = False,
@@ -564,6 +599,7 @@ def build_complete_card(
     body_text_size: str = "normal_v2",
     show_tool_use: bool = True,
     width_mode: str = "default",
+    model_switch: dict | None = None,
 ) -> dict[str, Any]:
     """完成态流式卡片 — 按 segments 顺序渲染."""
     elements: list[dict] = []
@@ -606,16 +642,45 @@ def build_complete_card(
         elements.append({"tag": "markdown", "content": f"![image]({img_key})"})
 
     if footer_enabled:
-        elements.extend(
-            _build_footer_elements(
-                footer_data,
-                is_error,
-                is_aborted,
-                fields=footer_fields,
-                show_label=footer_show_label,
-                text_size=footer_text_size,
-            )
+        footer_elems = _build_footer_elements(
+            footer_data,
+            is_error,
+            is_aborted,
+            fields=footer_fields,
+            show_label=footer_show_label,
+            text_size=footer_text_size,
         )
+        # 最右极简按钮（🧠⇄ tiny）：点击 → 机器人弹出模型选择卡（原生 interactive
+        # 消息、clarify 同款 action 容器，按钮名渲染有保证——v2 select_static
+        # 选项名端上渲染空白已弃用）。behaviors 携带 value——v2 实体卡不支持
+        # action 容器（200861）。
+        if footer_enabled and model_switch and model_switch.get("current"):
+            btn = {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🧠⇄"},
+                "type": "default", "size": "tiny",
+                "behaviors": [{"type": "callback",
+                               "value": {"hermes_model_action": "pick",
+                                         "from": str(model_switch["current"])}}],
+            }
+            text_elems = [e for e in footer_elems if e.get("tag") == "markdown"]
+            if text_elems:
+                elements.append(footer_elems[0])  # hr
+                elements.append({
+                    "tag": "column_set", "flex_mode": "none",
+                    "background_style": "default",
+                    "columns": [
+                        # weighted 撑满 → 按钮列贴最右
+                        {"tag": "column", "width": "weighted", "weight": 1,
+                         "elements": text_elems},
+                        {"tag": "column", "width": "auto", "elements": [btn]},
+                    ],
+                })
+            else:
+                elements.extend(footer_elems)
+                elements.append(btn)
+        else:
+            elements.extend(footer_elems)
 
     summary_text = ""
     for seg in reversed(segments):
@@ -661,9 +726,12 @@ def _format_run_time(run_time: str) -> str:
 
 def build_cron_card(
     content: str, *, task_name: str = "", run_time: str = "",
-    image_keys: list[str] | None = None,
+    image_keys: list[str] | None = None, template: str = "blue",
 ) -> dict[str, Any]:
-    """Cron 推送用的极简静态卡片 — schema 2.0，可选 header + markdown 内容 + 图片."""
+    """Cron 推送用的极简静态卡片 — schema 2.0，可选 header + markdown 内容 + 图片.
+
+    ``template`` 是 header 配色（飞书 header template 名）——失败通知传 "red"。
+    """
     card: dict[str, Any] = {
         "schema": "2.0",
         "config": {"wide_screen_mode": True, "locales": _LOCALES},
@@ -673,7 +741,7 @@ def build_cron_card(
     if header_parts:
         card["header"] = {
             "title": {"tag": "lark_md", "content": ":Alarm: " + " · ".join(header_parts)},
-            "template": "blue",
+            "template": template,
         }
     if not content.strip():
         return card

@@ -238,6 +238,30 @@ def check_deploy_freshness(report: Report, repo_plugin_dir: Path | None, deploye
         report.add("部署一致性", OK, "部署目录与仓库一致")
 
 
+def check_cron_card(report: Report, home: Path, deployed: Path | None) -> None:
+    """cron 卡链路病征（v0.16.0）：wrap_response 开关 + cron 分支已部署."""
+    config, _why = _load_yaml(home / "config.yaml")
+    wrap = _config_get(config or {}, "cron", "wrap_response")
+    if wrap is False:
+        report.add("cron.wrap_response", WARN, "false",
+                   "cron 投递将不带「Cronjob Response:」信封 → 卡片无任务名 header（降级可用，"
+                   "不影响投递本身）")
+    else:
+        report.add("cron.wrap_response", OK, "开（默认）")
+
+    has_branch = False
+    if deployed is not None:
+        try:
+            has_branch = "send_cron_card" in (deployed / "adapter.py").read_text(encoding="utf-8")
+        except OSError:
+            has_branch = False
+    if has_branch:
+        report.add("cron 卡分支", OK, "send_cron_card 已在部署目录")
+    else:
+        report.add("cron 卡分支", FAIL, "部署目录 adapter.py 无 send_cron_card",
+                   "部署的是旧版插件——重新拷贝 plugin/ 到 ~/.hermes/plugins/feishu-streaming 并重启网关")
+
+
 def check_contract(report: Report, home: Path) -> None:
     root = _hermes_source_root(home)
     if root is None:
@@ -345,6 +369,7 @@ def run_checks(home: Path, repo_plugin_dir: Path | None) -> Report:
     check_credentials(report, home)
     deployed = check_plugin_dir(report, home)
     check_deploy_freshness(report, repo_plugin_dir, deployed)
+    check_cron_card(report, home, deployed)
     check_contract(report, home)
     check_runtime_deps(report, home)
     check_injection_residue(report, home)

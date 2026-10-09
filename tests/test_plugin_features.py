@@ -8,6 +8,7 @@ from __future__ import annotations
 import sys
 import types
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from test_plugin_mode import _FakeBaseAdapter, _mock_client, _settle
@@ -1111,3 +1112,441 @@ def test_fanout_respects_profile_optout(tmp_path) -> None:
 
     (tmp_path / "config.yaml").unlink()
     assert plugin_pkg._profile_disabled_plugin(tmp_path) is False  # 坏文件不退出
+
+
+# ── cron 结果投递 → ⏰ cron 卡片（scheduler live lane，无锚）──
+
+_CRON_WRAPPED = (
+    "Cronjob Response: 举水乡情·十日读\n"
+    "(job_id: 426179a81bb3)\n"
+    "-------------\n\n"
+    "📖 举水乡情 · 第 9 / 10 篇\n\n正文内容在这里。\n\n"
+    'To stop or manage this job, send me a new message (e.g. "stop reminder 举水乡情·十日读").'
+)
+
+# hermes 失败通知的两个真实形状（copy 表公共前缀 / 脚本门）
+_CRON_FAILURE_WRAPPED = (
+    "Cronjob Response: 会失败的job\n"
+    "(job_id: deadbeef)\n"
+    "-------------\n\n"
+    "⚠️ Cron '会失败的job' failed: its script timed out. No model was invoked. \n\n"
+    'To stop or manage this job, send me a new message (e.g. "stop reminder 会失败的job").'
+)
+_CRON_FAILURE_SCRIPT_GATE = (
+    "Cronjob Response: 脚本job\n"
+    "(job_id: cafebabe)\n"
+    "-------------\n\n"
+    "**Status:** script failed\n\n{output}\n\n"
+    'To stop or manage this job, send me a new message (e.g. "stop reminder 脚本job").'
+)
+
+
+def test_parse_cron_payload_splits_wrapper() -> None:
+    from plugin.adapter import _parse_cron_payload
+
+    task_name, body, job_id, is_failure = _parse_cron_payload(_CRON_WRAPPED)
+    assert task_name == "举水乡情·十日读"
+    assert job_id == "426179a81bb3"
+    assert is_failure is False
+    assert "Cronjob Response" not in body
+    assert "-------------" not in body
+    assert "第 9 / 10 篇" in body
+    assert "stop reminder" in body and "(job_id: 426179a81bb3)" in body
+
+
+def test_parse_cron_payload_detects_failure() -> None:
+    """两个上游失败形状（copy 表前缀 / 脚本门）→ 红 header；成功正文不误判."""
+    from plugin.adapter import _parse_cron_payload
+
+    for raw in (_CRON_FAILURE_WRAPPED, _CRON_FAILURE_SCRIPT_GATE):
+        assert _parse_cron_payload(raw)[3] is True, raw[:60]
+    # 用户脚本输出里出现 "failed" 字样但非 hermes copy 形状 → 不误判
+    assert _parse_cron_payload(_CRON_WRAPPED)[3] is False
+    assert _parse_cron_payload(
+        "Cronjob Response: 监控\n(job_id: x)\n-------------\n\n磁盘使用率 88%，未达 failed 阈值\n"
+        "\n\nTo stop or manage this job, send me a new message (e.g. \"stop reminder 监控\").")[3] is False
+
+
+def test_parse_cron_payload_passthrough_on_mismatch() -> None:
+    """wrap_response=false 或上游改版 → 原样返回，不硬拆."""
+    from plugin.adapter import _parse_cron_payload
+
+    for raw in ("普通通知文本", "Cronjob Response: 缺分隔线\n(job_id: x)", ""):
+        task_name, body, job_id, is_failure = _parse_cron_payload(raw)
+        assert (task_name, body, job_id) == ("", raw, "")
+        assert is_failure is False
+
+
+@pytest.mark.asyncio
+async def test_send_cron_failure_renders_red_card(adapter) -> None:
+    """失败通知 → 红 header cron 卡（成功是蓝的）."""
+    result = await adapter.send(
+        "chat1", _CRON_FAILURE_WRAPPED, metadata={"job_id": "deadbeef", "notify": True})
+
+    assert result.success is True
+    card = adapter._engine()._client.cardkit_create.call_args[0][0]
+    assert card["header"]["template"] == "red"
+    assert "会失败的job" in card["header"]["title"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_send_cron_result_renders_card(adapter) -> None:
+    """job_id metadata + 无锚 → ⏰ cron 卡片直发，不走原生文本."""
+    result = await adapter.send(
+        "chat1", _CRON_WRAPPED,
+        metadata={"job_id": "426179a81bb3", "notify": True})
+
+    assert result.success is True
+    assert result.message_id == "om_card_msg"
+    assert adapter.native_sends == []
+    client = adapter._engine()._client
+    client.cardkit_create.assert_called_once()
+    card = client.cardkit_create.call_args[0][0]
+    assert "举水乡情·十日读" in card["header"]["title"]["content"]
+    body_md = "".join(e["content"] for e in card["body"]["elements"])
+    assert "第 9 / 10 篇" in body_md and "stop reminder" in body_md
+    client.send_card_to_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_send_cron_result_card_failure_falls_back_native(adapter) -> None:
+    """建卡失败 → 落回原生文本（fail-open，cron 结果不能被卡片异常吞掉）."""
+    adapter._engine()._client.cardkit_create = AsyncMock(side_effect=RuntimeError("api down"))
+
+    result = await adapter.send(
+        "chat1", _CRON_WRAPPED, metadata={"job_id": "j1", "notify": True})
+
+    assert result.success is True
+    assert result.message_id == "om_native"
+    assert adapter.native_sends and adapter.native_sends[0][1] == _CRON_WRAPPED
+
+
+@pytest.mark.asyncio
+async def test_send_unanchored_without_jobid_stays_native(adapter) -> None:
+    """无锚系统通知（watcher 等，无 job_id）保持原生文本 — 不被 cron 分支误吃."""
+    result = await adapter.send("chat1", "watcher 命中通知")
+
+    assert result.message_id == "om_native"
+    assert adapter.native_sends
+    assert not adapter._engine()._client.cardkit_create.called
+
+
+@pytest.mark.asyncio
+async def test_standalone_sender_returns_dict_and_parses_wrapper(monkeypatch) -> None:
+    """无网关 standalone 投递：返回 dict（hermes 消费端 result.get 契约）+ 拆 wrap 信封."""
+    import plugin as plugin_pkg
+
+    class _FakeLazyClient:
+        async def cardkit_create(self, card: dict) -> str:
+            _FakeLazyClient.card = card
+            return "card_xyz"
+
+        async def send_card_to_chat(self, chat_id: str, card: dict) -> str:
+            return "om_standalone_msg"
+
+    monkeypatch.setattr(plugin_pkg, "_LazyClient", _FakeLazyClient)
+    send = plugin_pkg._make_standalone_sender()
+
+    result = await send(None, "chat1", _CRON_WRAPPED)
+
+    assert result == {"success": True, "message_id": "om_standalone_msg"}
+    card = _FakeLazyClient.card
+    assert "举水乡情·十日读" in card["header"]["title"]["content"]
+    body_md = "".join(e["content"] for e in card["body"]["elements"])
+    assert "Cronjob Response" not in body_md and "第 9 / 10 篇" in body_md
+
+
+# ── usage 路由：multiplex 双 engine 下 session_id 不含 chat 的兜底 ──
+
+
+@pytest.mark.asyncio
+async def test_open_sessions_counts_creating_and_streaming() -> None:
+    engine = ChatCardEngine(_mock_client())
+    chat = "oc_" + "c" * 20
+    engine.on_turn_started(chat)
+    assert [s.state for s in engine.open_sessions()] == ["creating"]
+    engine.on_draft(chat, "草稿")
+    await _settle(engine)
+    assert [s.state for s in engine.open_sessions()] == ["streaming"]
+
+
+@pytest.mark.asyncio
+async def test_route_usage_engine_multiplex_active_fallback() -> None:
+    from plugin import _route_usage_engine
+
+    e1, e2 = ChatCardEngine(_mock_client()), ChatCardEngine(_mock_client())
+    # 双 engine 都无进行中回合 → 歧义放弃（10-08 回归的形态）
+    assert _route_usage_engine([e1, e2], "20261009_100000_abc123") is None
+    # 恰好一个有进行中回合（creating 也算）→ 路由到它
+    e2.on_turn_started("oc_" + "a" * 20)
+    assert _route_usage_engine([e1, e2], "20261009_100000_abc123") is e2
+    # 两个都有 → 歧义放弃
+    e1.on_turn_started("oc_" + "b" * 20)
+    assert _route_usage_engine([e1, e2], "20261009_100000_abc123") is None
+    # 单 engine 兜底保留
+    assert _route_usage_engine([e1], "whatever") is e1
+
+
+@pytest.mark.asyncio
+async def test_complete_without_draft_creates_answer_segment(adapter) -> None:
+    """短回答整段直发、无 draft 帧 → complete 用 final_text 补建 ANSWER 段（不渲染 Done. 占位）."""
+    chat = "oc_" + "d" * 20
+    engine = adapter._engine()
+    engine.on_turn_started(chat)
+    await _settle(engine)
+    engine.on_reasoning("", "想了一下")
+    await _settle(engine)
+
+    msg_id = await engine.complete(chat, "退了。有事喊我。")
+
+    assert msg_id == "om_card_msg"
+    card = engine._client.cardkit_update.call_args[0][1]
+    body_md = "".join(e.get("content", "") for e in card["body"]["elements"]
+                      if e.get("tag") == "markdown")
+    assert "退了。有事喊我。" in body_md
+    assert "Done." not in body_md
+
+
+# ── footer 模型循环切换按钮：渲染 + 路由 + 命令合成 ──
+
+
+def _find_switch_buttons(card: dict) -> list[dict]:
+    """递归收集模型切换按钮（tiny 🔄 嵌在 footer column_set 内）."""
+    found: list[dict] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("tag") == "button":
+                for b in node.get("behaviors", []) or []:
+                    if isinstance(b.get("value"), dict) and b["value"].get("hermes_model_action"):
+                        found.append(node)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(card.get("body", {}))
+    return found
+
+
+def test_build_complete_card_renders_model_switch_button() -> None:
+    from plugin._vendor.cardkit.builder import build_complete_card
+    from plugin._vendor.streaming.segments import Segment, SegmentType
+
+    seg = Segment(SegmentType.ANSWER, "answer_0")
+    seg.text = "回答"
+    card = build_complete_card(
+        segments=[seg], all_tool_steps=[],
+        footer_data={"duration": 1.0, "model": "deepseek-flash"},
+        model_switch={"current": "deepseek-flash"})
+    buttons = _find_switch_buttons(card)
+    assert len(buttons) == 1  # v2 独立 button（action 容器被 CardKit v2 拒绝，200861）
+    btn = buttons[0]
+    assert btn["text"]["content"] == "🧠⇄"
+    assert btn["behaviors"][0]["value"] == {"hermes_model_action": "pick",
+                                            "from": "deepseek-flash"}
+
+
+def test_build_complete_card_no_button_without_model_switch() -> None:
+    from plugin._vendor.cardkit.builder import build_complete_card
+    from plugin._vendor.streaming.segments import Segment, SegmentType
+
+    seg = Segment(SegmentType.ANSWER, "answer_0")
+    seg.text = "回答"
+    card = build_complete_card(segments=[seg], all_tool_steps=[])
+    assert not _find_switch_buttons(card)
+
+
+def test_engine_model_switch_target_cycle() -> None:
+    engine = ChatCardEngine(_mock_client(),
+                            model_cycle=["deepseek-flash", "glm-5.3-flash"])
+    assert engine._model_switch_data("deepseek-flash") == {"current": "deepseek-flash"}
+    assert engine._model_switch_data("glm-5.3-flash") == {"current": "glm-5.3-flash"}
+    # 当前模型未知 / 清单不足 → 不出按钮
+    assert engine._model_switch_data("") is None
+    assert ChatCardEngine(_mock_client(), model_cycle=["solo"])._model_switch_data("solo") is None
+    assert ChatCardEngine(_mock_client())._model_switch_data("x") is None
+
+
+def test_build_model_picker_card_lists_models() -> None:
+    from plugin._vendor.cardkit.builder import build_model_picker_card
+
+    card = build_model_picker_card("deepseek-flash", ["deepseek-flash", "glm-5.3-flash"])
+    buttons = [b for e in card["elements"] for b in e["actions"]]
+    assert [b["text"]["content"] for b in buttons] == ["✅ deepseek-flash", "glm-5.3-flash"]
+    assert buttons[1]["value"] == {"hermes_model_action": "switch",
+                                   "target": "glm-5.3-flash"}
+
+
+def test_build_model_switch_ack_card() -> None:
+    from plugin._vendor.cardkit.builder import build_model_switch_ack_card
+
+    card = build_model_switch_ack_card("glm-5.3-flash")
+    assert "已切换到 glm-5.3-flash" in card["header"]["title"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_complete_card_carries_model_switch_button(adapter) -> None:
+    """complete 用 usage 里的模型算按钮，NOTICE 重渲透传不丢."""
+    chat = "oc_" + "e" * 20
+    engine = adapter._engine()
+    engine._model_cycle = ["deepseek-flash", "glm-5.3-flash"]
+    engine.on_turn_started(chat)
+    await _settle(engine)
+    engine.record_usage("20261009_120000_aabbcc", {"prompt_tokens": 100,
+                                                   "completion_tokens": 10},
+                        model="deepseek-flash")
+    await engine.complete(chat, "回答文本")
+    card = engine._client.cardkit_update.call_args[0][1]
+    buttons = _find_switch_buttons(card)
+    assert buttons and buttons[0]["behaviors"][0]["value"] == {
+        "hermes_model_action": "pick", "from": "deepseek-flash"}
+    # NOTICE 追加重渲：按钮仍在
+    await engine.append_notice(chat, "后续通知")
+    assert _find_switch_buttons(engine._client.cardkit_update.call_args[0][1])
+
+
+def _card_action_event(value: dict | None = None, token: str = "tok1") -> Any:
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        event=SimpleNamespace(
+            action=SimpleNamespace(value=value or {"hermes_model_action": "switch",
+                                                   "target": "glm-5.3-flash"}),
+            operator=SimpleNamespace(open_id="ou_admin"),
+            context=SimpleNamespace(open_chat_id="oc_" + "f" * 20),
+            token=token))
+
+
+@pytest.mark.asyncio
+async def test_model_pick_action_sends_picker_card(adapter) -> None:
+    """🧠⇄ 点击 → 引擎 client 补发选择卡（当前模型 + 清单按钮）."""
+    engine = adapter._engine()
+    engine._model_cycle = ["deepseek-flash", "glm-5.3-flash"]
+    engine.record_usage("20261009_130000_xxyyzz", {"prompt_tokens": 1, "completion_tokens": 1},
+                        model="deepseek-flash")
+    scheduled: list[Any] = []
+    adapter._loop = object()
+    adapter._card_response = lambda *a, **k: k.get("card_data") or "empty_response"
+    adapter._is_interactive_operator_authorized = lambda open_id: True
+    adapter._is_card_action_duplicate = lambda token: False
+    adapter._submit_on_loop = lambda loop, coro: (scheduled.append(coro), True)[1]
+
+    adapter._handle_model_switch_action(
+        data=_card_action_event(value={"hermes_model_action": "pick",
+                                       "from": "deepseek-flash"}),
+        action_value={"hermes_model_action": "pick", "from": "deepseek-flash"})
+
+    assert len(scheduled) == 1
+    await scheduled[0]
+    sent = engine._client.send_card_to_chat.call_args[0][1]
+    assert "切换模型" in sent["header"]["title"]["content"]
+    buttons = [b for e in sent["elements"] for b in e["actions"]]
+    assert len(buttons) == 2
+
+
+def test_extract_selected_model_from_action_shapes() -> None:
+    from types import SimpleNamespace
+
+    from plugin.adapter import StreamingFeishuMixin
+
+    extract = StreamingFeishuMixin._extract_selected_model
+    assert extract(SimpleNamespace(option=SimpleNamespace(value="glm-5.3-flash"))) == "glm-5.3-flash"
+    assert extract(SimpleNamespace(option="deepseek-flash")) == "deepseek-flash"
+    assert extract(SimpleNamespace(value={"value": "glm-5.3-flash"})) == "glm-5.3-flash"
+    assert extract(SimpleNamespace()) == ""
+
+
+@pytest.mark.asyncio
+async def test_model_switch_action_dispatches_model_command(adapter, monkeypatch) -> None:
+    """按钮点击 → 鉴权 → 合成 /model <target> synthetic 命令."""
+    dispatched: list[dict] = []
+
+    async def _fake_dispatch(**kwargs: Any) -> None:
+        dispatched.append(kwargs)
+
+    scheduled: list[Any] = []
+    adapter._loop = object()
+    adapter._card_response = lambda *a, **k: k.get("card_data") or "empty_response"
+    adapter._is_interactive_operator_authorized = lambda open_id: True
+    adapter._is_card_action_duplicate = lambda token: False
+    adapter._submit_on_loop = lambda loop, coro: (scheduled.append(coro), True)[1]
+    monkeypatch.setattr(adapter, "_dispatch_model_switch",
+                        lambda **kw: _fake_dispatch(**kw))
+
+    resp = adapter._handle_model_switch_action(
+        data=_card_action_event(), action_value={"hermes_model_action": "switch",
+                                                 "target": "glm-5.3-flash"})
+    assert len(scheduled) == 1
+    await scheduled[0]  # 执行被调度的合成协程
+    assert len(dispatched) == 1
+    # text=f"/model {target}" 在 _dispatch_model_switch 内拼装，此处验证路由参数
+    assert dispatched[0]["target"] == "glm-5.3-flash"
+    assert dispatched[0]["chat_id"] == "oc_" + "f" * 20
+    assert dispatched[0]["open_id"] == "ou_admin"
+    # 同步确认卡替换选择卡
+    assert "已切换到 glm-5.3-flash" in str(resp)
+
+
+@pytest.mark.asyncio
+async def test_model_switch_action_rejects_unauthorized(adapter, monkeypatch) -> None:
+    """未授权点击者 → 不派发命令."""
+    dispatched: list[dict] = []
+
+    async def _fake_dispatch(**kwargs: Any) -> None:
+        dispatched.append(kwargs)
+
+    adapter._loop = object()
+    adapter._card_response = lambda *a, **k: k.get("card_data") or "empty_response"
+    adapter._is_interactive_operator_authorized = lambda open_id: False
+    adapter._is_card_action_duplicate = lambda token: False
+    adapter._submit_on_loop = lambda loop, coro: (coro.close(), True)[1]
+    monkeypatch.setattr(adapter, "_dispatch_model_switch",
+                        lambda **kw: _fake_dispatch(**kw))
+
+    adapter._handle_model_switch_action(
+        data=_card_action_event(), action_value={"hermes_model_action": "switch",
+                                                 "target": "glm-5.3-flash"})
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_model_switch_resolves_real_chat_type(adapter) -> None:
+    """/model 的 override 键派生自 chat_type——DM 必须解析成 p2p（dm 键），不能
+    沿用官方按钮处理器的 group 硬编码."""
+    sent: list[dict] = []
+
+    async def _fake_synth(**kwargs: Any) -> None:
+        sent.append(kwargs)
+
+    async def _fake_chat_info(chat_id: str) -> dict:
+        return {"type": "p2p", "name": "涛哥"}
+
+    adapter._dispatch_synthetic_event = _fake_synth
+    adapter.get_chat_info = _fake_chat_info
+
+    await adapter._dispatch_model_switch(chat_id="oc_" + "a" * 20, open_id="ou_admin",
+                                         target="glm-5.3-flash",
+                                         raw=object(), message_id="tok9")
+    assert sent[0]["text"] == "/model glm-5.3-flash"
+    assert sent[0]["event_chat_type"] == "p2p"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_model_switch_uses_raw_type_for_dm(adapter) -> None:
+    """映射后的 type='dm' 会被解析器再次错位成 group——必须传 raw_type='p2p'."""
+    sent: list[dict] = []
+
+    async def _fake_synth(**kwargs: Any) -> None:
+        sent.append(kwargs)
+
+    async def _fake_chat_info(chat_id: str) -> dict:
+        return {"type": "dm", "raw_type": "p2p", "name": "涛哥"}
+
+    adapter._dispatch_synthetic_event = _fake_synth
+    adapter.get_chat_info = _fake_chat_info
+
+    await adapter._dispatch_model_switch(chat_id="oc_" + "b" * 20, open_id="ou_admin",
+                                         target="glm-5.3-flash",
+                                         raw=object(), message_id="tok7")
+    assert sent[0]["event_chat_type"] == "p2p"

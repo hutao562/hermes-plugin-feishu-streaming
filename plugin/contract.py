@@ -21,6 +21,15 @@ from pathlib import Path
 # 相对 hermes 源码根的文件 → 该文件必须包含的锚点（子串匹配，带语义注释）。
 # 子串而非正则：锚点应力求贴近"契约"本身（调用形态/元数据键），上游无害的
 # 重排不该误报——宁可锚点粒度粗一点，也别让检查流于形式。
+
+# ── cron wrap 信封（cron 卡解析的字面契约，v0.16.0）──
+# plugin/adapter._parse_cron_payload 的输入格式；常量即锚点 needle 的来源：
+# 上游改文案 → 锚点缺失 → 每日 hermes-check 当天报警，而非 cron 卡静默降级。
+CRON_WRAP_HEADER = "Cronjob Response: "
+CRON_WRAP_JOBID_LINE = "(job_id: "
+CRON_WRAP_DIVIDER = "\n-------------\n\n"
+CRON_WRAP_FOOTER_PREFIX = '\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder '
+
 CONTRACT_ANCHORS: dict[str, tuple[tuple[str, str], ...]] = {
     "gateway/stream_consumer_transport.py": (
         ("supports_draft_streaming(chat_id=", "探针带 chat_id（插件在探针时机建卡）"),
@@ -37,6 +46,19 @@ CONTRACT_ANCHORS: dict[str, tuple[tuple[str, str], ...]] = {
         ("def _bump_draft_id", "segment 边界换 draft_id（锚回摆/新卡判定相关）"),
         ('meta["reply_to_message_id"] = self._initial_reply_to_id',
          "非 draft 路径同样带 reply 锚元数据"),
+    ),
+    "cron/scheduler_delivery.py": (
+        (f'f"{CRON_WRAP_HEADER}{{task_name}}', "cron wrap 头文案（cron 卡任务名/信封解析输入）"),
+        ('f"(job_id: ', "cron wrap job_id 行前缀（cron 卡追溯行解析——表达式可变，前缀不可变）"),
+        ('f"-------------\\n\\n"', "cron wrap 分隔线（cron 卡正文起点解析）"),
+        ('"To stop or manage this job, send me a new message "',
+         "cron wrap 管理提示尾（cron 卡尾部解析）"),
+        ('get("wrap_response", True)', "cron.wrap_response 默认开（false → cron 卡无 header 降级）"),
+    ),
+    "cron/scheduler.py": (
+        ("**Status:** script failed",
+         "脚本门失败形状（cron 卡红 header 判定之一；⚠️ Cron ' 前缀在 "
+         "scheduler_failure_copy.py，pinned revision 尚未抽出该模块，未锚——改版只降级为蓝卡）"),
     ),
 }
 
