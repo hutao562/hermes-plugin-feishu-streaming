@@ -6,8 +6,8 @@ kind: platform 插件：以同名 ``feishu`` 注册平台（registry last-writer
 
 部署：把本目录放到 ``~/.hermes/plugins/feishu-streaming/``（plugin.yaml +
 __init__.py + 其余文件），并在 config.yaml 的 ``plugins.enabled`` 加入
-``feishu-streaming``；注入模式（hermes-lark-streaming entry-point）需先
-``uninstall`` 释放 run.py。
+**manifest 名** ``feishu-streaming-platform``（目录名 feishu-streaming 不是
+enable 名——填错会静默不加载，2026-10-09 跨机部署实测踩过）。
 """
 
 from __future__ import annotations

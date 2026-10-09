@@ -477,7 +477,8 @@ def _render_footer_field(
     if name == "speed":
         tps = data.get("tps")
         if isinstance(tps, (int, float)) and tps > 0:
-            val = f"{tps:.0f} t/s"
+            # 短回答常见 0.x t/s——取整成 0 看着像坏了（2026-10-09 跨机部署实测）
+            val = "<1 t/s" if tps < 1 else f"{tps:.0f} t/s"
             if show_label:
                 return _T["speed"][0].format(val), _T["speed"][1].format(val)
             return f"⚡ {val}", f"⚡ {val}"
