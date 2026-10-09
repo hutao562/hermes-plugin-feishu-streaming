@@ -332,6 +332,8 @@ class ChatCardEngine:
         if session.reply_to is None and reply_to:
             session.reply_to = reply_to
             session.accepted_anchors = {reply_to}
+        # 话题会话：锚已到手（首帧 draft 带 reply_to_message_id）→ 此刻才建卡
+        self._maybe_start_card_task(session)
         if session.answer_seg is None:
             # 空文本走 on_answer_delta：在正确位置（reasoning 之后）新建空 ANSWER 段
             session.segment_state.on_answer_delta("")
@@ -556,12 +558,23 @@ class ChatCardEngine:
             new = ChatSession(chat_id=chat_id, thread_id=thread_id)
             self._sessions[key] = new
             session = new
-        if session.state == "creating" and session.card_create_task is None:
-            assert self._loop is not None
-            if session.flush is None:
-                session.flush = FlushController(loop=self._loop)
-            session.card_create_task = self._loop.create_task(self._do_create_card(session))
+        self._maybe_start_card_task(session)
         return session
+
+    def _maybe_start_card_task(self, session: ChatSession) -> None:
+        """建卡任务启动；话题会话例外——建卡推迟到首个 draft（拿到 reply 锚）.
+
+        无锚建卡直发 chat 会落在主聊顶层，话题回合的卡必须 reply 到话题内的
+        消息才能进线程（2026-10-09 实测：探针期无锚建卡，卡落主聊、话题空壳）。
+        """
+        if session.state != "creating" or session.card_create_task is not None:
+            return
+        if session.thread_id and session.reply_to is None:
+            return  # 话题会话等锚
+        assert self._loop is not None
+        if session.flush is None:
+            session.flush = FlushController(loop=self._loop)
+        session.card_create_task = self._loop.create_task(self._do_create_card(session))
 
     def _seal_session(self, session: ChatSession, notice: str | None = None) -> None:
         """旧会话收尾（followup 边界）：按已积累内容渲染完成卡，失败仅记日志."""
