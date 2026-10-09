@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -167,3 +168,32 @@ def test_cron_branch_missing_from_deploy_fails(home: Path) -> None:
     branch = _by_name(report, "cron 卡分支")[0]
     assert branch.status == FAIL
     assert "重新拷贝" in branch.hint
+
+
+def test_reasoning_deltas_missing_warns(home: Path) -> None:
+    """第 4 开关缺省 → WARN（卡能出、思考流缺，装的人不会当故障查）."""
+    report = run_checks(home, repo_plugin_dir=None)
+    check = _by_name(report, "default: plugins.stream_reasoning_deltas")[0]
+    assert check.status == WARN
+    assert "stream_reasoning_deltas: true" in check.hint
+
+
+def test_reasoning_deltas_present_ok(home: Path) -> None:
+    (home / "config.yaml").write_text(
+        GOOD_CONFIG + "\nplugins:\n  enabled:\n    - feishu-streaming-platform\n"
+        "  stream_reasoning_deltas: true\n", encoding="utf-8")
+    report = run_checks(home, repo_plugin_dir=None)
+    assert _by_name(report, "default: plugins.stream_reasoning_deltas")[0].status == OK
+
+
+def test_assembly_log_warns_before_gateway_restart(home: Path) -> None:
+    """插件目录比日志新（拷完未重启）→ WARN 引导重启，不再像「装错了」的 FAIL."""
+    import os
+    log = home / "logs" / "gateway.log"
+    log.write_text("boot ok\n", encoding="utf-8")
+    past = time.time() - 3600
+    os.utime(log, (past, past))  # 日志一小时前
+    report = run_checks(home, repo_plugin_dir=None)
+    check = _by_name(report, "装配日志")[0]
+    assert check.status == WARN
+    assert "重启" in check.hint

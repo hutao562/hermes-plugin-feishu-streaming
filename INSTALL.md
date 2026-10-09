@@ -29,7 +29,7 @@ python3 ~/.hermes/plugins/feishu-streaming/doctor.py
 
 ## Step 2 — Enable in config.yaml
 
-编辑 `~/.hermes/config.yaml`（**两处开关缺一不可**，这是历史上最常见的
+编辑 `~/.hermes/config.yaml`（**三处开关缺一不可**，这是历史上最常见的
 「装了没卡片」原因）：
 
 ```yaml
@@ -42,6 +42,15 @@ display:
   platforms:
     feishu:
       streaming: true             # 官方 draft 契约开关
+
+  # （可选但推荐，第 4 开关）思考流增量进卡——不开卡照常出、只是没有思考面板：
+  plugins:
+    stream_reasoning_deltas: true
+
+> **多 profile（multiplex）注意**：上面三处开关是 **per-profile** 的——每个
+> profile 自己的 `config.yaml` 都要开一份（`~/.hermes/config.yaml` 一份 +
+> `~/.hermes/profiles/<名字>/config.yaml` 各一份）。doctor 会逐 profile 检查。
+> 退出某个 profile：在其 config 的 `plugins.disabled` 写 `feishu-streaming-platform`。
 ```
 
 凭据复用官方飞书平台的配置（`FEISHU_APP_ID` / `FEISHU_APP_SECRET` 环境变量或
@@ -90,6 +99,11 @@ git checkout archive/injection-mode
 ```
 
 ## Troubleshooting
+
+- **footer 的 ⏱ 和 gateway 日志 `response ready time=` 数字不一致**：口径不同，
+  不是故障——卡片时长 = 首次 API 调用开始 → 最后一次 API 结束；网关时长含
+  入站排队/前置处理，所以总是略大。
+- **`⚡ <1 t/s`**：短回答的正常显示（输出 token 少、回合长），不是速度坏了。
 
 - 一切异常先跑 `doctor.py`；它覆盖本插件历史上所有静默失效模式。
 - 网关日志诊断：`grep '\[feishu-streaming\]' ~/.hermes/logs/gateway.log`。

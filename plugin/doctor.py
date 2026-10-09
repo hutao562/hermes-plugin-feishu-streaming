@@ -19,11 +19,13 @@ lark-oapi 可用性（PM venv 才是运行时）、网关进程与装配日志�
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json as _json
 import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -175,6 +177,16 @@ def check_config_section(report: Report, home: Path, label: str, config: dict | 
     else:
         report.add(f"{label}: display.platforms.feishu.streaming", FAIL, f"当前值 {display_on!r}",
                    "设 display.platforms.feishu.streaming: true（关着官方 draft 契约不启动，family 踩过）")
+
+    # 第 4 开关（隐性）：不上 reasoning 增量照常出卡，只有思考流缺——装的人
+    # 不会当故障查（2026-10-09 跨机部署实测），doctor 必须替他看见
+    reasoning_deltas = _config_get(config, "plugins", "stream_reasoning_deltas")
+    if reasoning_deltas is True:
+        report.add(f"{label}: plugins.stream_reasoning_deltas", OK)
+    else:
+        report.add(f"{label}: plugins.stream_reasoning_deltas", WARN, f"当前值 {reasoning_deltas!r}",
+                   "不设则思考流增量不进卡（on_stream_delta 钩子不触发，卡片其余功能正常）；"
+                   "要完整体感设 plugins.stream_reasoning_deltas: true")
     return flags
 
 
@@ -313,14 +325,19 @@ def check_gateway(report: Report, home: Path) -> None:
         running = subprocess.run(["pgrep", "-f", "gateway run"], capture_output=True, text=True)
     except OSError:
         running = None
+    log = home / "logs" / "gateway.log"
     if running is None:
-        report.add("网关进程", WARN, "无法探测（无 pgrep）")
+        # 无 pgrep（Windows 等）→ 日志新鲜度兜底：ticker/心跳每分钟都在写
+        if log.is_file() and time.time() - log.stat().st_mtime < 120:
+            report.add("网关进程", OK, f"日志 {int(time.time() - log.stat().st_mtime)}s 前仍在写入")
+        else:
+            report.add("网关进程", WARN, "无法探测（无 pgrep 且日志不新鲜）",
+                       "启动网关后卡片才会出现")
     elif running.returncode == 0:
         report.add("网关进程", OK, f"pid {running.stdout.split()[0]}")
     else:
         report.add("网关进程", WARN, "未运行", "启动网关后卡片才会出现")
 
-    log = home / "logs" / "gateway.log"
     if not log.is_file():
         report.add("装配日志", WARN, f"{log} 不存在（网关可能从未启动）")
         return
@@ -334,8 +351,14 @@ def check_gateway(report: Report, home: Path) -> None:
         report.add("装配日志", OK, f"最近装配 {len(factories)} 个 profile 的 StreamingFeishuAdapter"
                                   f"（multiplex 下每 profile 一行，最后: {factories[-1][:80]}…）")
     else:
-        report.add("装配日志", FAIL, "日志里没有 adapter factory 行——插件没被加载",
-                   "检查 plugins.enabled 与插件目录，重启网关后 grep 'adapter factory'")
+        manifest = home / "plugins" / "feishu-streaming" / "plugin.yaml"
+        if manifest.is_file() and log.stat().st_mtime < manifest.stat().st_mtime:
+            # 刚拷完目录、网关还没重启：日志比插件旧。文案必须像「下一步」而不是「你装错了」
+            report.add("装配日志", WARN, "插件目录比日志新——网关尚未在插件就位后重启",
+                       "重启网关后再跑一次自检（装配行重启后才出现）")
+        else:
+            report.add("装配日志", FAIL, "日志里没有 adapter factory 行——插件没被加载",
+                       "检查 plugins.enabled 与插件目录，重启网关后 grep 'adapter factory'")
 
     for pattern, why in _LOG_SIGNATURES:
         hits = len(re.findall(re.escape(pattern), tail))
@@ -382,6 +405,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="输出 JSON（CI 友好）")
     parser.add_argument("--home", type=Path, default=None, help="HERMES_HOME（默认读环境/ ~/.hermes）")
     args = parser.parse_args(argv)
+
+    # Windows GBK 控制台会把 ✓ 打成 UnicodeEncodeError 且 exit 1（2026-10-09
+    # 跨机部署实测）——先重配 stdio 为 utf-8/replace，只防崩不保证显示美观
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            with contextlib.suppress(Exception):
+                reconfigure(encoding="utf-8", errors="replace")
 
     home = args.home or Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
     script_dir = Path(__file__).resolve().parent
