@@ -54,7 +54,7 @@ plugin/
                    tests/test_cardkit|flush|segments|tooluse|text|config|feishu 直接测它
 ```
 
-会话生命周期：探针/typing 即建卡（`on_turn_started`）→ draft 快照整段置换 ANSWER（100ms FlushController）→ reasoning 增量/工具事件进面板 → 终态 close + 完成卡重渲（footer 统计）。会话以 **chat** 为键（draft 帧天然不带 message 身份）；终态会话保留在 `_sessions` 直到被顶替（跨回合合并的前提）。
+会话生命周期：探针/typing 即建卡（`on_turn_started`）→ draft 快照整段置换 ANSWER（100ms FlushController）→ reasoning 增量/工具事件进面板 → 终态 close + 完成卡重渲（footer 统计）。会话键 = **(chat, thread) 复合**（`_skey`；thread 取自探针/draft/send metadata 的 `thread_id`——hermes 话题是独立会话 `dm:oc_x:omt_y`，卡片必须同粒度隔离，否则话题与主聊串写，2026-10-09 实测用户被迫 /stop+/new 解缠）；已知边界：reasoning/工具事件走全局单活跃流路由、usage 桶按 chat 归组——同 chat 主聊+话题**并发**流式时这两类会歧义丢弃/合并（顺序使用不受影响）。终态会话保留在 `_sessions` 直到被顶替；bg 通知合并目标是 chat 级「最近一张卡」（`latest_session_for_chat`，thread 只是来源标记）。
 
 ## Key Constraints
 

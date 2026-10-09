@@ -58,6 +58,7 @@ class ChatSession:
     card_id: str | None = None
     card_msg_id: str | None = None
     answer_seg: Segment | None = None
+    thread_id: str | None = None  # 话题线程（Feishu 话题/回复链）；None = 主聊
     redirected: bool = False  # 诊断标记：本回合被 ↪ redirect 重启（seal/replace 日志用）
     model_switch: dict[str, str] | None = None  # footer 循环切换按钮数据（NOTICE 重渲透传）
     redirect_anchor: str | None = None  # redirect 新卡锚（用户纠正消息 id，来自 ack reply_to）
@@ -111,6 +112,8 @@ class ChatCardEngine:
         # model.default + fallback_providers 推导）——<2 个或当前模型不在清单则不出按钮
         self._model_cycle = [m.strip() for m in (model_cycle or []) if str(m).strip()]
         self._sessions: dict[str, ChatSession] = {}
+        # 会话键 = (chat, thread)：Feishu 话题在 hermes 是独立会话（dm:oc_x:omt_y），
+        # 卡片会话必须同粒度隔离，否则话题与主聊互相串写（2026-10-09 实测混写）
         # chat → 回合累计 usage（post_api_request 钩子按 session_id 归组，complete 消费）
         self._usage: dict[str, dict[str, Any]] = {}
         # chat → 最近一次 usage 上报的模型名（🧠⇄ 选择卡的「当前」显示用）
@@ -163,7 +166,12 @@ class ChatCardEngine:
             return None
         return bucket
 
-    def on_turn_started(self, chat_id: str) -> None:
+    @staticmethod
+    def _skey(chat_id: str, thread_id: str | None) -> str:
+        """卡片会话键：(chat, thread) 复合；thread 为空即主聊，与旧键兼容."""
+        return f"{chat_id}::{thread_id}" if thread_id else chat_id
+
+    def on_turn_started(self, chat_id: str, thread_id: str | None = None) -> None:
         """回合开始（send_typing 时机）→ 立即建卡.
 
         带工具的回合 draft 要等工具全部跑完才出现，此前用户什么都看不到
@@ -171,16 +179,18 @@ class ChatCardEngine:
         事件与正文随后进卡；DM/普通群与注入模式体感一致。
         """
         self._capture_loop()
-        existing = self._sessions.get(chat_id)
+        key = self._skey(chat_id, thread_id)
+        existing = self._sessions.get(key)
         if (existing is not None and existing.is_terminal
                 and time.time() - existing.completed_at < 5.0):
             # typing 是 2s 心跳循环：回合刚完成后的尾巴调用，不是新回合——
             # 重建会得到一张永挂 loading 的空卡
             return
-        existing = self._sessions.get(chat_id)
+        existing = self._sessions.get(key)
         if existing is None or existing.is_terminal:
-            self._ensure_session(chat_id)
-            _logger.info("[feishu-streaming] turn started: chat=%s", chat_id[:12])
+            self._ensure_session(chat_id, thread_id)
+            _logger.info("[feishu-streaming] turn started: chat=%s thread=%s",
+                         chat_id[:12], (thread_id or "-")[:16])
         # typing 2s 心跳循环的重复调用：会话健在时静默（此前每 2s 刷一条）
 
     def note_inbound(self, chat_id: str, message_id: str) -> None:
@@ -202,7 +212,8 @@ class ChatCardEngine:
             return False
         return message_id in self._inbound_seen.get(chat_id, {})
 
-    def mark_redirect(self, chat_id: str, anchor: str | None = None) -> None:
+    def mark_redirect(self, chat_id: str, anchor: str | None = None,
+                      thread_id: str | None = None) -> None:
         """↪ redirect ack（用户纠正、interrupt 模式）→ **立即收旧开新**.
 
         hermes redirect 是同一运行回合改锚续跑（agent.redirect 取消当前 model
@@ -215,7 +226,7 @@ class ChatCardEngine:
         anchor 是 ack 的 reply_to（= 用户纠正消息 id，hermes _send_busy_reply
         锚到新消息）——新卡 reply 引用它；不带时回退旧锚。旧请求取消前的
         残尾快照由 straggler_guard 在 on_draft 里前缀拦截。"""
-        session = self.active_session(chat_id)
+        session = self.active_session(chat_id, thread_id)
         if session is None:
             return
         self._capture_loop()
@@ -225,7 +236,8 @@ class ChatCardEngine:
         _logger.info("[feishu-streaming] redirect boundary at ack: chat=%s anchor=%s",
                      chat_id[:12], anchor or "-")
         new = ChatSession(
-            chat_id=chat_id, reply_to=session.redirect_anchor or session.reply_to,
+            chat_id=chat_id, thread_id=thread_id,
+            reply_to=session.redirect_anchor or session.reply_to,
             straggler_guard=(session.answer_seg.text if session.answer_seg else ""))
         # redirected 回合的 draft 锚会中途变回老消息 id（工具边界换 consumer
         # 重新锚定回合身份）——两个锚都算本回合，防 followup 边界拦腰拆卡
@@ -234,21 +246,29 @@ class ChatCardEngine:
         # 立刻置终态：seal 是异步任务（cardkit close+update 要走网络），期间旧
         # 会话若仍计为 streaming，全局 reasoning 路由会把新回合的思考误送旧卡
         session.state = "completed"
-        self._sessions[chat_id] = new
-        self._ensure_session(chat_id)  # 新卡立刻建，不等首条 draft
+        self._sessions[self._skey(chat_id, thread_id)] = new
+        self._ensure_session(chat_id, thread_id)  # 新卡立刻建，不等首条 draft
         self._seal_session(session, notice="↪ 任务已按新指令重启，结果见下方新卡片")
 
     # ── 会话查询 ──
 
-    def session_for(self, chat_id: str) -> ChatSession | None:
-        return self._sessions.get(chat_id)
+    def session_for(self, chat_id: str, thread_id: str | None = None) -> ChatSession | None:
+        return self._sessions.get(self._skey(chat_id, thread_id))
 
-    def active_session(self, chat_id: str) -> ChatSession | None:
+    def active_session(self, chat_id: str, thread_id: str | None = None) -> ChatSession | None:
         """活跃（非终态）会话 — send() 完成路由的判定入口."""
-        session = self._sessions.get(chat_id)
+        session = self._sessions.get(self._skey(chat_id, thread_id))
         if session is not None and not session.is_terminal:
             return session
         return None
+
+    def latest_session_for_chat(self, chat_id: str) -> ChatSession | None:
+        """该 chat（任意 thread）最近创建的会话——bg 通知合并「最近一张卡」用
+        （bg 交付的 thread_id 是来源标记，合并目标是聊天里最新那张卡）."""
+        candidates = [s for s in self._sessions.values() if s.chat_id == chat_id]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda s: s.created_at)
 
     def streaming_sessions(self) -> list[ChatSession]:
         return [s for s in self._sessions.values() if s.state == "streaming"]
@@ -258,14 +278,15 @@ class ChatCardEngine:
         （post_api_request 落在回合中段，首条 draft 前会话还是 creating）."""
         return [s for s in self._sessions.values() if not s.is_terminal]
 
-    def last_card_msg_id(self, chat_id: str) -> str | None:
+    def last_card_msg_id(self, chat_id: str, thread_id: str | None = None) -> str | None:
         """最近一张卡的消息 id（文档交付 reply 锚点用，终态也算）."""
-        session = self._sessions.get(chat_id)
+        session = self._sessions.get(self._skey(chat_id, thread_id))
         return session.card_msg_id if session else None
 
     # ── 流式输入 ──
 
-    def on_draft(self, chat_id: str, content: str, reply_to: str | None = None) -> None:
+    def on_draft(self, chat_id: str, content: str, reply_to: str | None = None,
+                 thread_id: str | None = None) -> None:
         """draft 帧（全量快照）— 确保会话与建卡，整段置换 answer 文本.
 
         由 async 的 send_draft 调用：此处捕获引擎事件循环（后续 format_tool_event
@@ -273,7 +294,7 @@ class ChatCardEngine:
         reply_to 是 transport _draft_metadata 带的用户消息锚（首轮记录，后续幂等）。
         """
         self._capture_loop()
-        session = self._ensure_session(chat_id)
+        session = self._ensure_session(chat_id, thread_id)
         guard = session.straggler_guard
         if guard and content and (content.startswith(guard) or guard.startswith(content)):
             # redirect 残尾：旧请求取消前挤出的快照（老回合内容的超集），
@@ -303,10 +324,10 @@ class ChatCardEngine:
                     "[feishu-streaming] followup boundary: anchor %s -> %s (inbound), "
                     "sealing old card", session.reply_to, reply_to)
                 old_session = session
-                new = ChatSession(chat_id=chat_id, reply_to=reply_to)
+                new = ChatSession(chat_id=chat_id, thread_id=thread_id, reply_to=reply_to)
                 new.accepted_anchors = {reply_to}
-                self._sessions[chat_id] = new
-                session = self._ensure_session(chat_id)  # 新会话补建卡 task
+                self._sessions[self._skey(chat_id, thread_id)] = new
+                session = self._ensure_session(chat_id, thread_id)  # 新会话补建卡 task
                 self._seal_session(old_session)
         if session.reply_to is None and reply_to:
             session.reply_to = reply_to
@@ -365,9 +386,9 @@ class ChatCardEngine:
         target.segment_state.on_reasoning_delta(text)
         self._schedule(target)
 
-    def on_heartbeat(self, chat_id: str, text: str) -> None:
+    def on_heartbeat(self, chat_id: str, text: str, thread_id: str | None = None) -> None:
         """心跳/interim 文本 → 卡片末尾状态行."""
-        session = self.active_session(chat_id)
+        session = self.active_session(chat_id, thread_id)
         if session is None:
             return
         session.heartbeat_text = text[:_HEARTBEAT_MAX_LEN]
@@ -377,9 +398,9 @@ class ChatCardEngine:
 
     async def complete(self, chat_id: str, final_text: str, *, is_error: bool = False,
                        duration: float | None = None, tokens: dict[str, int] | None = None,
-                       model: str = "") -> str | None:
+                       model: str = "", thread_id: str | None = None) -> str | None:
         """回合终态：渲染完成卡（含 footer），返回卡片消息 id."""
-        session = self.active_session(chat_id)
+        session = self.active_session(chat_id, thread_id)
         if session is None:
             return None
         _logger.info("[feishu-streaming] complete: chat=%s state=%s segs=%d redirected=%s",
@@ -444,14 +465,15 @@ class ChatCardEngine:
             _logger.warning("plugin complete card update failed: chat=%s err=%s", chat_id, e)
         return session.card_msg_id
 
-    async def append_notice(self, chat_id: str, text: str) -> str | None:
+    async def append_notice(self, chat_id: str, text: str,
+                            thread_id: str | None = None) -> str | None:
         """把 background/系统通知追加进该 chat 最近一张卡（跨回合合并）.
 
         会话可能是 COMPLETED（bg 回合在主回合完成后到达）——追加 NOTICE segment
         后整体重渲完成卡；会话仍活跃则交由 flush 建 NOTICE 元素。
         返回卡片消息 id；无可用卡片返回 None（调用方走原生文本保底）。
         """
-        session = self._sessions.get(chat_id)
+        session = self._sessions.get(self._skey(chat_id, thread_id))
         if session is None or session.card_id is None:
             return None
         session.segment_state.add_notice(text)
@@ -502,9 +524,9 @@ class ChatCardEngine:
                             chat_id[:12], e)
             return None
 
-    async def abandon(self, chat_id: str) -> None:
+    async def abandon(self, chat_id: str, thread_id: str | None = None) -> None:
         """流被弃（中断/异常）— 尽力按错误收尾，避免永久转圈卡."""
-        session = self.active_session(chat_id)
+        session = self.active_session(chat_id, thread_id)
         if session is None:
             return
         await self.complete(chat_id, session.answer_seg.text if session.answer_seg else "",
@@ -518,8 +540,9 @@ class ChatCardEngine:
             self._loop = asyncio.get_running_loop()
             self._thread = threading.current_thread()
 
-    def _ensure_session(self, chat_id: str) -> ChatSession:
-        session = self._sessions.get(chat_id)
+    def _ensure_session(self, chat_id: str, thread_id: str | None = None) -> ChatSession:
+        key = self._skey(chat_id, thread_id)
+        session = self._sessions.get(key)
         if session is None or session.is_terminal:
             # 旧卡（终态）保留在聊天里，新回合开新会话
             if session is not None:
@@ -530,8 +553,8 @@ class ChatCardEngine:
                     f"{time.time() - session.completed_at:.1f}s"
                     if session.completed_at else "never",
                     session.redirected)
-            new = ChatSession(chat_id=chat_id)
-            self._sessions[chat_id] = new
+            new = ChatSession(chat_id=chat_id, thread_id=thread_id)
+            self._sessions[key] = new
             session = new
         if session.state == "creating" and session.card_create_task is None:
             assert self._loop is not None

@@ -1550,3 +1550,47 @@ async def test_dispatch_model_switch_uses_raw_type_for_dm(adapter) -> None:
                                          target="glm-5.3-flash",
                                          raw=object(), message_id="tok7")
     assert sent[0]["event_chat_type"] == "p2p"
+
+
+@pytest.mark.asyncio
+async def test_topic_thread_sessions_isolated(adapter) -> None:
+    """话题（thread）与主聊同 chat 并发：会话按 (chat, thread) 隔离，锚与正文互不串写.
+
+    2026-10-09 实测回归：话题回合与主聊回合共用 chat 键会话，reasoning/正文
+    互相串写、followup 边界误判 redirect，用户被迫 /stop + /new 解缠。"""
+    engine = adapter._engine()
+    main_chat = "oc_" + "1" * 20
+    topic_thread = "omt_" + "a" * 16
+
+    # 主聊与话题回合交错开始 → 两张独立卡
+    engine.on_turn_started(main_chat)
+    engine.on_turn_started(main_chat, thread_id=topic_thread)
+    await _settle(engine)
+    assert len(engine._sessions) == 2
+    main_sess = engine.session_for(main_chat)
+    topic_sess = engine.session_for(main_chat, thread_id=topic_thread)
+    assert main_sess is not None and topic_sess is not None
+    assert main_sess is not topic_sess
+    assert main_sess.thread_id is None and topic_sess.thread_id == topic_thread
+
+    # 各自 draft（不同锚）→ 正文与锚不串
+    engine.on_draft(main_chat, "主聊回答", reply_to="om_main_1")
+    engine.on_draft(main_chat, "话题回答", reply_to="om_topic_1", thread_id=topic_thread)
+    await _settle(engine)
+    assert main_sess.answer_seg.text == "主聊回答"
+    assert topic_sess.answer_seg.text == "话题回答"
+    assert main_sess.reply_to == "om_main_1"
+    assert topic_sess.reply_to == "om_topic_1"
+
+    # 各自完成 → 完成卡只含自己的正文
+    await engine.complete(main_chat, "主聊回答")
+    await engine.complete(main_chat, "话题回答", thread_id=topic_thread)
+    updates = [c.args[1] for c in engine._client.cardkit_update.call_args_list]
+    assert len(updates) >= 2
+    bodies = []
+    for card in updates[-2:]:
+        bodies.append("".join(
+            e.get("content", "") for e in (card.get("body", {}).get("elements") or [])
+            if isinstance(e, dict) and e.get("tag") == "markdown"))
+    assert "主聊回答" in bodies[0] and "话题回答" not in bodies[0]
+    assert "话题回答" in bodies[1] and "主聊回答" not in bodies[1]
