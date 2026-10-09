@@ -24,6 +24,7 @@ from typing import Any
 from ._vendor.cardkit.builder import (
     HEARTBEAT_ELEMENT_ID,
     build_complete_card,
+    build_cron_card,
     build_streaming_card_v2,
     cap_reasoning_text,
 )
@@ -58,6 +59,7 @@ class ChatSession:
     card_msg_id: str | None = None
     answer_seg: Segment | None = None
     redirected: bool = False  # 诊断标记：本回合被 ↪ redirect 重启（seal/replace 日志用）
+    model_switch: dict[str, str] | None = None  # footer 循环切换按钮数据（NOTICE 重渲透传）
     redirect_anchor: str | None = None  # redirect 新卡锚（用户纠正消息 id，来自 ack reply_to）
     # redirect 残尾拦截：旧 model 请求被取消前挤出的快照是老回合内容的超集，
     # 前缀比对命中即丢弃，防老答案闪进新卡；首个不相关内容通过后清空
@@ -93,7 +95,8 @@ class ChatCardEngine:
                  width_mode: str = "default",
                  footer_fields: list[list[str]] | None = None,
                  footer_show_label: bool = False,
-                 footer_enabled: bool = True) -> None:
+                 footer_enabled: bool = True,
+                 model_cycle: list[str] | None = None) -> None:
         self._client = client
         self._body_text_size = body_text_size
         self._show_tool_use = show_tool_use
@@ -104,9 +107,15 @@ class ChatCardEngine:
         self._footer_fields = footer_fields or [["elapsed", "model", "context"]]
         self._footer_show_label = footer_show_label
         self._footer_enabled = footer_enabled
+        # footer 模型切换按钮的轮换清单（streaming.footer.model_cycle，缺省
+        # model.default + fallback_providers 推导）——<2 个或当前模型不在清单则不出按钮
+        self._model_cycle = [m.strip() for m in (model_cycle or []) if str(m).strip()]
         self._sessions: dict[str, ChatSession] = {}
         # chat → 回合累计 usage（post_api_request 钩子按 session_id 归组，complete 消费）
         self._usage: dict[str, dict[str, Any]] = {}
+        # chat → 最近一次 usage 上报的模型名（🧠⇄ 选择卡的「当前」显示用）
+        self._chat_models: dict[str, str] = {}
+        self._last_model = ""
         # chat → 见过的入站消息 id（on_processing_start 登记，drain 消息在 drain
         # 开始时也会触发）——followup 拆卡的门槛：新锚必须是真入站消息
         self._inbound_seen: dict[str, dict[str, float]] = {}
@@ -144,6 +153,9 @@ class ChatCardEngine:
             if bucket["first_started"] is None:
                 bucket["first_started"] = usage["started_at"]
             bucket["last_ended"] = usage.get("ended_at") or bucket["last_ended"]
+        if model:
+            self._chat_models[chat_id or ""] = model
+            self._last_model = model
 
     def _pop_usage(self, chat_id: str) -> dict[str, Any] | None:
         bucket = self._usage.pop(chat_id, None) or self._usage.pop("", None)
@@ -240,6 +252,11 @@ class ChatCardEngine:
 
     def streaming_sessions(self) -> list[ChatSession]:
         return [s for s in self._sessions.values() if s.state == "streaming"]
+
+    def open_sessions(self) -> list[ChatSession]:
+        """未终态会话（creating/streaming）——usage 路由的「回合进行中」判据
+        （post_api_request 落在回合中段，首条 draft 前会话还是 creating）."""
+        return [s for s in self._sessions.values() if not s.is_terminal]
 
     def last_card_msg_id(self, chat_id: str) -> str | None:
         """最近一张卡的消息 id（文档交付 reply 锚点用，终态也算）."""
@@ -377,6 +394,13 @@ class ChatCardEngine:
         if final_text and session.answer_seg is not None:
             session.answer_seg.text = final_text
             session.answer_seg.dirty = False  # 完成卡整体重渲，不再单独流式
+        elif final_text:
+            # 短回答可能整段直发、无任何 draft 帧（仅 reasoning 段）——用终态文本
+            # 补建 ANSWER 段，否则正文丢失、完成卡渲染成「Done.」占位（2026-10-09 实测）
+            session.segment_state.on_answer_delta("")
+            session.answer_seg = session.segment_state.segments[-1]
+            session.answer_seg.text = strip_reasoning_tags(final_text)
+            session.answer_seg.dirty = False
         session.segment_state.finalize_segments(
             len(session.tool_tracker.build_display_steps()))
         session.state = "failed" if is_error else "completed"
@@ -395,6 +419,8 @@ class ChatCardEngine:
         if tokens:
             usage = {"input": tokens.get("input_tokens", 0),
                      "output": tokens.get("output_tokens", 0), "model": model}
+        session.model_switch = self._model_switch_data(
+            (usage or {}).get("model") or model)
         card = build_complete_card(
             segments=session.segment_state.segments,
             all_tool_steps=session.tool_tracker.build_display_steps(),
@@ -407,6 +433,7 @@ class ChatCardEngine:
             body_text_size=self._body_text_size,
             show_tool_use=self._show_tool_use,
             width_mode=self._width_mode,
+            model_switch=session.model_switch,
         )
         try:
             session.sequence += 1
@@ -440,6 +467,7 @@ class ChatCardEngine:
                 body_text_size=self._body_text_size,
                 show_tool_use=self._show_tool_use,
                 width_mode=self._width_mode,
+                model_switch=getattr(session, "model_switch", None),
             )
             session.sequence += 1
             try:
@@ -452,6 +480,27 @@ class ChatCardEngine:
         _logger.info("[feishu-streaming] notice merged into card: chat=%s len=%d",
                      chat_id[:12], len(text))
         return session.card_msg_id
+
+    async def send_cron_card(self, chat_id: str, content: str, *, task_name: str = "",
+                             job_id: str = "", run_time: str = "",
+                             template: str = "blue") -> str | None:
+        """cron 结果一次性卡片（⏰ 静态卡，直发 chat，不建流式会话）.
+
+        与 :meth:`append_notice` 同属旁路发送：无会话状态、无后续 edit，失败返回
+        None 由调用方落回原生文本。失败通知 template="red"（红 header 一眼可辨）。
+        """
+        card = build_cron_card(content, task_name=task_name, run_time=run_time,
+                               template=template)
+        try:
+            card_id = await self._client.cardkit_create(card)
+            # cron 投递无 reply 锚，直发 chat（同 _do_create_card 无锚分支）
+            msg_id: str | None = await self._client.send_card_to_chat(
+                chat_id, {"type": "card", "data": {"card_id": card_id}})
+            return msg_id
+        except Exception as e:
+            _logger.warning("[feishu-streaming] cron card send failed: chat=%s err=%s",
+                            chat_id[:12], e)
+            return None
 
     async def abandon(self, chat_id: str) -> None:
         """流被弃（中断/异常）— 尽力按错误收尾，避免永久转圈卡."""
@@ -666,3 +715,18 @@ class ChatCardEngine:
         elif model:
             data["model"] = model
         return data
+
+    def _model_switch_data(self, current: str) -> dict[str, str] | None:
+        """footer 🧠⇄ 按钮数据：{"current"}；轮换清单 <2 或当前模型未知 → 不出按钮."""
+        current = (current or "").strip()
+        if len(self._model_cycle) < 2 or not current:
+            return None
+        return {"current": current}
+
+    def model_picker_data(self, chat_id: str) -> dict[str, Any] | None:
+        """🧠⇄ 点击后的选择卡数据：{"current", "models"}；无清单 → None."""
+        if len(self._model_cycle) < 2:
+            return None
+        current = self._chat_models.get(chat_id) or self._chat_models.get("") \
+            or self._last_model or self._model_cycle[0]
+        return {"current": current, "models": list(self._model_cycle)}

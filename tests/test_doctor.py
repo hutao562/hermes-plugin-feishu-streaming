@@ -138,3 +138,32 @@ def test_no_factory_line_fails(home: Path) -> None:
     (home / "logs" / "gateway.log").write_text("boot ok, nothing else\n", encoding="utf-8")
     report = run_checks(home, repo_plugin_dir=None)
     assert _by_name(report, "装配日志")[0].status == FAIL
+
+
+def test_cron_card_checks_ok_by_default(home: Path) -> None:
+    """wrap_response 未配置（默认开）+ 部署目录含 cron 分支 → 双 ✓."""
+    report = run_checks(home, repo_plugin_dir=None)
+    wrap = _by_name(report, "cron.wrap_response")[0]
+    assert wrap.status == OK
+    branch = _by_name(report, "cron 卡分支")[0]
+    assert branch.status == OK
+
+
+def test_cron_wrap_response_false_warns(home: Path) -> None:
+    """wrap_response: false → WARN（卡无任务名 header，降级可用）."""
+    (home / "config.yaml").write_text(
+        GOOD_CONFIG + "\ncron:\n  wrap_response: false\n", encoding="utf-8")
+    report = run_checks(home, repo_plugin_dir=None)
+    wrap = _by_name(report, "cron.wrap_response")[0]
+    assert wrap.status == WARN
+    assert "无任务名 header" in wrap.hint
+
+
+def test_cron_branch_missing_from_deploy_fails(home: Path) -> None:
+    """部署目录是旧版（adapter.py 无 send_cron_card）→ FAIL 指向重新部署."""
+    (home / "plugins" / "feishu-streaming" / "adapter.py").write_text(
+        "# 旧版部署：无 cron 卡分支\n", encoding="utf-8")
+    report = run_checks(home, repo_plugin_dir=None)
+    branch = _by_name(report, "cron 卡分支")[0]
+    assert branch.status == FAIL
+    assert "重新拷贝" in branch.hint

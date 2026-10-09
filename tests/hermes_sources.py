@@ -27,6 +27,9 @@ TREE_FILES = (
     "gateway/stream_consumer_fallback.py",
     "gateway/stream_consumer_fences.py",
     "gateway/run_busy.py",
+    # cron 卡契约（v0.16.0）：wrap 信封 + 脚本门失败形状
+    "cron/scheduler_delivery.py",
+    "cron/scheduler.py",
 )
 
 
