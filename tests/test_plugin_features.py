@@ -1594,3 +1594,26 @@ async def test_topic_thread_sessions_isolated(adapter) -> None:
             if isinstance(e, dict) and e.get("tag") == "markdown"))
     assert "主聊回答" in bodies[0] and "话题回答" not in bodies[0]
     assert "话题回答" in bodies[1] and "主聊回答" not in bodies[1]
+
+
+@pytest.mark.asyncio
+async def test_topic_session_defers_card_until_anchor(adapter) -> None:
+    """话题会话探针期不建卡（无锚直发会落主聊顶层）；首个 draft 锚到手后
+    才建卡且走 reply（进话题线程）."""
+    engine = adapter._engine()
+    main_chat = "oc_" + "1" * 20
+    topic2 = "omt_" + "b" * 16
+
+    engine.on_turn_started(main_chat, thread_id=topic2)
+    await _settle(engine)
+    n_create = engine._client.cardkit_create.call_count
+    n_reply = engine._client.reply_card_by_id.call_count
+
+    engine.on_draft(main_chat, "话题新回合", reply_to="om_topic_2", thread_id=topic2)
+    await _settle(engine)
+
+    assert engine._client.cardkit_create.call_count == n_create + 1
+    assert engine._client.reply_card_by_id.call_count == n_reply + 1
+    sess = engine.session_for(main_chat, thread_id=topic2)
+    assert sess.reply_to == "om_topic_2"
+    assert sess.answer_seg.text == "话题新回合"
