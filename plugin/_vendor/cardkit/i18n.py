@@ -22,7 +22,12 @@ _T: dict[str, tuple[str, str]] = {
     "processing_prefix": ("💭 Processing...", "💭 处理中..."),
     "tool_use": ("Tool use", "工具执行"),
     "tool_pending": ("🛠️ Tool use pending", "🛠️ 等待工具执行"),
+    "tool_pending_hint": ("Tool activity will appear here", "工具执行动态将显示在这里"),
     "steps": ("{} step{}", "{} 步"),
+    # 多段工具面板（工具→正文→再工具）标题带全局步区间，面板之间可区分
+    "steps_range": ("steps {}–{}", "第 {}–{} 步"),
+    # 折叠态失败信号：不展开也能发现回合中出过错（标题同时转红）
+    "steps_failed": ("⚠️ {} failed", "⚠️ {} 步失败"),
     "thought": ("Thought", "思考"),
     "thinking_panel": ("Thinking", "思考中"),
     "thought_for": ("Thought for {}", "思考了 {}"),
