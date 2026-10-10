@@ -362,3 +362,27 @@ def test_nested_lark_domain_uses_larksuite_url() -> None:
 
     with patch.dict(os.environ, {}, clear=True):
         assert cfg.feishu_base_url == "https://open.larksuite.com"
+
+
+class TestPanelExpandedSplit:
+    """完成卡面板展开拆分键：tool_panel_expanded / reasoning_panel_expanded（回退旧键）。"""
+
+    def test_tool_key_takes_priority_over_legacy(self) -> None:
+        cfg = _make_config({"streaming": {"panel_expanded": False, "tool_panel_expanded": True}})
+        assert cfg.tool_panel_expanded is True
+        assert cfg.reasoning_panel_expanded is False  # 未单独配置 → 回退旧键 False
+
+    def test_reasoning_key_takes_priority_over_legacy(self) -> None:
+        cfg = _make_config({"streaming": {"panel_expanded": False, "reasoning_panel_expanded": True}})
+        assert cfg.reasoning_panel_expanded is True
+        assert cfg.tool_panel_expanded is False
+
+    def test_legacy_key_applies_to_both(self) -> None:
+        cfg = _make_config({"streaming": {"panel_expanded": True}})
+        assert cfg.tool_panel_expanded is True
+        assert cfg.reasoning_panel_expanded is True
+
+    def test_defaults_false(self) -> None:
+        cfg = _make_config({"streaming": {}})
+        assert cfg.tool_panel_expanded is False
+        assert cfg.reasoning_panel_expanded is False

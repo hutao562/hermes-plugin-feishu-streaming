@@ -130,8 +130,10 @@ class StreamingFeishuMixin:
         if chat_id:
             # 话题回合：metadata 带 thread_id（hermes dm:oc_x:omt_y 会话键）——
             # 卡片会话必须同粒度隔离，否则话题与主聊互相串写
-            self._engine().on_turn_started(
-                chat_id, thread_id=(metadata or {}).get("thread_id"))
+            thread = (metadata or {}).get("thread_id")
+            self._engine().on_turn_started(chat_id, thread_id=thread)
+            # 当回合锚（format_tool_event 落在本 adapter 上但事件本身不带 chat）
+            self._turn_anchor = (chat_id, thread)
         return True
 
     async def send_draft(self, chat_id: str, draft_id: int, content: str,
@@ -141,8 +143,10 @@ class StreamingFeishuMixin:
             logging.getLogger("gateway.run").info(
                 "[feishu-streaming] draft chat=%s len=%d", chat_id[:12], len(content))
         reply_to = (metadata or {}).get("reply_to_message_id")
+        thread = (metadata or {}).get("thread_id")
+        self._turn_anchor = (chat_id, thread)
         self._engine().on_draft(chat_id, content, reply_to=reply_to,
-                                thread_id=(metadata or {}).get("thread_id"))
+                                thread_id=thread)
         return _compat.send_result(success=True, message_id=None)
 
     # ── 结构化流事件 ──
@@ -157,7 +161,8 @@ class StreamingFeishuMixin:
             first_val = next(iter(event.args.values()))
             if not detail and first_val is not None:
                 detail = str(first_val)
-        self._engine().on_tool_start(event.tool_name, detail[:200])
+        self._engine().on_tool_start(event.tool_name, detail[:200],
+                                     anchor=getattr(self, "_turn_anchor", None))
         return None
 
     # ── 出站拦截 ──

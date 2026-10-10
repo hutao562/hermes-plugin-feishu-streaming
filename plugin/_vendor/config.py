@@ -51,9 +51,25 @@ class Config:
 
     @property
     def panel_expanded(self) -> bool:
-        """完成态卡片中面板（工具、推理）是否保持展开."""
+        """完成态卡片中面板（工具、推理）是否保持展开（旧键，两面板共用）."""
         sec = self._streaming_sec()
         return bool(sec.get("panel_expanded", False))
+
+    @property
+    def tool_panel_expanded(self) -> bool:
+        """完成态工具面板默认展开（未单独配置时回退旧键 panel_expanded）."""
+        sec = self._streaming_sec()
+        if "tool_panel_expanded" in sec:
+            return bool(sec.get("tool_panel_expanded", False))
+        return self.panel_expanded
+
+    @property
+    def reasoning_panel_expanded(self) -> bool:
+        """完成态思考面板默认展开（未单独配置时回退旧键 panel_expanded）."""
+        sec = self._streaming_sec()
+        if "reasoning_panel_expanded" in sec:
+            return bool(sec.get("reasoning_panel_expanded", False))
+        return self.panel_expanded
 
     @property
     def clarify_inline(self) -> bool:

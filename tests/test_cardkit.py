@@ -164,6 +164,7 @@ _STEP_RUNNING = {
     "error_block": None,
 }
 _STEP_SUCCESS = {**_STEP_RUNNING, "status": "success", "output": "ok", "elapsed_ms": 100}
+_STEP_ERROR = {**_STEP_RUNNING, "status": "error", "error": "boom"}
 
 
 class TestBuildToolPanel:
@@ -198,6 +199,55 @@ class TestBuildToolPanel:
         title = panel["header"]["title"]["content"]
         assert title.startswith("🛠️ Tool use")
         assert "Reading 幼儿园与学习.md" not in title
+
+    def test_failed_steps_marked_in_collapsed_title(self) -> None:
+        """有失败步骤：折叠标题带 ⚠️ N failed 且转红——不展开也能发现回合出过错。"""
+        panel = _build_tool_panel([_STEP_SUCCESS, _STEP_ERROR])  # type: ignore[list-item]
+        title = panel["header"]["title"]
+        assert "⚠️ 1 failed" in title["content"]
+        assert title["text_color"] == "red"
+        assert "⚠️ 1 步失败" in title["i18n_content"]["zh_cn"]
+
+    def test_success_only_title_stays_grey(self) -> None:
+        panel = _build_tool_panel([_STEP_SUCCESS])  # type: ignore[list-item]
+        title = panel["header"]["title"]
+        assert "failed" not in title["content"]
+        assert title["text_color"] == "grey"
+
+    def test_running_with_failure_shows_both(self) -> None:
+        """running 步骤 + 前序失败并存：动作标签后跟 ⚠️ 失败计数。"""
+        step: dict = {**_STEP_RUNNING, "label": "📖 Reading x.md", "emoji": "📖"}
+        panel = _build_tool_panel([_STEP_ERROR, step])  # type: ignore[list-item]
+        title = panel["header"]["title"]["content"]
+        assert "📖 Reading x.md" in title
+        assert "⚠️ 1 failed" in title
+
+    def test_step_offset_range_in_title(self) -> None:
+        """多段工具面板：offset>0 标题带全局步区间（steps 6–7 / 第 6–7 步）。"""
+        steps = [_STEP_SUCCESS, _STEP_SUCCESS]  # type: ignore[list-item]
+        t0 = _build_tool_panel(steps)["header"]["title"]["content"]
+        assert "2 steps" in t0
+        assert "steps 1–2" not in t0
+        panel5 = _build_tool_panel(steps, step_offset=5)
+        assert "steps 6–7" in panel5["header"]["title"]["content"]
+        assert "第 6–7 步" in panel5["header"]["title"]["i18n_content"]["zh_cn"]
+
+    def test_max_steps_param_caps_with_hidden_marker(self) -> None:
+        """max_steps（完成卡动态预算入口）截断展示，保留已折叠标注。"""
+        steps = [_STEP_SUCCESS] * 4  # type: ignore[list-item]
+        panel = _build_tool_panel(steps, max_steps=2)
+        divs = [e for e in panel["elements"] if e.get("tag") == "div"]
+        assert len(divs) == 2
+        assert any("已折叠前 2 步" in str(e.get("content", "")) for e in panel["elements"])
+
+    def test_pending_panel_has_hint(self) -> None:
+        """pending 面板展开不再是空白：带提示行。"""
+        card = build_streaming_card_v2(
+            show_tool_use=True, show_reasoning=False, show_streaming_element=False)
+        panel = next(e for e in card["body"]["elements"]
+                     if e.get("tag") == "collapsible_panel")
+        assert panel["elements"]
+        assert "Tool activity will appear here" in str(panel["elements"])
 
 
 # --- Footer ---
@@ -517,6 +567,85 @@ class TestBuildSegmentCompleteCard:
             all_tool_steps=steps,
         )
         assert any(e.get("tag") == "collapsible_panel" for e in card["body"]["elements"])
+
+    def test_two_tool_segments_get_range_titles(self) -> None:
+        """多段工具（工具→正文→再工具）：第二面板标题带全局步区间，面板间可区分。"""
+        steps = [_STEP_SUCCESS, _STEP_RUNNING, _STEP_SUCCESS, _STEP_SUCCESS]  # type: ignore[list-item]
+        card = build_complete_card(
+            segments=[
+                _seg("tool", tool_offset=0, tool_end_offset=2),
+                _seg("answer", "mid"),
+                _seg("tool", tool_offset=2, tool_end_offset=4),
+            ],
+            all_tool_steps=steps,
+        )
+        panels = [e for e in card["body"]["elements"] if e.get("tag") == "collapsible_panel"]
+        assert len(panels) == 2
+        assert "2 steps" in panels[0]["header"]["title"]["content"]
+        assert "steps 3–4" in panels[1]["header"]["title"]["content"]
+
+    def test_complete_card_step_budget_relaxes_beyond_streaming_cap(self) -> None:
+        """完成卡动态预算：短正文 + 40 步全展示（流式 15 封顶不再是完成态上限）。"""
+        steps = [_STEP_SUCCESS] * 40  # type: ignore[list-item]
+        card = build_complete_card(
+            segments=[_seg("tool", tool_offset=0, tool_end_offset=0), _seg("answer", "ok")],
+            all_tool_steps=steps,
+        )
+        panel = next(e for e in card["body"]["elements"] if e.get("tag") == "collapsible_panel")
+        divs = [e for e in panel["elements"] if e.get("tag") == "div"]
+        assert len(divs) == 40
+        assert not any("已折叠" in str(e.get("content", "")) for e in panel["elements"])
+
+    def test_complete_card_step_budget_binds_on_huge_answer(self) -> None:
+        """超长正文压缩元素预算：按预算截断步数（仍 ≥15），带已折叠标注。"""
+        steps = [_STEP_SUCCESS] * 40  # type: ignore[list-item]
+        card = build_complete_card(
+            segments=[
+                _seg("tool", tool_offset=0, tool_end_offset=0),
+                _seg("answer", "x" * 168_000),  # ≈71 个正文块，压掉大半元素预算
+            ],
+            all_tool_steps=steps,
+            footer_enabled=False,
+        )
+        panel = next(e for e in card["body"]["elements"] if e.get("tag") == "collapsible_panel")
+        divs = [e for e in panel["elements"] if e.get("tag") == "div"]
+        assert 15 <= len(divs) < 40
+        assert any("已折叠前" in str(e.get("content", "")) for e in panel["elements"])
+
+    def test_complete_card_char_budget_binds_on_heavy_steps(self) -> None:
+        """重结果块吃字符预算（防 200860）：步数在 50 内提前截断。"""
+        heavy: dict = {
+            **_STEP_SUCCESS,
+            "detail": "d" * 200,
+            "result_block": {"language": "json", "content": "r" * 1100, "fenced": ""},
+        }
+        steps = [heavy] * 60  # type: ignore[list-item]
+        card = build_complete_card(
+            segments=[_seg("tool", tool_offset=0, tool_end_offset=0)],
+            all_tool_steps=steps,
+        )
+        panel = next(e for e in card["body"]["elements"] if e.get("tag") == "collapsible_panel")
+        # 步数 = 标题行数（每步一个 "Succeeded" 状态标签；div 含 detail/output 不可直接数）
+        shown = str(panel["elements"]).count("Succeeded")
+        assert 15 <= shown < 60
+        assert any("已折叠前" in str(e.get("content", "")) for e in panel["elements"])
+
+    def test_panel_expanded_flags_control_both_panels(self) -> None:
+        """完成卡面板默认展开：工具/推理两键独立控制。"""
+        card = build_complete_card(
+            segments=[_seg("reasoning", "think"), _seg("answer", "a")],
+            all_tool_steps=[],
+            tool_panel_expanded=True,
+            reasoning_panel_expanded=True,
+        )
+        reasoning = next(e for e in card["body"]["elements"] if e.get("tag") == "collapsible_panel")
+        assert reasoning["expanded"] is True
+        card2 = build_complete_card(
+            segments=[_seg("reasoning", "think"), _seg("answer", "a")],
+            all_tool_steps=[],
+        )
+        reasoning2 = next(e for e in card2["body"]["elements"] if e.get("tag") == "collapsible_panel")
+        assert reasoning2["expanded"] is False
 
     def test_summary_truncated_from_last_answer(self) -> None:
         card = build_complete_card(

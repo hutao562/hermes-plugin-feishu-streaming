@@ -1627,3 +1627,146 @@ def test_footer_speed_below_one_tps_renders_lt1() -> None:
     assert "0 t/s" not in en and "<1 t/s" in en
     en2, _ = _render_footer_field("speed", {"tps": 48.2}, False, False, False)
     assert "48 t/s" in en2
+
+
+# ── 折叠栏：流式工具面板按段切片 + 面板展开配置接线 ──
+
+
+@pytest.mark.asyncio
+async def test_flush_tool_update_slices_per_segment() -> None:
+    """第二段工具面板的脏更新只含自己的步骤切片（曾传全量导致跨段重复渲染）。"""
+    from plugin.engine import ChatSession
+
+    client = _mock_client()
+    engine = ChatCardEngine(client)
+    session = ChatSession(chat_id="chat1", thread_id=None)
+    session.state = "streaming"
+    session.card_id = "card_1"
+
+    def _step(name: str, detail: str, output: str) -> None:
+        session.tool_tracker.record_start(name, detail)
+        session.segment_state.on_tool_event(len(session.tool_tracker.build_display_steps()))
+        session.tool_tracker.record_end(name, output=output)
+
+    # 第一段：2 步 + 正文 → flush 建 seg1/answer 元素
+    _step("read", "a.md", "ok")
+    _step("read", "b.md", "ok")
+    session.segment_state.on_answer_delta("mid")
+    await engine._do_flush(session)
+    # 第二段创建：1 步 → flush 建 seg2 元素（add action）
+    _step("bash", "ls", "ok")
+    await engine._do_flush(session)
+    # 第二段追加：1 步 → flush 走 seg2 的脏更新（partial_update_element）
+    _step("read", "c.md", "ok")
+    await engine._do_flush(session)
+
+    tool_segs = [s for s in session.segment_state.segments if s.type == "tool"]
+    updates = [
+        a for a in client.cardkit_batch_update.call_args_list[-1].args[1]
+        if a.get("action") == "partial_update_element"
+    ]
+    seg2_updates = [u for u in updates
+                    if u["params"]["element_id"] == tool_segs[1].el_id]
+    assert len(seg2_updates) == 1, "第三波 flush 应只含 seg2 的脏更新"
+    upd = seg2_updates[0]
+    assert "steps 3–4" in upd["params"]["partial_element"]["header"]["title"]["content"]
+    body = str(upd["params"]["partial_element"]["elements"])
+    assert "ls" in body and "c.md" in body
+    assert "a.md" not in body and "b.md" not in body
+
+
+@pytest.mark.asyncio
+async def test_complete_passes_panel_expanded_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """engine 把 tool/reasoning 面板展开配置透传给完成卡（曾漏接致配置全程不生效）。"""
+    import plugin.engine as engine_mod
+    from plugin.engine import ChatSession
+
+    captured: dict[str, Any] = {}
+
+    def _fake_build(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"schema": "2.0", "body": {"elements": []}}
+
+    monkeypatch.setattr(engine_mod, "build_complete_card", _fake_build)
+    client = _mock_client()
+    engine = engine_mod.ChatCardEngine(
+        client, tool_panel_expanded=True, reasoning_panel_expanded=True)
+    session = ChatSession(chat_id="chat1", thread_id=None)
+    session.state = "streaming"
+    session.card_id = "card_1"
+    session.card_msg_id = "om_1"
+    engine._sessions[engine._skey("chat1", None)] = session
+
+    assert await engine.complete("chat1", "hello") == "om_1"
+    assert captured["tool_panel_expanded"] is True
+    assert captured["reasoning_panel_expanded"] is True
+
+
+@pytest.mark.asyncio
+async def test_reasoning_routes_by_session_map_no_cross_chat(adapter) -> None:
+    """session_id 映射路由：双 chat 并发时 reasoning 各进各卡，绝不互串."""
+    import plugin as plugin_pkg
+
+    engine = adapter._engine()
+    chat_a, chat_b = "oc_" + "a" * 20, "oc_" + "b" * 20
+    engine.on_turn_started(chat_a)
+    engine.on_turn_started(chat_b)
+    await _settle(engine)
+
+    plugin_pkg._note_session_route("sess_b", engine, chat_b)
+    hook = plugin_pkg._make_reasoning_hook()
+    hook(kind="reasoning", delta="B 的思考", session_id="sess_b")
+
+    await _settle(engine)
+    sa = engine.session_for(chat_a)
+    sb = engine.session_for(chat_b)
+    assert "B 的思考" in (sb.segment_state.segments[0].text
+                          if sb.segment_state.segments else "")
+    assert not sa.segment_state.segments, "A 的卡不应出现 B 的思考"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_strict_drops_when_target_inactive(adapter) -> None:
+    """strict 路由目标已终态 → 丢弃，不回落单活跃（回落=串扰）."""
+    import plugin as plugin_pkg
+
+    engine = adapter._engine()
+    chat_a, chat_b = "oc_" + "a" * 20, "oc_" + "b" * 20
+    engine.on_turn_started(chat_a)
+    await _settle(engine)
+    # chat_b 会话不存在（映射过期场景）
+
+    plugin_pkg._note_session_route("sess_b", engine, chat_b)
+    hook = plugin_pkg._make_reasoning_hook()
+    hook(kind="reasoning", delta="孤儿思考", session_id="sess_b")
+    await _settle(engine)
+
+    sa = engine.session_for(chat_a)
+    assert not sa.segment_state.segments or all(
+        "孤儿思考" not in (s.text or "") for s in sa.segment_state.segments)
+
+
+@pytest.mark.asyncio
+async def test_tool_event_routes_by_turn_anchor(adapter) -> None:
+    from types import SimpleNamespace
+    """工具事件按 adapter 回合锚路由：并发双 chat，工具只进锚定的那张卡."""
+    engine = adapter._engine()
+    chat_a, chat_b = "oc_" + "a" * 20, "oc_" + "b" * 20
+    engine.on_turn_started(chat_a)
+    engine.on_turn_started(chat_b)
+    await _settle(engine)
+
+    try:
+        from gateway.stream_events import ToolCallChunk
+        chunk = ToolCallChunk(tool_name="terminal", preview="ls")
+    except ImportError:  # 无 hermes 源树环境：duck-typing 替身
+        chunk = SimpleNamespace(tool_name="terminal", preview="ls", args={})
+    adapter._turn_anchor = (chat_b, None)
+    adapter.format_tool_event(chunk)
+    await _settle(engine)
+
+    sa = engine.session_for(chat_a)
+    sb = engine.session_for(chat_b)
+    # B 的会话记了工具步；A 的没有
+    assert len(sb.tool_tracker.build_display_steps()) == 1
+    assert len(sa.tool_tracker.build_display_steps()) == 0

@@ -159,6 +159,10 @@ def _build_scoped_engine() -> tuple[ChatCardEngine, Any]:
         # header（完成态状态条）与注入模式同源读 streaming.header 段；
         # 漏接会让红卡等 header 依赖特性静默失效
         header_enabled=_header_config(),
+        # 完成卡面板默认展开（streaming.tool_panel_expanded / reasoning_panel_expanded，
+        # 未单独配置回退旧键 panel_expanded；此前漏接曾让两键全程不生效）
+        tool_panel_expanded=_panel_expanded_config("tool_panel_expanded"),
+        reasoning_panel_expanded=_panel_expanded_config("reasoning_panel_expanded"),
     )
     with _ENGINES_LOCK:
         _ENGINES.append(engine)
@@ -270,6 +274,36 @@ def _fanout_hooks_to_profile_scopes(hooks: dict[str, Any], manifest: Any = None)
 # 跨 engine 钩子路由（multiplex 下每 profile 一个 engine）
 _ENGINES: list[ChatCardEngine] = []
 _ENGINES_LOCK = threading.Lock()
+# hermes session_id（date_hash）→ (engine, chat)：usage 钩子在回合并发窗口登记，
+# reasoning 增量按它精确路由（hermes 会话跨回合持久——自第 2 回合起生效，
+# 首回合仍走单活跃兜底）。TTL 10 分钟防陈旧映射跨会话误路由。
+_SESSION_ROUTE: dict[str, tuple[ChatCardEngine, str, float]] = {}
+_SESSION_ROUTE_TTL = 600.0
+
+
+def _note_session_route(session_id: str, engine: ChatCardEngine, chat_id: str) -> None:
+    if not session_id or not chat_id:
+        return
+    now = time.time()
+    with _ENGINES_LOCK:
+        # 顺带清扫过期项（懒清理，防无界增长）
+        stale = [k for k, v in _SESSION_ROUTE.items() if now - v[2] > _SESSION_ROUTE_TTL]
+        for k in stale:
+            _SESSION_ROUTE.pop(k, None)
+        if len(_SESSION_ROUTE) > 256:
+            _SESSION_ROUTE.clear()
+        _SESSION_ROUTE[session_id] = (engine, chat_id, now)
+
+
+def _route_by_session(session_id: str) -> tuple[ChatCardEngine, str] | None:
+    if not session_id:
+        return None
+    now = time.time()
+    with _ENGINES_LOCK:
+        hit = _SESSION_ROUTE.get(session_id)
+    if hit and now - hit[2] <= _SESSION_ROUTE_TTL:
+        return hit[0], hit[1]
+    return None
 
 
 def _model_cycle_config() -> list[str]:
@@ -321,6 +355,16 @@ def _header_config() -> bool:
         from ._vendor.config import Config
 
         return Config().header_enabled
+    except Exception:
+        return False
+
+
+def _panel_expanded_config(key: str) -> bool:
+    """读 streaming.tool_panel_expanded / reasoning_panel_expanded（缺省回退 panel_expanded）."""
+    try:
+        from ._vendor.config import Config
+
+        return bool(getattr(Config(), key))
     except Exception:
         return False
 
@@ -411,7 +455,12 @@ def _make_reasoning_hook() -> Any:
         text = kwargs.get("delta") or kwargs.get("text") or ""
         if not text:
             return
-        # 钩子不带 chat：全局恰好一个活跃会话时兜底（跨 engine 聚合判定）
+        # session_id 精确路由（usage 登记的映射）优先；未登记（首回合）回退
+        # 「全局恰好一个活跃会话」兜底
+        routed = _route_by_session(str(kwargs.get("session_id") or ""))
+        if routed is not None:
+            routed[0].on_reasoning(routed[1], text, strict=True)
+            return
         with _ENGINES_LOCK:
             engines = list(_ENGINES)
         actives = [(e, e.streaming_sessions()) for e in engines]
@@ -443,6 +492,10 @@ def _make_usage_hook() -> Any:
         engine = _route_usage_engine(engines, session_id)
         if engine is None:
             return
+        # 恰好一个进行中回合 → 登记 session→chat 映射，供 reasoning 增量路由
+        open_sessions = engine.open_sessions()
+        if len(open_sessions) == 1:
+            _note_session_route(session_id, engine, open_sessions[0].chat_id)
         usage = {**usage, "context_length": kwargs.get("context_length"),
                  "started_at": kwargs.get("started_at"),
                  "ended_at": kwargs.get("ended_at")}

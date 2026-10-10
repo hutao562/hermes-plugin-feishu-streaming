@@ -34,6 +34,7 @@ from ._vendor.streaming.segment_helper import (
     build_add_segment_action,
     build_reasoning_finalized_action,
     build_tool_update_action,
+    tool_segment_end,
 )
 from ._vendor.streaming.segments import Segment, SegmentState, SegmentType
 from ._vendor.streaming.text import strip_reasoning_tags
@@ -97,12 +98,18 @@ class ChatCardEngine:
                  footer_fields: list[list[str]] | None = None,
                  footer_show_label: bool = False,
                  footer_enabled: bool = True,
-                 model_cycle: list[str] | None = None) -> None:
+                 model_cycle: list[str] | None = None,
+                 tool_panel_expanded: bool = False,
+                 reasoning_panel_expanded: bool = False) -> None:
         self._client = client
         self._body_text_size = body_text_size
         self._show_tool_use = show_tool_use
         self._header_enabled = header_enabled
         self._width_mode = width_mode
+        # 完成卡面板默认展开（streaming.tool_panel_expanded / reasoning_panel_expanded，
+        # 未单独配置回退旧键 panel_expanded）——流式期恒折叠，标题行动作标签已够用
+        self._tool_panel_expanded = tool_panel_expanded
+        self._reasoning_panel_expanded = reasoning_panel_expanded
         # footer 形态与注入模式同源（vendor Config 读 HERMES_HOME/config.yaml
         # 的 streaming.footer 段），两形态渲染一致
         self._footer_fields = footer_fields or [["elapsed", "model", "context"]]
@@ -344,13 +351,21 @@ class ChatCardEngine:
         session.answer_seg.dirty = True
         self._schedule(session)
 
-    def on_tool_start(self, tool_name: str, detail: str = "") -> None:
+    def on_tool_start(self, tool_name: str, detail: str = "",
+                      anchor: tuple[str, str | None] | None = None) -> None:
         """format_tool_event(ToolCallChunk) 的落点 — 记录步骤并刷新工具面板.
 
         工具事件可能先于任何 draft（带工具回合的常态）：无会话时也建卡，
-        让工具面板从第一步就滚动在用户眼前。
+        让工具面板从第一步就滚动在用户眼里。``anchor``=(chat, thread) 是
+        adapter 侧记录的当回合锚（format_tool_event 落在当回合的 adapter 上，
+        adapter 知道自己在服务谁）——并发多会话时按锚路由，杜绝 B 会话的
+        工具名/参数画进 A 会话的卡（2026-10-10 catalog review 指出的串扰）。
         """
-        session = self._any_active_session()
+        session = None
+        if anchor is not None:
+            session = self.active_session(anchor[0], anchor[1])
+        if session is None:
+            session = self._any_active_session()
         if session is None:
             # 工具事件先于 typing 的兜底：在事件循环线程上捕获 loop 建""占位
             # 会话（typing 到达后按 chat 归位）；跨线程无 loop 时丢弃该事件
@@ -376,9 +391,14 @@ class ChatCardEngine:
             session.tool_seg.dirty = True
         self._schedule(session)
 
-    def on_reasoning(self, chat_id: str, text: str) -> None:
-        """reasoning 增量 — 插件钩子不带 chat，多会话并发时丢弃（防串扰）."""
-        target = self._resolve_reasoning_target(chat_id)
+    def on_reasoning(self, chat_id: str, text: str, *, strict: bool = False) -> None:
+        """reasoning 增量 — 多会话并发时丢弃（防串扰）.
+
+        ``strict``（session_id 路由命中时）：只进 chat_id 自己的会话，目标
+        不活跃就丢弃——绝不回落单活跃兜底（回落=把 B 的思考写进 A 的卡，
+        catalog review 指出的串扰正是这一步）。
+        """
+        target = self.active_session(chat_id) if strict else self._resolve_reasoning_target(chat_id)
         if target is None:
             return
         if not target._reasoning_logged:
@@ -457,6 +477,8 @@ class ChatCardEngine:
             show_tool_use=self._show_tool_use,
             width_mode=self._width_mode,
             model_switch=session.model_switch,
+            tool_panel_expanded=self._tool_panel_expanded,
+            reasoning_panel_expanded=self._reasoning_panel_expanded,
         )
         try:
             session.sequence += 1
@@ -492,6 +514,8 @@ class ChatCardEngine:
                 show_tool_use=self._show_tool_use,
                 width_mode=self._width_mode,
                 model_switch=getattr(session, "model_switch", None),
+                tool_panel_expanded=self._tool_panel_expanded,
+                reasoning_panel_expanded=self._reasoning_panel_expanded,
             )
             session.sequence += 1
             try:
@@ -606,6 +630,8 @@ class ChatCardEngine:
                 body_text_size=self._body_text_size,
                 show_tool_use=self._show_tool_use,
                 width_mode=self._width_mode,
+                tool_panel_expanded=self._tool_panel_expanded,
+                reasoning_panel_expanded=self._reasoning_panel_expanded,
             )
             try:
                 session.sequence += 1
@@ -686,7 +712,11 @@ class ChatCardEngine:
                     seg, all_steps, text_size=self._body_text_size))
                 seg.created = True
             elif seg.type == SegmentType.TOOL and seg.dirty:
-                actions.append(build_tool_update_action(element_id=seg.el_id, steps=all_steps))
+                # 按段自己的 [offset, end) 切片更新：传全量会让第二个工具面板
+                # 把前面段的步骤重复渲染进去（单面板时代遗留），也与完成卡口径不一
+                seg_steps = all_steps[seg.tool_offset:tool_segment_end(seg, all_steps)]
+                actions.append(build_tool_update_action(
+                    element_id=seg.el_id, steps=seg_steps, step_offset=seg.tool_offset))
                 seg.dirty = False
             elif (seg.type == SegmentType.REASONING and seg.elapsed_ms > 0
                   and not seg.reasoning_finalized):

@@ -89,7 +89,8 @@ def build_add_segment_action(
     elif seg.type == SegmentType.TOOL:
         start = seg.tool_offset
         end = seg.tool_end_offset if seg.tool_end_offset else len(all_steps)
-        element = _build_tool_panel(all_steps[start:end], element_id=seg.el_id)
+        element = _build_tool_panel(
+            all_steps[start:end], element_id=seg.el_id, step_offset=start)
     elif seg.type == SegmentType.NOTICE:
         element = {
             "tag": "markdown",
@@ -138,9 +139,10 @@ def build_tool_update_action(
     *,
     element_id: str,
     steps: list[ToolDisplayStep],
+    step_offset: int = 0,
 ) -> dict[str, Any]:
-    """构造 tool panel 局部更新 action."""
-    panel = _build_tool_panel(steps)
+    """构造 tool panel 局部更新 action（steps 为该段自己的步骤切片）."""
+    panel = _build_tool_panel(steps, step_offset=step_offset)
     return {
         "action": "partial_update_element",
         "params": {

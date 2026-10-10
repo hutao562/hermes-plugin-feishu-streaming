@@ -10,6 +10,7 @@ from ..streaming.segments import Segment, SegmentType
 from ..streaming.tooluse import ToolDisplayStep
 from .i18n import _LOCALES, _T, _i18n, _t
 from .markdown import (
+    _MAX_CHUNK_CHARS,
     _downgrade_tables,
     _split_long_text,
     optimize_markdown_style,
@@ -128,6 +129,48 @@ def _build_heartbeat_element(content: str = " ") -> dict:
 # 工具面板显示步数上限：长 agent 回合动辄几十步，全量渲染会撑爆卡片体积
 _TOOL_STEPS_SHOWN = 15
 
+# 完成卡整卡重渲时的动态放宽上限：流式期增量更新预算紧（固定 15 封顶），完成
+# 卡按元素预算（本地镜像 segment_helper.ELEMENT_THRESHOLD=180，避免循环导入）与
+# 折叠区字符量双约束摊给各工具面板——长回合前段步骤不再永久丢失，仍防 200860
+_COMPLETE_ELEMENT_BUDGET = 180
+_TOOL_SECTION_CHAR_BUDGET = 40_000
+_MAX_TOOL_STEPS_COMPLETE = 50
+
+
+def _tool_step_element_cost(step: ToolDisplayStep) -> int:
+    """单步元素成本（口径同 segment_helper.estimate_tool_elements）."""
+    cost = 3  # 标题行 div + standard_icon + lark_md
+    if step.get("detail"):
+        cost += 2  # div + plain_text
+    if step.get("result_block") or step.get("error_block"):
+        cost += 2  # div + lark_md
+    return cost
+
+
+def _tool_step_char_cost(step: ToolDisplayStep) -> int:
+    """单步折叠区字符量（detail + 结果/错误块正文，防体积上限 200860）."""
+    chars = len(str(step.get("detail") or ""))
+    block: Any = step.get("error_block") or step.get("result_block") or {}
+    chars += len(str(block.get("content") or block.get("fenced") or ""))
+    return chars
+
+
+def _complete_tool_max_steps(
+    steps: list[ToolDisplayStep], el_budget: int, char_budget: int,
+) -> int:
+    """完成卡单面板可显示步数：双预算内尽量多；下限 1（不渲染空面板），上限 50."""
+    used_el = used_char = n = 0
+    for s in steps:
+        el = _tool_step_element_cost(s)
+        ch = _tool_step_char_cost(s)
+        if (n >= _MAX_TOOL_STEPS_COMPLETE or used_el + el > el_budget
+                or used_char + ch > char_budget):
+            break
+        used_el += el
+        used_char += ch
+        n += 1
+    return max(n, 1)
+
 
 def _build_tool_panel(
     steps: list[ToolDisplayStep],
@@ -135,11 +178,15 @@ def _build_tool_panel(
     *,
     expanded: bool = False,
     element_id: str | None = TOOL_PANEL_ELEMENT_ID,
+    step_offset: int = 0,
+    max_steps: int = _TOOL_STEPS_SHOWN,
 ) -> dict:
     en_t, zh_t = _T["tool_use"]
     # 折叠态标题：有 running 步骤时直接显示「动作标签」（📖 Reading 幼儿园与学习.md），
     # 让用户不展开就能看到 agent 正在操作什么；无 running（含空/全完成）退回
     # 「🛠️ Tool use · N steps」骨架。label 自带 emoji，故 running 态不加 🛠️ 前缀。
+    # 有失败步骤时折叠态必须可见（⚠️ N failed + 标题转红），不展开也能发现回合出过错。
+    failed = sum(1 for s in steps if s.get("status") == "error")
     running = next((s for s in reversed(steps) if s.get("status") == "running"), None)
     if running:
         prefix = ""
@@ -150,16 +197,25 @@ def _build_tool_panel(
         prefix = "🛠️ "
         en_parts, zh_parts = [en_t], [zh_t]
     total_steps = len(steps)
-    if total_steps > _TOOL_STEPS_SHOWN:
+    if total_steps > max_steps:
         # 步数封顶：只渲染最近 N 步（running 步骤恒在末尾），标题计数仍是全量
-        hidden = total_steps - _TOOL_STEPS_SHOWN
-        steps = steps[-_TOOL_STEPS_SHOWN:]
+        hidden = total_steps - max_steps
+        steps = steps[-max_steps:]
     else:
         hidden = 0
-    if steps:
-        tpl_en, tpl_zh = _T["steps"]
-        en_parts.append(tpl_en.format(total_steps, "s" if total_steps > 1 else ""))
-        zh_parts.append(tpl_zh.format(total_steps, ""))
+    if total_steps:
+        if step_offset > 0:
+            tpl_en, tpl_zh = _T["steps_range"]
+            en_parts.append(tpl_en.format(step_offset + 1, step_offset + total_steps))
+            zh_parts.append(tpl_zh.format(step_offset + 1, step_offset + total_steps))
+        else:
+            tpl_en, tpl_zh = _T["steps"]
+            en_parts.append(tpl_en.format(total_steps, "s" if total_steps > 1 else ""))
+            zh_parts.append(tpl_zh.format(total_steps, ""))
+    if failed:
+        tpl_en, tpl_zh = _T["steps_failed"]
+        en_parts.append(tpl_en.format(failed))
+        zh_parts.append(tpl_zh.format(failed))
     if elapsed_ms > 0:
         en_parts.append(f"({_format_elapsed(elapsed_ms)})")
         zh_parts.append(f"({_format_elapsed(elapsed_ms)})")
@@ -181,7 +237,7 @@ def _build_tool_panel(
             "tag": "plain_text",
             "content": f"{prefix}{' · '.join(en_parts)}",
             "i18n_content": _i18n(f"{prefix}{' · '.join(en_parts)}", f"{prefix}{' · '.join(zh_parts)}"),
-            "text_color": "grey",
+            "text_color": "red" if failed else "grey",
             "text_size": "notation",
         },
         elements=children,
@@ -513,6 +569,8 @@ def _format_elapsed(ms: float) -> str:
 
 
 def build_streaming_tool_use_pending_panel() -> dict[str, Any]:
+    # 展开态提示行：面板点开不再是空白（markdown 元素不带 i18n_content，与
+    # running 动作标签同口径先英文）
     return _collapsible_panel(
         expanded=False,
         title_el={
@@ -522,7 +580,12 @@ def build_streaming_tool_use_pending_panel() -> dict[str, Any]:
             "text_color": "grey",
             "text_size": "notation",
         },
-        elements=[],
+        elements=[{
+            "tag": "markdown",
+            "content": _T["tool_pending_hint"][0],
+            "text_size": "notation",
+            "text_color": "grey",
+        }],
     )
 
 
@@ -595,7 +658,8 @@ def build_complete_card(
     footer_show_label: bool = True,
     footer_enabled: bool = True,
     footer_text_size: str = "notation",
-    panel_expanded: bool = False,
+    tool_panel_expanded: bool = False,
+    reasoning_panel_expanded: bool = False,
     header_enabled: bool = False,
     body_text_size: str = "normal_v2",
     show_tool_use: bool = True,
@@ -606,11 +670,27 @@ def build_complete_card(
     elements: list[dict] = []
     has_answer = False
 
+    # 工具步骤显示预算：扣除非工具元素与 footer 的估算占用后，剩余在元素/字符
+    # 双上限内摊给各工具面板（流式期固定 15 封顶，完成卡动态放宽最多 50）
+    tool_el_budget = _COMPLETE_ELEMENT_BUDGET - 4  # 基础波动余量
+    if footer_enabled:
+        tool_el_budget -= 4  # hr + footer 文本 + 按钮列等
+    for seg in segments:
+        if seg.type == SegmentType.REASONING:
+            tool_el_budget -= 4
+        elif seg.type == SegmentType.ANSWER:
+            tool_el_budget -= len(seg.text) // _MAX_CHUNK_CHARS + 1
+        elif seg.type == SegmentType.NOTICE:
+            tool_el_budget -= 1
+        elif seg.type == SegmentType.TOOL and show_tool_use:
+            tool_el_budget -= 3  # 面板壳（panel + header 子节点）
+    tool_char_budget = _TOOL_SECTION_CHAR_BUDGET
+
     for seg in segments:
         if seg.type == SegmentType.REASONING:
             if seg.text:
                 elements.append(_build_reasoning_panel(
-                    seg.text, seg.elapsed_ms, expanded=panel_expanded,
+                    seg.text, seg.elapsed_ms, expanded=reasoning_panel_expanded,
                     element_id=None, text_element_id=None,
                 ))
         elif seg.type == SegmentType.TOOL:
@@ -620,7 +700,13 @@ def build_complete_card(
             end = seg.tool_end_offset if seg.tool_end_offset else len(all_tool_steps)
             steps = all_tool_steps[start:end]
             if steps:
-                elements.append(_build_tool_panel(steps, expanded=panel_expanded, element_id=None))
+                max_steps = _complete_tool_max_steps(steps, tool_el_budget, tool_char_budget)
+                elements.append(_build_tool_panel(
+                    steps, expanded=tool_panel_expanded, element_id=None,
+                    step_offset=start, max_steps=max_steps))
+                shown = steps[-max_steps:]
+                tool_el_budget -= sum(_tool_step_element_cost(s) for s in shown)
+                tool_char_budget -= sum(_tool_step_char_cost(s) for s in shown)
         elif seg.type == SegmentType.ANSWER and seg.text:
             has_answer = True
             content = _downgrade_tables(optimize_markdown_style(seg.text))
