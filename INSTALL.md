@@ -77,9 +77,30 @@ grep "adapter factory" ~/.hermes/logs/gateway.log | tail
 
 ```bash
 python3 ~/.hermes/plugins/feishu-streaming/doctor.py
+# 可选：装机时顺手探一次 CardKit 权限（唯一发网络请求的检查）
+python3 ~/.hermes/plugins/feishu-streaming/doctor.py --probe-cardkit
 ```
 
-发一条飞书消息：应立即出现流式卡片（带工具的回合，工具面板从第一步就滚动）。
+### 验收（零工具版）
+
+给机器人发一条消息：回复是**流式卡片**（不是纯文本/post 富文本）就算过。
+带工具的回合，工具面板会从第一步就滚动。
+
+### 验收（agent 版，前后对照）
+
+判断标准是 `msg_type == interactive`，不是日志：
+
+```bash
+# 装前先记一条旧回复的形态（post / text）
+lark-cli im +chat-messages-list --chat <chat_id> --limit 3
+# 以你的身份发测试消息
+lark-cli im +messages-send --as user --chat <chat_id> --text "卡片插件测试"
+# 装后新回复应为 interactive
+lark-cli im +chat-messages-list --chat <chat_id> --limit 3
+```
+
+> footer 的 ⏱ 与 gateway 日志 `response ready time=` 口径不同（卡片=API 跨度，
+> 网关=含排队），网关侧略大是正常的；`⚡ <1 t/s` 是短回答的正常显示。
 
 ## Uninstall
 
