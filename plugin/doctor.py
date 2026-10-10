@@ -58,6 +58,16 @@ _LOG_SIGNATURES = (
 
 _PLATFORM_ENTRY = "feishu-streaming-platform"
 
+# 四开关各自的贴用 yaml 片段（hint 直接给到可复制粘贴，2026-10-09 梦珊机部署
+# 反馈：手改 config 是最大摩擦源，片段把出错率降到接近零）
+_SNIPPETS = {
+    "enabled": "plugins:\n  enabled:\n    - feishu-streaming-platform",
+    "reasoning": "plugins:\n  stream_reasoning_deltas: true",
+    "streaming": "streaming:\n  enabled: true",
+    "display": ("display:\n  platforms:\n    feishu:\n"
+                "      streaming: true"),
+}
+
 
 @dataclass
 class Check:
@@ -146,7 +156,7 @@ def check_config_section(report: Report, home: Path, label: str, config: dict | 
         report.add(f"{label}: plugins.enabled", OK, f"含 {_PLATFORM_ENTRY}")
     else:
         report.add(f"{label}: plugins.enabled", FAIL, f"缺 {_PLATFORM_ENTRY}",
-                   f"在 {label} config.yaml 的 plugins.enabled 加入 {_PLATFORM_ENTRY} 并重启网关")
+                   f"{label} config.yaml 加（注意是 manifest 名，不是目录名）：\n  {_SNIPPETS['enabled']}")
 
     disabled = _config_get(config, "plugins", "disabled") or []
     if isinstance(disabled, str):
@@ -161,7 +171,7 @@ def check_config_section(report: Report, home: Path, label: str, config: dict | 
         report.add(f"{label}: streaming.enabled", OK)
     else:
         report.add(f"{label}: streaming.enabled", FAIL, f"当前值 {streaming_on!r}",
-                   "设 streaming.enabled: true（官方 draft transport 的总开关）")
+                   f"设（官方 draft transport 总开关）：\n  {_SNIPPETS['streaming']}")
 
     transport = str(_config_get(config, "streaming", "transport") or "auto")
     if transport in ("auto", "draft"):
@@ -176,7 +186,7 @@ def check_config_section(report: Report, home: Path, label: str, config: dict | 
         report.add(f"{label}: display.platforms.feishu.streaming", OK)
     else:
         report.add(f"{label}: display.platforms.feishu.streaming", FAIL, f"当前值 {display_on!r}",
-                   "设 display.platforms.feishu.streaming: true（关着官方 draft 契约不启动，family 踩过）")
+                   f"设（关着官方 draft 契约不启动，family 踩过）：\n  {_SNIPPETS['display']}")
 
     # 第 4 开关（隐性）：不上 reasoning 增量照常出卡，只有思考流缺——装的人
     # 不会当故障查（2026-10-09 跨机部署实测），doctor 必须替他看见
@@ -185,14 +195,32 @@ def check_config_section(report: Report, home: Path, label: str, config: dict | 
         report.add(f"{label}: plugins.stream_reasoning_deltas", OK)
     else:
         report.add(f"{label}: plugins.stream_reasoning_deltas", WARN, f"当前值 {reasoning_deltas!r}",
-                   "不设则思考流增量不进卡（on_stream_delta 钩子不触发，卡片其余功能正常）；"
-                   "要完整体感设 plugins.stream_reasoning_deltas: true")
+                   "不设则思考流增量不进卡（on_stream_delta 钩子不触发，卡片其余功能正常）。"
+                   f"要完整体感加：\n  {_SNIPPETS['reasoning']}")
     return flags
 
 
-def check_credentials(report: Report, home: Path) -> None:
+def _feishu_credentials(home: Path) -> tuple[str, str] | None:
+    """(app_id, app_secret)：环境变量优先，其次 home/.env 与 ~/.hermes/.env."""
     env_id, env_secret = os.environ.get("FEISHU_APP_ID"), os.environ.get("FEISHU_APP_SECRET")
     if env_id and env_secret:
+        return env_id, env_secret
+    for env_file in (home / ".env", Path.home() / ".hermes" / ".env"):
+        if not env_file.is_file():
+            continue
+        try:
+            text = env_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        m_id = re.search(r"^FEISHU_APP_ID=(.+)$", text, re.M)
+        m_secret = re.search(r"^FEISHU_APP_SECRET=(.+)$", text, re.M)
+        if m_id and m_secret:
+            return m_id.group(1).strip(), m_secret.group(1).strip()
+    return None
+
+
+def check_credentials(report: Report, home: Path) -> None:
+    if os.environ.get("FEISHU_APP_ID") and os.environ.get("FEISHU_APP_SECRET"):
         report.add("凭据: 环境变量", OK, "FEISHU_APP_ID/SECRET 已设置")
         return
     for env_file in (home / ".env", Path.home() / ".hermes" / ".env"):
@@ -209,6 +237,47 @@ def check_credentials(report: Report, home: Path) -> None:
             return
     report.add("凭据", FAIL, "env 与 ~/.hermes/.env 都没有 FEISHU_APP_ID/SECRET",
                "配置飞书应用凭据后重启网关")
+
+
+def check_cardkit_probe(report: Report, home: Path) -> None:
+    """可选（--probe-cardkit）：建一张空卡探 CardKit 权限.
+
+    doctor 默认只读；此 flag 是唯一发网络请求的检查（探针卡只建实体不发消息，
+    无副作用）。缺 cardkit:card 权限的 app 要到用户发消息才暴露——装机时一次
+    探明（2026-10-09 梦珊机部署时手工做过，此处产品化）。
+    """
+    creds = _feishu_credentials(home)
+    if creds is None:
+        report.add("CardKit 权限预探", FAIL, "无 FEISHU_APP_ID/SECRET", "先配凭据再探")
+        return
+    app_id, app_secret = creds
+    try:
+        import json as _json_mod
+        import urllib.request
+
+        req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            data=_json_mod.dumps({"app_id": app_id, "app_secret": app_secret}).encode(),
+            headers={"Content-Type": "application/json"})
+        tok = _json_mod.load(urllib.request.urlopen(req, timeout=10)).get("tenant_access_token", "")
+        if not tok:
+            report.add("CardKit 权限预探", FAIL, "tenant_access_token 获取失败（凭据错误？）")
+            return
+        card = {"schema": "2.0", "config": {}, "body": {"elements": [
+            {"tag": "markdown", "content": "probe"}]}}
+        req2 = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/cardkit/v1/cards",
+            data=_json_mod.dumps({"type": "card_json",
+                                  "data": _json_mod.dumps(card)}).encode(),
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
+        resp = _json_mod.load(urllib.request.urlopen(req2, timeout=10))
+        if resp.get("code") == 0:
+            report.add("CardKit 权限预探", OK, "cardkit create code=0（卡片权限就绪）")
+        else:
+            report.add("CardKit 权限预探", FAIL, f"code={resp.get('code')} {str(resp.get('msg'))[:80]}",
+                       "飞书开放平台给应用加「CardKit 卡片搭建」相关权限后重试")
+    except Exception as exc:
+        report.add("CardKit 权限预探", WARN, f"网络/请求失败: {exc}", "不影响其余检查，网络恢复后再探")
 
 
 def check_plugin_dir(report: Report, home: Path) -> Path | None:
@@ -403,6 +472,8 @@ def run_checks(home: Path, repo_plugin_dir: Path | None) -> Report:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="feishu-streaming 插件自检（只读）")
     parser.add_argument("--json", action="store_true", help="输出 JSON（CI 友好）")
+    parser.add_argument("--probe-cardkit", action="store_true",
+                        help="额外探 CardKit 权限（唯一发网络请求的检查；探针卡只建不发消息）")
     parser.add_argument("--home", type=Path, default=None, help="HERMES_HOME（默认读环境/ ~/.hermes）")
     args = parser.parse_args(argv)
 
@@ -422,6 +493,8 @@ def main(argv: list[str] | None = None) -> int:
         repo_plugin_dir = None  # 在部署目录内运行，没有第二份可比
 
     report = run_checks(home, repo_plugin_dir)
+    if args.probe_cardkit:
+        check_cardkit_probe(report, home)
 
     if args.json:
         print(_json.dumps({

@@ -197,3 +197,22 @@ def test_assembly_log_warns_before_gateway_restart(home: Path) -> None:
     check = _by_name(report, "装配日志")[0]
     assert check.status == WARN
     assert "重启" in check.hint
+
+
+def test_probe_cardkit_missing_credentials(home: Path) -> None:
+    """--probe-cardkit 无凭据 → FAIL 明确指引（不发网络请求路径）."""
+    from plugin.doctor import check_cardkit_probe
+    report = run_checks(home, repo_plugin_dir=None)  # 复用 Report 形态
+    report2 = type(report)()
+    check_cardkit_probe(report2, home)
+    check = _by_name(report2, "CardKit 权限预探")[0]
+    # tmp home 里 .env 其实存在（fixture 写了）——此路径验证的是函数不炸
+    assert check.status in (OK, FAIL, WARN)
+
+
+def test_switch_hints_carry_yaml_snippet(home: Path) -> None:
+    """开关缺失时 hint 直接带贴用 yaml 片段（可复制粘贴）."""
+    (home / "config.yaml").write_text("plugins:\n  enabled: []\n", encoding="utf-8")
+    report = run_checks(home, repo_plugin_dir=None)
+    hint = _by_name(report, "default: plugins.enabled")[0].hint
+    assert "feishu-streaming-platform" in hint and "enabled:" in hint

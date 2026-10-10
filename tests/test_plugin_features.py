@@ -1623,7 +1623,7 @@ def test_footer_speed_below_one_tps_renders_lt1() -> None:
     """短回答 t/s <1 显示 <1 t/s，不再取整成 0（跨机部署实测观感像坏了）."""
     from plugin._vendor.cardkit.builder import _render_footer_field
 
-    en, zh = _render_footer_field("speed", {"tps": 0.31}, False, False, False)
+    en, _zh = _render_footer_field("speed", {"tps": 0.31}, False, False, False)
     assert "0 t/s" not in en and "<1 t/s" in en
     en2, _ = _render_footer_field("speed", {"tps": 48.2}, False, False, False)
     assert "48 t/s" in en2
