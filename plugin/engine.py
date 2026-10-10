@@ -14,15 +14,18 @@ builder（CardKit v2）/ FeishuClient（SDK 封装）。
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from ._vendor.cardkit.builder import (
     HEARTBEAT_ELEMENT_ID,
+    MAX_FAVORITE_MODELS,
     build_complete_card,
     build_cron_card,
     build_streaming_card_v2,
@@ -116,8 +119,15 @@ class ChatCardEngine:
         self._footer_show_label = footer_show_label
         self._footer_enabled = footer_enabled
         # footer 模型切换按钮的轮换清单（streaming.footer.model_cycle，缺省
-        # model.default + fallback_providers 推导）——<2 个或当前模型不在清单则不出按钮
+        # model.default + fallback_providers 推导）——<2 个或当前模型不在清单则不出按钮。
+        # 卡片内「常用模型」管理（v0.19.0）落盘 JSON 并在启动时优先于推导清单
         self._model_cycle = [m.strip() for m in (model_cycle or []) if str(m).strip()]
+        self._model_cycle_fallback = list(self._model_cycle)
+        favorites = self._load_model_favorites()
+        if favorites:
+            self._model_cycle = favorites
+        # hermes 全部可用模型（管理卡候选池）：(fetched_at, providers) 进程内缓存
+        self._candidates_cache: tuple[float, list[dict[str, Any]]] | None = None
         self._sessions: dict[str, ChatSession] = {}
         # 会话键 = (chat, thread)：Feishu 话题在 hermes 是独立会话（dm:oc_x:omt_y），
         # 卡片会话必须同粒度隔离，否则话题与主聊互相串写（2026-10-09 实测混写）
@@ -796,3 +806,124 @@ class ChatCardEngine:
         current = self._chat_models.get(chat_id) or self._chat_models.get("") \
             or self._last_model or self._model_cycle[0]
         return {"current": current, "models": list(self._model_cycle)}
+
+    # ── 常用模型管理（v0.19.0：picker 卡 ⚙ 入口 → 管理卡 toggle，存盘跨重启）──
+
+    _CANDIDATES_TTL = 60.0
+
+    def _model_cycle_file(self) -> Path | None:
+        """常用清单存储：<HERMES_HOME>/feishu_streaming_model_cycle.json.
+
+        与 config.yaml 同目录（profile 作用域天然隔离；部署拷贝 plugins/ 不会
+        覆盖它）。"""
+        try:
+            from ._vendor.config import _config_path
+
+            return _config_path().parent / "feishu_streaming_model_cycle.json"
+        except Exception:
+            return None
+
+    def _load_model_favorites(self) -> list[str]:
+        path = self._model_cycle_file()
+        if path is None or not path.exists():
+            return []
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            models = raw.get("models") if isinstance(raw, dict) else raw
+            out: list[str] = []
+            for m in models or []:
+                name = str(m).strip()
+                if name and name not in out:
+                    out.append(name)
+            return out[:MAX_FAVORITE_MODELS]
+        except Exception as e:
+            _logger.warning("[feishu-streaming] model favorites load failed: %s", e)
+            return []
+
+    def _apply_model_favorites(self, models: list[str]) -> list[str]:
+        """清单落盘 + 应用到本 engine（footer 按钮与 picker 即时生效）；空清单回退推导."""
+        out: list[str] = []
+        for m in models:
+            name = str(m).strip()
+            if name and name not in out:
+                out.append(name)
+        out = out[:MAX_FAVORITE_MODELS]
+        self._model_cycle = out or list(self._model_cycle_fallback)
+        path = self._model_cycle_file()
+        if path is not None:
+            try:
+                tmp = path.with_suffix(path.suffix + ".tmp")
+                tmp.write_text(json.dumps({"models": out}, ensure_ascii=False, indent=2),
+                               encoding="utf-8")
+                tmp.replace(path)
+            except Exception as e:
+                _logger.warning("[feishu-streaming] model favorites save failed: %s", e)
+        return out
+
+    def toggle_model_favorite(self, target: str) -> tuple[list[str], str]:
+        """加入/移出一个常用模型 → (新清单, notice)。上限已满拒绝加新。"""
+        target = (target or "").strip()
+        if not target:
+            return self._load_model_favorites(), ""
+        favorites = self._load_model_favorites()
+        if target in favorites:
+            favorites.remove(target)
+        elif len(favorites) >= MAX_FAVORITE_MODELS:
+            return favorites, f"常用已满 {MAX_FAVORITE_MODELS} 个，先移出一个再加「{target}」"
+        else:
+            favorites.append(target)
+        return self._apply_model_favorites(favorites), ""
+
+    async def model_candidates(self) -> list[dict[str, Any]]:
+        """hermes 全部可用模型（provider 分组）——管理卡候选池.
+
+        数据源 = 上游 /model picker 同款 list_picker_providers（内置 provider 目录
+        + 自定义端点，non_blocking 只读磁盘缓存）。同步 IO → to_thread；60s 缓存。
+        任何失败回 []（管理卡渲染空态提示，不影响其他功能）。"""
+        now = time.time()
+        if self._candidates_cache and now - self._candidates_cache[0] < self._CANDIDATES_TTL:
+            return self._candidates_cache[1]
+
+        def _fetch() -> list[dict[str, Any]]:
+            import yaml
+
+            from ._vendor.config import _config_path
+
+            cfg = yaml.safe_load(_config_path().read_text(encoding="utf-8")) or {}
+            model_cfg = cfg.get("model") or {}
+            try:
+                from hermes_cli.config import get_compatible_custom_providers
+
+                custom = get_compatible_custom_providers(cfg)
+            except Exception:
+                custom = cfg.get("custom_providers")
+            excluded = (cfg.get("model_catalog") or {}).get("excluded_providers")
+            from hermes_cli.model_switch_providers import list_picker_providers
+
+            providers: list[dict[str, Any]] = list(list_picker_providers(
+                current_provider=str(model_cfg.get("provider") or "openrouter"),
+                current_base_url=str(model_cfg.get("base_url") or ""),
+                current_model=self._last_model or str(model_cfg.get("default") or ""),
+                user_providers=cfg.get("providers"),
+                custom_providers=custom,
+                excluded_providers=excluded if isinstance(excluded, list) else [],
+                non_blocking_catalogs=True, probe_custom_providers=False,
+                probe_current_custom_provider=False, max_models=50, include_moa=False))
+            return providers
+
+        try:
+            providers = await asyncio.to_thread(_fetch)
+        except Exception as e:
+            _logger.warning("[feishu-streaming] model candidates fetch failed: %s", e)
+            return []
+        slim: list[dict[str, Any]] = [
+            {"slug": p.get("slug"), "name": p.get("name"),
+             "models": [str(m) for m in (p.get("models") or []) if str(m).strip()],
+             "total_models": int(p.get("total_models") or 0)}
+            for p in providers or [] if p.get("models")]
+        for item in slim:
+            item["total_models"] = item["total_models"] or len(item["models"])
+        self._candidates_cache = (now, slim)
+        _logger.info("[feishu-streaming] model candidates loaded: providers=%d models=%d",
+                     len(slim), sum(len(p["models"]) for p in slim))
+        return slim

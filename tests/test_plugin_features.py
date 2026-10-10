@@ -670,8 +670,15 @@ async def test_footer_renders_without_labels_single_row() -> None:
     assert "1.0M" in card  # context 字段（1M 上限）
 
 
-def test_footer_config_reads_hermes_yaml() -> None:
+def test_footer_config_reads_hermes_yaml(monkeypatch: Any, tmp_path: Any) -> None:
     """register 的 footer 形态来自 HERMES_HOME/config.yaml（与注入模式同源）."""
+    import plugin._vendor.config as config_mod
+
+    monkeypatch.setattr(config_mod, "_config_path",
+                        lambda home=None: tmp_path / "config.yaml")
+    (tmp_path / "config.yaml").write_text(
+        "streaming:\n  footer:\n    fields:\n      - - elapsed\n        - model\n",
+        encoding="utf-8")
     from plugin import _footer_config
 
     fields = _footer_config("fields", None)
@@ -1374,9 +1381,11 @@ def test_build_model_picker_card_lists_models() -> None:
 
     card = build_model_picker_card("deepseek-flash", ["deepseek-flash", "glm-5.3-flash"])
     buttons = [b for e in card["elements"] for b in e["actions"]]
-    assert [b["text"]["content"] for b in buttons] == ["✅ deepseek-flash", "glm-5.3-flash"]
+    assert [b["text"]["content"] for b in buttons] == ["✅ deepseek-flash", "glm-5.3-flash",
+                                                       "⚙ 管理常用模型"]
     assert buttons[1]["value"] == {"hermes_model_action": "switch",
                                    "target": "glm-5.3-flash"}
+    assert buttons[2]["value"] == {"hermes_model_action": "admin"}
 
 
 def test_build_model_switch_ack_card() -> None:
@@ -1442,7 +1451,192 @@ async def test_model_pick_action_sends_picker_card(adapter) -> None:
     sent = engine._client.send_card_to_chat.call_args[0][1]
     assert "切换模型" in sent["header"]["title"]["content"]
     buttons = [b for e in sent["elements"] for b in e["actions"]]
-    assert len(buttons) == 2
+    assert len(buttons) == 3  # 2 个模型 + ⚙ 管理常用模型入口
+
+
+# ── 常用模型管理（v0.19.0）：管理卡 toggle + favorites 存盘 ──
+
+
+def test_build_model_admin_card_sections_and_toggle_values() -> None:
+    from plugin._vendor.cardkit.builder import build_model_admin_card
+
+    card = build_model_admin_card(
+        "glm-5", ["glm-5"],
+        [{"slug": "zai", "name": "Z.AI", "models": ["glm-5", "glm-4.6"],
+          "total_models": 2}])
+    buttons = [b for e in card["elements"] for b in e.get("actions", [])]
+    texts = [b["text"]["content"] for b in buttons]
+    # 常用节 ✅ + 候选节未加入项（已常用的不再重复出现在候选节）
+    assert texts == ["✅ glm-5", "glm-4.6", "✅ 完成"]
+    assert buttons[0]["value"] == {"hermes_model_action": "toggle", "target": "glm-5"}
+    assert buttons[1]["type"] == "default"
+    assert buttons[2]["value"] == {"hermes_model_action": "admin_done"}
+    contents = [e.get("content", "") for e in card["elements"] if e.get("tag") == "markdown"]
+    assert any("★ 常用" in c for c in contents)
+
+
+def test_build_model_admin_card_keeps_off_pool_favorites_and_caps() -> None:
+    from plugin._vendor.cardkit.builder import MAX_ADMIN_CANDIDATES, build_model_admin_card
+
+    # 常用含候选池外模型（手工配置项）→ 单列 ★ 节可移出
+    card = build_model_admin_card(
+        "m", ["custom-x"],
+        [{"slug": "zai", "name": "Z.AI", "models": ["a"], "total_models": 1}])
+    buttons = [b for e in card["elements"] for b in e.get("actions", [])]
+    assert [b["text"]["content"] for b in buttons] == ["✅ custom-x", "a", "✅ 完成"]
+    # 超上限截断：候选节合计 ≤ MAX_ADMIN_CANDIDATES
+    providers = [{"slug": "or", "name": "OpenRouter",
+                  "models": [f"m{i}" for i in range(MAX_ADMIN_CANDIDATES + 20)],
+                  "total_models": MAX_ADMIN_CANDIDATES + 20}]
+    card2 = build_model_admin_card("m", [], providers)
+    toggle_buttons = [b for e in card2["elements"] for b in e.get("actions", [])
+                      if b["value"].get("hermes_model_action") == "toggle"]
+    assert len(toggle_buttons) == MAX_ADMIN_CANDIDATES
+    assert "仅列前" in "".join(e.get("content", "") for e in card2["elements"]
+                               if e.get("tag") == "markdown")
+
+
+def test_build_model_admin_card_empty_pool_hint() -> None:
+    from plugin._vendor.cardkit.builder import build_model_admin_card
+
+    card = build_model_admin_card("m", [], [])
+    contents = [e.get("content", "") for e in card["elements"] if e.get("tag") == "markdown"]
+    assert any("候选池为空" in c for c in contents)
+
+
+def test_build_model_admin_done_card() -> None:
+    from plugin._vendor.cardkit.builder import build_model_admin_done_card
+
+    card = build_model_admin_done_card(["a", "b"])
+    assert "常用模型已更新" in card["header"]["title"]["content"]
+    assert "2 个" in card["elements"][0]["content"]
+    assert "（空" in build_model_admin_done_card([])["elements"][0]["content"]
+
+
+def _patch_favorites_file(monkeypatch: Any, tmp_path: Any) -> Any:
+    """把 vendor Config 的路径解析指到 tmp（engine 构造前设置才影响 __init__ 读盘）."""
+    import plugin._vendor.config as config_mod
+
+    fav_file = tmp_path / "feishu_streaming_model_cycle.json"
+    monkeypatch.setattr(config_mod, "_config_path",
+                        lambda home=None: tmp_path / "config.yaml")
+    return fav_file
+
+
+def test_engine_toggle_model_favorite_persists_and_falls_back(
+        monkeypatch: Any, tmp_path: Any) -> None:
+    import json
+
+    fav_file = _patch_favorites_file(monkeypatch, tmp_path)
+    engine = ChatCardEngine(_mock_client(), model_cycle=["glm-5.3-flashx",
+                                                         "deepseek-flash"])
+    # 加入 → 落盘 + picker 清单切换
+    favs, notice = engine.toggle_model_favorite("glm-5")
+    assert favs == ["glm-5"] and notice == ""
+    assert engine._model_cycle == ["glm-5"]
+    assert json.loads(fav_file.read_text(encoding="utf-8")) == {"models": ["glm-5"]}
+    # 新 engine（重启模拟）读盘优先于推导清单
+    engine2 = ChatCardEngine(_mock_client(), model_cycle=["glm-5.3-flashx",
+                                                          "deepseek-flash"])
+    assert engine2._model_cycle == ["glm-5"]
+    # 移出至空 → 回退推导清单
+    favs2, _ = engine2.toggle_model_favorite("glm-5")
+    assert favs2 == [] and engine2._model_cycle == ["glm-5.3-flashx", "deepseek-flash"]
+    # 上限拒绝：第 9 个加不进，notice 提示
+    for i in range(8):
+        engine2.toggle_model_favorite(f"m{i}")
+    favs3, notice3 = engine2.toggle_model_favorite("overflow")
+    assert len(favs3) == 8 and "已满" in notice3
+
+
+@pytest.mark.asyncio
+async def test_model_admin_action_sends_admin_card(adapter: Any, monkeypatch: Any) -> None:
+    """⚙ 管理常用模型点击 → 补发管理卡（候选池 + 当前常用 ✅）."""
+    engine = adapter._engine()
+    engine._model_cycle = ["deepseek-flash", "glm-5.3-flash"]
+    engine.record_usage("20261010_120000_aaa", {"prompt_tokens": 1, "completion_tokens": 1},
+                        model="glm-5.3-flash")
+
+    async def fake_candidates() -> list[dict[str, Any]]:
+        return [{"slug": "zai", "name": "Z.AI",
+                 "models": ["glm-5.3-flash", "glm-5"], "total_models": 2}]
+
+    monkeypatch.setattr(engine, "model_candidates", fake_candidates)
+    scheduled: list[Any] = []
+    adapter._loop = object()
+    adapter._card_response = lambda *a, **k: "empty_response"
+    adapter._is_interactive_operator_authorized = lambda open_id: True
+    adapter._is_card_action_duplicate = lambda token: False
+    adapter._submit_on_loop = lambda loop, coro: (scheduled.append(coro), True)[1]
+
+    adapter._handle_model_switch_action(
+        data=_card_action_event(value={"hermes_model_action": "admin"}),
+        action_value={"hermes_model_action": "admin"})
+
+    assert len(scheduled) == 1
+    await scheduled[0]
+    sent = engine._client.send_card_to_chat.call_args[0][1]
+    assert "管理常用模型" in sent["header"]["title"]["content"]
+    buttons = [b for e in sent["elements"] for b in e.get("actions", [])]
+    values = [b["value"] for b in buttons]
+    assert {"hermes_model_action": "toggle", "target": "glm-5"} in values
+    assert {"hermes_model_action": "admin_done"} in values
+
+
+@pytest.mark.asyncio
+async def test_model_toggle_action_rebuilds_card_and_persists(
+        adapter: Any, monkeypatch: Any, tmp_path: Any) -> None:
+    """toggle → 常用清单落盘 + 管理卡原地刷新（✅ 标记变化）。"""
+    import json
+    import time as _time
+
+    engine = adapter._engine()
+    fav_file = _patch_favorites_file(monkeypatch, tmp_path)
+    engine._candidates_cache = (_time.time(), [
+        {"slug": "zai", "name": "Z.AI", "models": ["glm-5"], "total_models": 1}])
+    captured: dict[str, Any] = {}
+    adapter._loop = object()
+    adapter._card_response = lambda *a, **k: captured.update(
+        card=k.get("card_data")) or captured["card"]
+    adapter._is_interactive_operator_authorized = lambda open_id: True
+    adapter._is_card_action_duplicate = lambda token: False
+
+    adapter._handle_model_switch_action(
+        data=_card_action_event(value={"hermes_model_action": "toggle",
+                                       "target": "glm-5"}),
+        action_value={"hermes_model_action": "toggle", "target": "glm-5"})
+
+    card = captured["card"]
+    buttons = [b for e in card["elements"] for b in e.get("actions", [])]
+    added = next(b for b in buttons if b["value"].get("target") == "glm-5")
+    assert added["text"]["content"] == "✅ glm-5"
+    assert json.loads(fav_file.read_text(encoding="utf-8")) == {"models": ["glm-5"]}
+    # 再点同一个 → 移出，落盘清空
+    adapter._handle_model_switch_action(
+        data=_card_action_event(value={"hermes_model_action": "toggle",
+                                       "target": "glm-5"}, token="tok2"),
+        action_value={"hermes_model_action": "toggle", "target": "glm-5"})
+    buttons2 = [b for e in captured["card"]["elements"] for b in e.get("actions", [])]
+    removed = next(b for b in buttons2 if b["value"].get("target") == "glm-5")
+    assert removed["text"]["content"] == "glm-5"
+    assert json.loads(fav_file.read_text(encoding="utf-8")) == {"models": []}
+
+
+@pytest.mark.asyncio
+async def test_model_admin_done_returns_done_card(adapter: Any) -> None:
+    engine = adapter._engine()
+    engine._model_cycle = ["deepseek-flash", "glm-5.3-flash"]
+    captured: dict[str, Any] = {}
+    adapter._loop = object()
+    adapter._card_response = lambda *a, **k: captured.setdefault("card", k.get("card_data"))
+    adapter._is_interactive_operator_authorized = lambda open_id: True
+    adapter._is_card_action_duplicate = lambda token: False
+
+    adapter._handle_model_switch_action(
+        data=_card_action_event(value={"hermes_model_action": "admin_done"}),
+        action_value={"hermes_model_action": "admin_done"})
+
+    assert "常用模型已更新" in captured["card"]["header"]["title"]["content"]
 
 
 def test_extract_selected_model_from_action_shapes() -> None:

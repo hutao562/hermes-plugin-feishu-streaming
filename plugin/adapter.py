@@ -26,7 +26,12 @@ from datetime import datetime
 from typing import Any, cast
 
 from . import _compat
-from ._vendor.cardkit.builder import build_model_picker_card, build_model_switch_ack_card
+from ._vendor.cardkit.builder import (
+    build_model_admin_card,
+    build_model_admin_done_card,
+    build_model_picker_card,
+    build_model_switch_ack_card,
+)
 from .contract import CRON_WRAP_DIVIDER, CRON_WRAP_FOOTER_PREFIX, CRON_WRAP_HEADER, CRON_WRAP_JOBID_LINE
 from .engine import ChatCardEngine
 
@@ -427,12 +432,13 @@ class StreamingFeishuMixin:
         return ""
 
     def _handle_model_switch_action(self, *, data: Any, action_value: dict[str, Any]) -> Any:
-        """footer 🧠⇄（pick）与选择卡按钮（switch）的统一入口.
+        """footer 🧠⇄（pick）/ 选择卡（switch）/ 管理卡（admin/toggle/done）统一入口.
 
         pick：鉴权后由引擎 client 补发模型选择卡（原生 interactive 消息）；
         switch：合成 `/model <target>` 命令事件（官方 synthetic 通道，sender=
         点击者），hermes 原生切换（session 级 override、重启持久），并同步替换
-        选择卡为确认卡。完成卡本体原地不变。
+        选择卡为确认卡。admin：补发常用模型管理卡；toggle：改常用清单并整卡
+        原地刷新（_card_response 替换）；admin_done：收尾确认卡。完成卡本体原地不变。
         """
         event = getattr(data, "event", None)
         action_kind = str(action_value.get("hermes_model_action") or "")
@@ -440,7 +446,7 @@ class StreamingFeishuMixin:
         open_id = str(getattr(getattr(event, "operator", None), "open_id", "") or "")
         chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
         token = str(getattr(event, "token", "") or "")
-        if not open_id or not chat_id or (action_kind == "switch" and not target):
+        if not open_id or not chat_id or (action_kind in ("switch", "toggle") and not target):
             return self._card_response()  # type: ignore[attr-defined]
         # 官方同款 token 去重：防双击重复派发
         if token and self._is_card_action_duplicate(token):  # type: ignore[attr-defined]
@@ -458,6 +464,29 @@ class StreamingFeishuMixin:
                 "[feishu-streaming] model picker requested: chat=%s submitted=%s",
                 chat_id[:12], submitted)
             return self._card_response()  # type: ignore[attr-defined]
+
+        if action_kind == "admin":
+            submitted = self._submit_on_loop(  # type: ignore[attr-defined]
+                self._loop,  # type: ignore[attr-defined]
+                self._send_model_admin_card(chat_id=chat_id))
+            logging.getLogger("gateway.run").info(
+                "[feishu-streaming] model admin requested: chat=%s submitted=%s",
+                chat_id[:12], submitted)
+            return self._card_response()  # type: ignore[attr-defined]
+
+        if action_kind == "toggle":
+            engine = self._engine()  # type: ignore[attr-defined]
+            favorites, notice = engine.toggle_model_favorite(target)
+            card = self._rebuild_admin_card(chat_id, favorites, notice)
+            logging.getLogger("gateway.run").info(
+                "[feishu-streaming] model favorite toggled: target=%s count=%d chat=%s",
+                target[:40], len(favorites), chat_id[:12])
+            return self._card_response(card_data=card)  # type: ignore[attr-defined]
+
+        if action_kind == "admin_done":
+            engine = self._engine()  # type: ignore[attr-defined]
+            return self._card_response(  # type: ignore[attr-defined]
+                card_data=build_model_admin_done_card(engine._load_model_favorites()))
 
         if action_kind == "switch":
             submitted = self._submit_on_loop(  # type: ignore[attr-defined]
@@ -481,6 +510,30 @@ class StreamingFeishuMixin:
         card = build_model_picker_card(data["current"], data["models"])
         await self._engine()._client.send_card_to_chat(  # type: ignore[attr-defined]
             chat_id, card)
+
+    async def _send_model_admin_card(self, chat_id: str) -> None:
+        """补发常用模型管理卡（⚙ 入口）；候选池获取失败回退选择卡."""
+        engine = self._engine()  # type: ignore[attr-defined]
+        data = engine.model_picker_data(chat_id) or {"current": "", "models": []}
+        providers = await engine.model_candidates()
+        if not providers:
+            # 候选池拿不到（hermes provider 目录异常）——选择卡可用性不受影响
+            logging.getLogger("gateway.run").warning(
+                "[feishu-streaming] model admin candidates empty, fallback to picker")
+            await engine._client.send_card_to_chat(
+                chat_id, build_model_picker_card(data["current"], data["models"]))
+            return
+        await engine._client.send_card_to_chat(
+            chat_id, build_model_admin_card(
+                data["current"], engine._load_model_favorites(), providers))
+
+    def _rebuild_admin_card(self, chat_id: str, favorites: list[str],
+                            notice: str) -> dict[str, Any]:
+        """toggle 后原地刷新管理卡：复用 60s 候选池缓存，无网请求."""
+        engine = self._engine()  # type: ignore[attr-defined]
+        current = engine._chat_models.get(chat_id) or engine._last_model
+        providers = engine._candidates_cache[1] if engine._candidates_cache else []
+        return build_model_admin_card(current, favorites, providers, notice=notice)
 
     async def _dispatch_model_switch(self, *, chat_id: str, open_id: str,
                                      target: str, raw: Any, message_id: str) -> None:

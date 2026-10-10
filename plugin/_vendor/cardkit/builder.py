@@ -411,11 +411,25 @@ def _notice_markdown(text: str) -> str:
     return f"<font color='grey'>{compact}</font>"
 
 
+_MODEL_BUTTONS_PER_ROW = 3
+MAX_FAVORITE_MODELS = 8
+# 管理卡候选池按钮上限：防超多 provider 全量平铺把卡片推到飞书体积上限；
+# 常用清单本身不受此限（已加入的始终完整显示）
+MAX_ADMIN_CANDIDATES = 60
+
+
+def _model_button_rows(buttons: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按钮按每行 3 个排成 action 行（飞书 action 容器一行一组）。"""
+    return [{"tag": "action", "actions": buttons[i:i + _MODEL_BUTTONS_PER_ROW]}
+            for i in range(0, len(buttons), _MODEL_BUTTONS_PER_ROW)]
+
+
 def build_model_picker_card(current: str, models: list[str]) -> dict[str, Any]:
     """模型选择卡（原生 interactive 消息，非 cardkit 实体）— 🧠⇄ 点击后补发.
 
     原生消息路径支持 action 容器（clarify 同款），按钮名 = 模型名渲染有保证；
-    选中经回调合成 `/model <name>`。当前模型打 ✅。"""
+    选中经回调合成 `/model <name>`。当前模型打 ✅。末行「⚙ 管理常用」进管理卡
+    （常用清单存盘、跨回合生效；为空时清单即 default+fallback 推导）。"""
     buttons = [
         {"tag": "button",
          "text": {"tag": "plain_text", "content": (f"✅ {m}" if m == current else m)},
@@ -423,13 +437,85 @@ def build_model_picker_card(current: str, models: list[str]) -> dict[str, Any]:
          "value": {"hermes_model_action": "switch", "target": m}}
         for m in models
     ]
-    # 每行最多 3 个，多了换行
-    elements = [{"tag": "action", "actions": buttons[i:i + 3]}
-                for i in range(0, len(buttons), 3)]
+    elements = _model_button_rows(buttons)
+    elements.append({"tag": "action", "actions": [
+        {"tag": "button",
+         "text": {"tag": "plain_text", "content": "⚙ 管理常用模型"},
+         "type": "default",
+         "value": {"hermes_model_action": "admin"}},
+    ]})
     return {
         "config": {"wide_screen_mode": True},
         "header": {"title": {"tag": "plain_text",
                              "content": f"🧠 切换模型（当前：{current}）"},
+                   "template": "blue"},
+        "elements": elements,
+    }
+
+
+def build_model_admin_card(current: str, favorites: list[str],
+                           providers: list[dict[str, Any]],
+                           notice: str = "") -> dict[str, Any]:
+    """常用模型管理卡 — picker 卡「⚙ 管理常用模型」点击后补发，toggle 即存盘.
+
+    providers = [{"slug","name","models"}]（hermes list_picker_providers 同构）。
+    常用清单单列一节排最前（含不在候选池里的手工配置项，保证可移出）；候选池
+    按 provider 分节，已在常用的打 ✅。所有按钮点击 → toggle → 整卡原地刷新
+    （_card_response 替换，clarify/switch ack 同款）。"""
+    fav_set = set(favorites)
+    merged: list[tuple[str, list[str]]] = []
+    if favorites:
+        merged.append(("★ 常用（点击移出）", list(favorites)))
+    budget = MAX_ADMIN_CANDIDATES
+    for p in providers or []:
+        if budget <= 0:
+            break
+        rows = [m for m in (p.get("models") or [])
+                if str(m).strip() and str(m).strip() not in fav_set]
+        rows = rows[:budget]
+        if not rows:
+            continue
+        budget -= len(rows)
+        label = str(p.get("name") or p.get("slug") or "models")
+        shown_here = len(rows) + len([m for m in (p.get("models") or []) if m in fav_set])
+        if (p.get("total_models") or 0) > shown_here:
+            label += f"（{shown_here}/{p['total_models']}）"
+        merged.append((label, rows))
+    truncated = budget <= 0 and any(
+        (p.get("total_models") or 0) > len([m for m in (p.get("models") or [])
+                                            if m in fav_set])
+        for p in (providers or []))
+    elements: list[dict[str, Any]] = []
+    if notice:
+        elements.append({"tag": "markdown", "content": f"⚠️ {notice}"})
+    hint = ("点击模型加入/移出常用（✅ = 已常用，即点即存）。"
+            f"常用上限 {MAX_FAVORITE_MODELS} 个，选择卡（footer 🧠⇄）只展示常用。")
+    if truncated:
+        hint += f" 候选池较多，仅列前 {MAX_ADMIN_CANDIDATES} 个可加项。"
+    elements.append({"tag": "markdown", "content": hint})
+    for title, models in merged:
+        elements.append({"tag": "markdown",
+                         "content": f"**{title}**"})
+        elements.extend(_model_button_rows([
+            {"tag": "button",
+             "text": {"tag": "plain_text",
+                      "content": (f"✅ {m}" if m in fav_set
+                                  else ("➕ " + m if title.startswith("★") else m))},
+             "type": "primary" if m in fav_set else "default",
+             "value": {"hermes_model_action": "toggle", "target": m}}
+            for m in models]))
+    if not any(models for _, models in merged):
+        elements.append({"tag": "markdown",
+                         "content": "候选池为空（hermes provider 目录不可用）——请检查凭据，"
+                                    "或在 config.yaml 配 `streaming.footer.model_cycle`。"})
+    elements.append({"tag": "action", "actions": [
+        {"tag": "button", "text": {"tag": "plain_text", "content": "✅ 完成"},
+         "type": "primary", "value": {"hermes_model_action": "admin_done"}},
+    ]})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text",
+                             "content": f"⚙ 管理常用模型（当前模型：{current or '未知'}）"},
                    "template": "blue"},
         "elements": elements,
     }
@@ -443,6 +529,19 @@ def build_model_switch_ack_card(model: str) -> dict[str, Any]:
                    "template": "green"},
         "elements": [{"tag": "markdown",
                       "content": "下一回合起使用该模型（以 footer 显示为准）。"}],
+    }
+
+
+def build_model_admin_done_card(favorites: list[str]) -> dict[str, Any]:
+    """管理卡「✅ 完成」后的收尾卡（替换管理卡本体）."""
+    names = "、".join(favorites) if favorites else "（空——选择卡回退默认清单）"
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": "✅ 常用模型已更新"},
+                   "template": "green"},
+        "elements": [{"tag": "markdown",
+                      "content": f"当前常用（{len(favorites)} 个）：{names}\n"
+                                 "任意完成卡 footer 点 🧠⇄ 即按此清单出选择卡。"}],
     }
 
 
