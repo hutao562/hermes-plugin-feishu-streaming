@@ -467,6 +467,11 @@ def _make_reasoning_hook() -> Any:
         actives = [(e, s) for e, s in actives if s]
         if len(actives) == 1 and len(actives[0][1]) == 1:
             actives[0][0].on_reasoning("", text)
+        elif not actives:
+            # 零活跃卡片会话（CLI/cron/其它平台回合，或卡片均已收尾）——没有卡片可丢，
+            # 属无损忽略：计入 dropped 只会刷日志（实测非飞书长回合 4000+ 条 INFO 噪音）。
+            # 不变量：只有「存在活跃卡片却没路由上」的丢弃才需要可见。
+            return
         else:
             # 多会话并发时防串扰丢弃——但要可见（曾静默丢成「折叠条消失」）
             dropped["n"] += 1

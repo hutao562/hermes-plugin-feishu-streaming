@@ -505,3 +505,43 @@ def test_register_hook_routes_reasoning_only() -> None:
 
     hook(kind="text", text="answer chunk")  # text kind → 不进引擎
     hook(kind="reasoning", text="💭 思考")  # 无活跃会话 → 静默丢弃
+
+
+def test_reasoning_hook_silent_without_active_cards(monkeypatch, caplog) -> None:
+    """零活跃卡片会话（CLI/cron 回合）丢 reasoning 不计数、不刷日志（v0.19.1）.
+
+    实测回归：非飞书长回合每次 delta 都计入 dropped，4000+ 条 INFO 噪音。
+    """
+    import logging
+
+    import plugin as plugin_mod
+
+    monkeypatch.setattr(plugin_mod, "_route_by_session", lambda _sid: None)
+    monkeypatch.setattr(plugin_mod, "_ENGINES", [])
+
+    hook = plugin_mod._make_reasoning_hook()
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        for _ in range(120):
+            hook(kind="reasoning", delta="x", session_id="s-cli")
+
+    drops = [r for r in caplog.records if "reasoning dropped" in r.getMessage()]
+    assert not drops
+
+
+def test_reasoning_hook_logs_on_real_contention(monkeypatch, caplog) -> None:
+    """存在活跃卡片却没路由上（多会话并发）→ 仍计数并可见（防串扰语义保留）."""
+    import logging
+
+    import plugin as plugin_mod
+
+    monkeypatch.setattr(plugin_mod, "_route_by_session", lambda _sid: None)
+    eng = SimpleNamespace(streaming_sessions=lambda: ["a", "b"],
+                          on_reasoning=MagicMock())
+    monkeypatch.setattr(plugin_mod, "_ENGINES", [eng])
+
+    hook = plugin_mod._make_reasoning_hook()
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        hook(kind="reasoning", delta="x", session_id="s1")
+
+    assert any("reasoning dropped" in r.getMessage() for r in caplog.records)
+    eng.on_reasoning.assert_not_called()  # 两个活跃会话 → 不能盲投，防串扰
