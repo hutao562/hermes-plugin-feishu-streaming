@@ -82,6 +82,17 @@ class ChatSession:
     flush: FlushController | None = None
 
     completed_at: float = 0.0
+    # 本回合原始入站消息 id（首个 processing_start 登记）——probe 期 redirect
+    # （首 token 前纠正）时旧 draft 锚从未出现，首 draft 锚定回原始消息会被
+    # 误判成 followup 新回合拦腰拆卡（2026-10-17 16:56 实测一回合拆三卡）
+    turn_inbound: str | None = None
+    # 完成卡 footer 快照：stale-finalize 编辑重定向（reconcile_card）重渲时
+    # 复用，否则重渲后 footer 丢 tokens/t/s
+    last_footer: dict[str, Any] | None = None
+    # 卡片 API 串行化锁：complete/seal/notice/flush 并发下各自 +1 sequence 会
+    # 共享同一基号，后落地者 300317（2026-10-17 两次实测：心跳 flush 在飞时
+    # close 撞号，卡片永久停留 loading 态）
+    card_op_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
     def is_terminal(self) -> bool:
@@ -222,6 +233,14 @@ class ChatCardEngine:
         bucket[message_id] = time.time()
         while len(bucket) > 50:  # 每_chat 只留最近 50 条，防无界增长
             bucket.pop(next(iter(bucket)))
+        # 本回合原始入站锚登记：活跃会话尚未记录时取最近创建的一个
+        # （turn_started 先于 processing_start，首条即回合原始消息；drain /
+        # 纠正消息到达时会话已有值，不覆盖——它们不是本回合的原始锚）
+        candidates = [s for s in self._sessions.values()
+                      if s.chat_id == chat_id and not s.is_terminal
+                      and s.turn_inbound is None]
+        if candidates:
+            max(candidates, key=lambda s: s.created_at).turn_inbound = message_id
 
     def _inbound_verified(self, chat_id: str, message_id: str | None) -> bool:
         """锚是否为引擎亲眼见过的入站消息."""
@@ -256,10 +275,15 @@ class ChatCardEngine:
             chat_id=chat_id, thread_id=thread_id,
             reply_to=session.redirect_anchor or session.reply_to,
             straggler_guard=(session.answer_seg.text if session.answer_seg else ""))
+        new.turn_inbound = session.turn_inbound  # 同一回合续跑，原始锚随行
         # redirected 回合的 draft 锚会中途变回老消息 id（工具边界换 consumer
-        # 重新锚定回合身份）——两个锚都算本回合，防 followup 边界拦腰拆卡
+        # 重新锚定回合身份）——两个锚都算本回合，防 followup 边界拦腰拆卡。
+        # probe 期 redirect（首 token 前纠正）draft 锚从未出现过，必须带上
+        # 回合原始入站 id（turn_inbound）——hermes 把 draft 锚在回合原始消息
+        # 上，缺它时首 draft 锚回摆被误判新回合（2026-10-17 16:56 实测三卡）
         new.accepted_anchors = {a for a in (session.redirect_anchor,
-                                            session.reply_to) if a}
+                                            session.reply_to,
+                                            session.turn_inbound) if a}
         # 立刻置终态：seal 是异步任务（cardkit close+update 要走网络），期间旧
         # 会话若仍计为 streaming，全局 reasoning 路由会把新回合的思考误送旧卡
         session.state = "completed"
@@ -474,10 +498,12 @@ class ChatCardEngine:
                      "output": tokens.get("output_tokens", 0), "model": model}
         session.model_switch = self._model_switch_data(
             (usage or {}).get("model") or model)
+        footer = self._footer_data(session, duration, usage, model)
+        session.last_footer = footer  # reconcile_card 重渲完成卡时复用
         card = build_complete_card(
             segments=session.segment_state.segments,
             all_tool_steps=session.tool_tracker.build_display_steps(),
-            footer_data=self._footer_data(session, duration, usage, model),
+            footer_data=footer,
             footer_fields=self._footer_fields,
             footer_show_label=self._footer_show_label,
             footer_enabled=self._footer_enabled,
@@ -491,10 +517,13 @@ class ChatCardEngine:
             reasoning_panel_expanded=self._reasoning_panel_expanded,
         )
         try:
-            session.sequence += 1
-            await self._client.cardkit_close_streaming(session.card_id, sequence=session.sequence)
-            session.sequence += 1
-            await self._client.cardkit_update(session.card_id, card, sequence=session.sequence)
+            # 串行化：等在飞的 flush/notice 卡片调用落地再取号——并发各自 +1
+            # 会共享基号，后落地者 300317
+            async with session.card_op_lock:
+                session.sequence += 1
+                await self._client.cardkit_close_streaming(session.card_id, sequence=session.sequence)
+                session.sequence += 1
+                await self._client.cardkit_update(session.card_id, card, sequence=session.sequence)
         except Exception as e:
             _logger.warning("plugin complete card update failed: chat=%s err=%s", chat_id, e)
         return session.card_msg_id
@@ -527,9 +556,10 @@ class ChatCardEngine:
                 tool_panel_expanded=self._tool_panel_expanded,
                 reasoning_panel_expanded=self._reasoning_panel_expanded,
             )
-            session.sequence += 1
             try:
-                await self._client.cardkit_update(session.card_id, card, sequence=session.sequence)
+                async with session.card_op_lock:
+                    session.sequence += 1
+                    await self._client.cardkit_update(session.card_id, card, sequence=session.sequence)
             except Exception as e:
                 _logger.warning("[feishu-streaming] append notice update failed: %s", e)
                 return None
@@ -561,12 +591,77 @@ class ChatCardEngine:
             return None
 
     async def abandon(self, chat_id: str, thread_id: str | None = None) -> None:
-        """流被弃（中断/异常）— 尽力按错误收尾，避免永久转圈卡."""
+        """流被弃（/stop、/new、/reset 等 adapter 路由的取消）— 红卡收尾，防永久转圈.
+
+        触发链：adapter.on_processing_complete 收到 CANCELLED（上游语义见
+        base.py `_expected_cancelled_tasks` / run_turn_followup_ack：仅 adapter
+        自己路由的取消才是 CANCELLED，redirect 不产生、drain 正常路径是
+        SUCCESS）。2026-10-17 实测缺口：/stop 后无人收卡，卡片转圈 10 分钟
+        直到 /new 的回执被错当回答渲染成完成卡。
+        """
         session = self.active_session(chat_id, thread_id)
         if session is None:
             return
+        _logger.info("[feishu-streaming] abandoned (cancelled turn): chat=%s state=%s",
+                     chat_id[:12], session.state)
+        session.segment_state.add_notice("⏹ 本回合已中断")
         await self.complete(chat_id, session.answer_seg.text if session.answer_seg else "",
-                            is_error=True)
+                            is_error=True, thread_id=thread_id)
+
+    def session_by_card_msg_id(self, message_id: str) -> ChatSession | None:
+        """按卡片消息 id 找会话（stale-finalize 编辑重定向的入口）."""
+        for s in self._sessions.values():
+            if s.card_msg_id == message_id:
+                return s
+        return None
+
+    async def reconcile_card(self, session: ChatSession, content: str) -> bool:
+        """stale-finalize / transformed-final 的编辑打到卡片消息 → 重定向为完成卡重渲.
+
+        官方 edit 走原生文本编辑 API，对卡片消息必 230054，上游随即降级
+        normal final send——同一回答以原生文本再发一遍（2026-10-17 12:24
+        实测：完成卡 + 274 字裸文本双发）。此处把编辑解释为「用完整终稿置换
+        答案正文、重渲完成卡」，成功返回 True → adapter 回成功，上游置
+        already_sent 不再补发。仅终态卡：活跃卡的正文由流式管道自管。
+        """
+        if (not session.is_terminal or session.card_id is None
+                or not str(content or "").strip()):
+            return False
+        if session.answer_seg is not None:
+            session.answer_seg.text = strip_reasoning_tags(content)
+            session.answer_seg.dirty = False
+        else:
+            session.segment_state.on_answer_delta("")
+            session.answer_seg = session.segment_state.segments[-1]
+            session.answer_seg.text = strip_reasoning_tags(content)
+        card = build_complete_card(
+            segments=session.segment_state.segments,
+            all_tool_steps=session.tool_tracker.build_display_steps(),
+            footer_data=session.last_footer
+            or self._footer_data(session, None, None, ""),
+            footer_fields=self._footer_fields,
+            footer_show_label=self._footer_show_label,
+            footer_enabled=self._footer_enabled,
+            is_error=session.state == "failed",
+            header_enabled=self._header_enabled,
+            body_text_size=self._body_text_size,
+            show_tool_use=self._show_tool_use,
+            width_mode=self._width_mode,
+            model_switch=getattr(session, "model_switch", None),
+            tool_panel_expanded=self._tool_panel_expanded,
+            reasoning_panel_expanded=self._reasoning_panel_expanded,
+        )
+        try:
+            async with session.card_op_lock:
+                session.sequence += 1
+                await self._client.cardkit_update(session.card_id, card, sequence=session.sequence)
+        except Exception as e:
+            _logger.warning("[feishu-streaming] reconcile card edit failed: %s", e)
+            return False
+        _logger.info(
+            "[feishu-streaming] stale-finalize edit reconciled into card: chat=%s len=%d",
+            session.chat_id[:12], len(content))
+        return True
 
     # ── 内部 ──
 
@@ -644,10 +739,11 @@ class ChatCardEngine:
                 reasoning_panel_expanded=self._reasoning_panel_expanded,
             )
             try:
-                session.sequence += 1
-                await self._client.cardkit_close_streaming(session.card_id, sequence=session.sequence)
-                session.sequence += 1
-                await self._client.cardkit_update(session.card_id, card, sequence=session.sequence)
+                async with session.card_op_lock:
+                    session.sequence += 1
+                    await self._client.cardkit_close_streaming(session.card_id, sequence=session.sequence)
+                    session.sequence += 1
+                    await self._client.cardkit_update(session.card_id, card, sequence=session.sequence)
             except Exception as e:
                 _logger.warning("[feishu-streaming] seal old card failed: %s", e)
 
@@ -713,6 +809,13 @@ class ChatCardEngine:
         """幂等 flush：新 segment 建元素 + 脏文本流式 + 工具面板/心跳更新."""
         if session.is_terminal or not session.card_id:
             return
+        # 整段持锁：complete/seal 的 close 取号必须等在飞的卡片调用落地，
+        # 否则 sequence 共享基号、后落地者 300317（flush 本身由 FlushController
+        # 互斥，此锁管的是它与终态路径的并发）
+        async with session.card_op_lock:
+            await self._do_flush_locked(session)
+
+    async def _do_flush_locked(self, session: ChatSession) -> None:
         segments = session.segment_state.segments
         all_steps = session.tool_tracker.build_display_steps()
         actions: list[dict[str, Any]] = []

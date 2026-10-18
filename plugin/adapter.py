@@ -271,6 +271,17 @@ class StreamingFeishuMixin:
                     self._engine().on_heartbeat(session.chat_id, content,
                                                 thread_id=session.thread_id)
                     return _compat.send_result(success=True, message_id=message_id)
+        if (finalize and message_id and not message_id.startswith("lark-card:")
+                and str(content or "").strip()):
+            # stale-finalize / transformed-final 的编辑目标是我们返回的卡片消息
+            # id（真 om_ id）：官方 edit 走原生文本编辑 API 对卡片必 230054，
+            # 上游随即降级 normal final send——同一回答以原生文本双发
+            # （2026-10-17 12:24 实测）。重定向为完成卡重渲，成功即上游置
+            # already_sent 不再补发；失败落回官方 edit（行为同旧版）。
+            engine = self._engine()
+            card_session = engine.session_by_card_msg_id(message_id)
+            if card_session is not None and await engine.reconcile_card(card_session, content):
+                return _compat.send_result(success=True, message_id=message_id)
         return await super().edit_message(chat_id, message_id, content,  # type: ignore[misc]
                                           finalize=finalize, **kwargs)
 
@@ -305,6 +316,16 @@ class StreamingFeishuMixin:
         super_method = getattr(super(), "on_processing_complete", None)
         if callable(super_method):
             await super_method(event, outcome)
+        # /stop、/new、/reset 等 adapter 路由的取消 → 立即红卡收尾。上游语义
+        # （base.py `_expected_cancelled_tasks`）：仅 adapter 自己路由的取消才
+        # 是 CANCELLED——redirect 不产生、drain 正常路径是 SUCCESS、失败路径走
+        # FAILURE 且有自己的错误文本 send 兜底（不在此收卡，防双发）
+        if getattr(outcome, "name", outcome) == "CANCELLED":
+            source = getattr(event, "source", None)
+            chat_id = getattr(source, "chat_id", "") or ""
+            if chat_id:
+                await self._engine().abandon(
+                    chat_id, thread_id=getattr(source, "thread_id", None))
 
     # ── clarify 内联单选（类定义期覆写；SDK connect() 注册的绑定方法即本版本）──
 

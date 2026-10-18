@@ -545,3 +545,159 @@ def test_reasoning_hook_logs_on_real_contention(monkeypatch, caplog) -> None:
 
     assert any("reasoning dropped" in r.getMessage() for r in caplog.records)
     eng.on_reasoning.assert_not_called()  # 两个活跃会话 → 不能盲投，防串扰
+
+
+# ── v0.19.2：取消收卡 / 卡片操作串行化 / probe 期 redirect / stale-finalize 重定向 ──
+
+
+class _Outcome:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+def _processing_event(chat_id: str = "chat1", thread_id: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        message_id="om_in_1",
+        source=SimpleNamespace(chat_id=chat_id, thread_id=thread_id))
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_abandons_card(adapter) -> None:
+    """CANCELLED（/stop 等 adapter 路由取消）→ 红卡立即收尾，不再转圈等顶替."""
+    engine = adapter._engine()
+    engine.on_draft("chat1", "部分回答")
+    await _settle(engine)
+    engine._client.cardkit_close_streaming.reset_mock()
+
+    await adapter.on_processing_complete(_processing_event(), _Outcome("CANCELLED"))
+
+    session = engine.session_for("chat1")
+    assert session.state == "failed"  # is_error 收尾
+    engine._client.cardkit_close_streaming.assert_called_once()
+    # 幂等：重复 CANCELLED（无活跃会话）不再动作
+    engine._client.cardkit_close_streaming.reset_mock()
+    await adapter.on_processing_complete(_processing_event(), _Outcome("CANCELLED"))
+    engine._client.cardkit_close_streaming.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_success_outcome_keeps_streaming(adapter) -> None:
+    """SUCCESS / FAILURE 不触发收卡（失败路径有自己的错误文本 send 兜底）."""
+    engine = adapter._engine()
+    engine.on_draft("chat1", "内容")
+    await _settle(engine)
+
+    await adapter.on_processing_complete(_processing_event(), _Outcome("SUCCESS"))
+    await adapter.on_processing_complete(_processing_event(), _Outcome("FAILURE"))
+
+    assert engine.session_for("chat1").state == "streaming"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_routes_to_thread_session(adapter) -> None:
+    """话题回合取消 → 收话题自己的卡（thread_id 精确路由）."""
+    engine = adapter._engine()
+    engine.on_draft("chat1", "话题回答", reply_to="om_topic_msg", thread_id="omt_1")
+    await _settle(engine)
+    engine.on_draft("chat1", "主聊回答")  # 主聊另有活跃卡
+    await _settle(engine)
+
+    await adapter.on_processing_complete(
+        _processing_event(thread_id="omt_1"), _Outcome("CANCELLED"))
+
+    assert engine.session_for("chat1", "omt_1").state == "failed"
+    assert engine.session_for("chat1").state == "streaming"  # 主聊不受牵连
+
+
+@pytest.mark.asyncio
+async def test_note_inbound_records_turn_inbound(engine: ChatCardEngine) -> None:
+    """首个 processing_start 登记回合原始锚；后续（drain/纠错）不覆盖."""
+    engine.on_turn_started("chat1")
+    engine.note_inbound("chat1", "om_first")
+    engine.note_inbound("chat1", "om_second")
+    session = engine.session_for("chat1")
+    assert session is not None and session.turn_inbound == "om_first"
+
+
+@pytest.mark.asyncio
+async def test_redirect_before_first_draft_keeps_single_card(engine: ChatCardEngine) -> None:
+    """probe 期 redirect（首 token 前纠正）：draft 锚回摆到回合原始消息不得拆卡.
+
+    2026-10-17 16:56 实测：hermes 把 draft 锚在回合原始消息上，redirect 新卡
+    只认纠正锚 → 首 draft 被误判 followup，一回合拆成三张卡。
+    """
+    engine.on_turn_started("chat1")                 # typing/probe 建卡①（无锚）
+    engine.note_inbound("chat1", "om_orig")         # 回合原始入站
+    engine.mark_redirect("chat1", anchor="om_fix")  # 纠正 ack：收①开②
+    await _settle(engine)
+    assert engine._client.cardkit_create.call_count == 2
+
+    engine.on_draft("chat1", "按纠正后的答案", reply_to="om_orig")  # 锚回摆
+    await _settle(engine)
+
+    assert engine._client.cardkit_create.call_count == 2  # 没有第三张卡
+    session = engine.active_session("chat1")
+    assert session is not None and session.answer_seg is not None
+    assert "纠正后" in session.answer_seg.text
+    assert session.turn_inbound == "om_orig"  # redirect 续跑携带原始锚
+
+
+@pytest.mark.asyncio
+async def test_card_ops_serialized_against_flush(engine: ChatCardEngine) -> None:
+    """flush 的卡片调用在飞时 complete 的 close 必须等它落地（300317 防线）."""
+    engine.on_draft("chat1", "部分")
+    await _settle(engine)
+    session = engine.session_for("chat1")
+    assert session is not None
+    engine._client.cardkit_close_streaming.reset_mock()
+
+    gate = asyncio.Event()
+    inner = engine._client.cardkit_stream_element
+
+    async def _gated(*args, **kwargs):
+        await gate.wait()
+        return await inner(*args, **kwargs)
+
+    engine._client.cardkit_stream_element = _gated
+    session.heartbeat_text = "⏳ busy"
+    flush_task = asyncio.create_task(engine._do_flush(session))
+    await asyncio.sleep(0.05)  # flush 进入 gated 调用（持锁在飞）
+    assert engine._client.cardkit_close_streaming.call_count == 0
+
+    complete_task = asyncio.create_task(engine.complete("chat1", "最终"))
+    await asyncio.sleep(0.05)
+    # close 仍在等锁——不能与在飞的 stream_element 共享 sequence 基号
+    assert engine._client.cardkit_close_streaming.call_count == 0
+
+    gate.set()
+    await asyncio.gather(flush_task, complete_task)
+    engine._client.cardkit_close_streaming.assert_called_once()
+    # 取号严格晚于 flush 落地的调用
+    close_seq = engine._client.cardkit_close_streaming.call_args.kwargs["sequence"]
+    flush_seqs = [c.kwargs.get("sequence") for c in inner.call_args_list]
+    assert all(close_seq > s for s in flush_seqs if s is not None)
+
+
+@pytest.mark.asyncio
+async def test_stale_finalize_edit_updates_card_not_native(adapter) -> None:
+    """stale-finalize 对卡片消息的编辑 → 重渲完成卡，不落原生 edit（230054+双发防线）."""
+    engine = adapter._engine()
+    engine.on_draft("chat1", "流式答案 203")
+    await _settle(engine)
+    result = await adapter.send("chat1", "流式答案 203 完整版")
+    assert result.message_id == "om_card_msg"
+    engine._client.cardkit_update.reset_mock()
+
+    edit = await adapter.edit_message("chat1", "om_card_msg",
+                                      "流式答案 203 完整版 + 补齐的尾巴",
+                                      finalize=True)
+
+    assert edit.success is True
+    engine._client.cardkit_update.assert_called_once()  # 完成卡重渲
+    assert adapter.native_edits == []                   # 官方 edit（必 230054）未走
+    session = engine.session_for("chat1")
+    assert session is not None and session.answer_seg is not None
+    assert "补齐的尾巴" in session.answer_seg.text
+    # 非卡片消息 id 的编辑不受影响，仍走原生
+    await adapter.edit_message("chat1", "om_plain_text", "x", finalize=True)
+    assert adapter.native_edits[-1][1] == "om_plain_text"
