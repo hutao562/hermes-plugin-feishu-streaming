@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 from typing import Any
@@ -310,6 +311,52 @@ async def test_send_normal_final_with_notify_stays_card_path(adapter) -> None:
                                 metadata={"notify": True})
     assert adapter._engine().session_for("chat1").state == "completed"
     assert result.message_id == "om_card_msg"
+
+
+@pytest.mark.asyncio
+async def test_final_send_during_card_creation_completes_card(adapter) -> None:
+    """final send 撞进建卡窗口 → 等建卡完成后收尾，不永停 loading、不漏原生双发.
+
+    2026-10-19 实测：无探针的后台通知回合整段秒回，draft→final 仅 195ms，
+    快于 cardkit create；此前 creating 不命中完成分支、无 reply 锚又不命中
+    现场开卡兜底 → 卡建好后永停「处理中」，final 以原生文本双发。
+    """
+    engine = adapter._engine()
+    real_create = engine._client.cardkit_create
+
+    async def slow_create(card: dict[str, Any]) -> str:
+        await asyncio.sleep(0.2)  # cardkit create 网络延迟
+        return await real_create(card)
+
+    engine._client.cardkit_create = AsyncMock(side_effect=slow_create)
+    await adapter.send_draft("chat1", 1, "（系统通知）废稿已作废")  # draft 建会话
+    assert engine.active_session("chat1").state == "creating"  # 卡尚在建
+
+    result = await adapter.send("chat1", "（系统通知）废稿已作废", reply_to=None)
+
+    assert engine.session_for("chat1").state == "completed"
+    assert result.message_id == "om_card_msg"
+    engine._client.send_card_to_chat.assert_called_once()  # 无锚卡直发 chat
+    assert adapter.native_sends == []  # 不走原生文本双发
+
+
+@pytest.mark.asyncio
+async def test_final_send_on_anchorless_deferred_topic_session_fails_not_phantom(adapter) -> None:
+    """话题会话等锚（建卡未启动）+ 无锚 final 先到 → 原生文本兜底，会话置终态.
+
+    不能留幽灵 creating 会话——open_sessions 是 usage/reasoning 路由的
+    「回合进行中」判据，幽灵会话让后续并发回合误判歧义。
+    """
+    engine = adapter._engine()
+    engine.on_turn_started("chat1", thread_id="omt_1")
+    assert engine.active_session("chat1", "omt_1").card_create_task is None  # 等锚推迟
+
+    result = await adapter.send("chat1", "答案", reply_to=None,
+                                metadata={"thread_id": "omt_1"})
+
+    assert engine.session_for("chat1", "omt_1").state == "failed"
+    assert result.message_id == "om_native"  # 原生文本兜底
+    assert len(adapter.native_sends) == 1
 
 
 # ── redirect：↪ ack 即刻收旧开新（不等首条正文 draft）──

@@ -467,6 +467,11 @@ class ChatCardEngine:
         if session.flush is not None:
             session.flush.mark_completed()
         if session.state == "failed" or session.card_id is None:
+            if session.state == "creating":
+                # 建卡从未启动（话题会话等锚被跳过 + final 先于任何 draft 到达）：
+                # 置终态，防幽灵 open session 污染 usage/reasoning 路由的「回合
+                # 进行中」判据
+                session.state = "failed"
             return session.card_msg_id  # 建卡已失败：交回原生文本保底
         if final_text and session.answer_seg is not None:
             session.answer_seg.text = final_text

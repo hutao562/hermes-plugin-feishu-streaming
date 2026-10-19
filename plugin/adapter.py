@@ -223,9 +223,16 @@ class StreamingFeishuMixin:
                 message_id=(f"lark-card:{session.card_msg_id}"
                             if session is not None and session.card_msg_id else None))
 
-        if session is not None and session.state == "streaming":
+        if session is not None and session.state in ("creating", "streaming"):
             # 回合终态文本 → 完成卡（官方 transport 在 draft 后仍会真发最终文本，
             # 此处接管渲染；已发送标记由 gateway 流机制去重）
+            if session.state == "creating":
+                # final send 撞进建卡窗口：无探针的后台通知回合整段秒回，
+                # draft→final 间隔短于 cardkit create，此前 creating 不命中
+                # 本分支、无锚又不命中下方兜底 → 卡建好后永停 loading（2026-10-19
+                # 实测）。on_draft 幂等：补记锚、启动推迟的建卡任务；complete
+                # 内部 await 建卡完成后收尾。
+                engine.on_draft(chat_id, content, reply_to=reply_to, thread_id=thread_id)
             if session.reply_to is None and reply_to:
                 session.reply_to = reply_to
             msg_id = await engine.complete(chat_id, content, thread_id=thread_id)
