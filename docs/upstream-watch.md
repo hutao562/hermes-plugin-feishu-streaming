@@ -27,3 +27,15 @@
   - 确认兼容后：同步 `tests/hermes_sources.json` revision 至升级版本（按 HERMES_SAMPLES.md 口径单 revision 重算 sha256，勿混版本）+ 补锚（上面盲区 1/2）+ `hermes plugins validate` + 部署重启；
   - 建议先补锚点盲区再执行升级，否则升级窗口内每日检查对父类改动不可见。
 - 关联发现（运维侧，非上游兼容）：本地 main 领先 `origin/main` 88 提交未 push——origin 的每日 GH Action 仍在跑**旧注入模式验证**，并于 2026-10-15 开出 issue #118（traceback 为 `split_gateway.py`/`patcher.py`，与插件模式契约无关，可关闭）；catalog 安装引用若取 origin 默认分支将拿不到 `plugin/`。是否 push 由用户决定。
+
+## 2026-10-19 上游 20acba0（基线 2237be3，较昨日 ccc6956 增量 116 文件 +4089/−895）
+
+- 状态：锚点全绿（missing=0），增量触及 busy 语义面与插件父类 → 疑似影响；整体结论不变，仍按 2026-10-18 条目的升级实测方案执行，本条无单独动作
+- 上游改动（相对昨日已记录的 ccc6956 的增量）：
+  - `plugins/platforms/feishu/adapter.py`（插件父类）仅 +1 行：`serial_receive_loop = True`——feishu 接入 per-chat 串行收信循环（wecom/irc/ntfy 早已如此设置），同 chat 上一条消息处理完才读下一条，burst 门（`session_ingress_burst.burst_gate`，base 同步由 `_shared_burst_pending` 重构为此）随之生效。插件每 chat 卡片会话本就假设串行入口（card_op_lock / 会话互斥），中性偏好。
+  - `gateway/run_busy.py` +132：slash 命令产生的回合（/queue、/steer 兜底、/plan、/learn、skill/bundle 回合）改入会话 authority 的 durable FIFO 排队（原先在当前回合内插队执行），ack 改由入列 commit 时发送；新增 `_stop_epoch`/`_route_stop_epoch`，/stop、/new 会丢弃 FIFO 中未执行的命令回合。busy ack 发送链原样（`_send_busy_reply` → `adapter._send_with_retry` → `self.send`，带 thread 元数据）；↪ redirect 面本增量未触及。
+  - `run_turn_persistence/prepare/progress/runner` 四模块 delta 零触及插件缝隙（CANCELLED / edit_message(finalize) / probe / draft / _MIN_NEW / reply_to 全无命中）。
+  - `cron/scheduler.py` 36 行：worktree GC 运维（per-profile 节流 + worktree_registry），投递面未动（`scheduler_delivery.py` 未变，CRON_WRAP 信封安全）；`tools/clarify_gateway.py` 未变。
+- 影响面：升级实测清单追加一项——busy 期间发 slash 命令（如 /model）观察 ack 时机与 FIFO 排队行为；footer 🧠⇄ 按钮合成的 /model 走 `_dispatch_synthetic_event` 通道，是否入 FIFO 上游未明示（`_command_turn_admitted` 排除 `event.internal`，合成事件归属待核），升级回归时一并验证。
+- 建议处理方案：同 2026-10-18 条目（先补锚点盲区 → 升级 → doctor/pytest/实测清单 → 同步 revision → 部署重启）。
+- 其他：本次 gh 查 compat issue 遇网络 EOF 未复查（昨日记录的 #118 为旧注入工作流误报，与插件无关）。
