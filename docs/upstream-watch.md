@@ -39,3 +39,18 @@
 - 影响面：升级实测清单追加一项——busy 期间发 slash 命令（如 /model）观察 ack 时机与 FIFO 排队行为；footer 🧠⇄ 按钮合成的 /model 走 `_dispatch_synthetic_event` 通道，是否入 FIFO 上游未明示（`_command_turn_admitted` 排除 `event.internal`，合成事件归属待核），升级回归时一并验证。
 - 建议处理方案：同 2026-10-18 条目（先补锚点盲区 → 升级 → doctor/pytest/实测清单 → 同步 revision → 部署重启）。
 - 其他：本次 gh 查 compat issue 遇网络 EOF 未复查（昨日记录的 #118 为旧注入工作流误报，与插件无关）。
+
+## 2026-10-21 上游 0b8dee0（基线 2237be3，较前记录 20acba0 增量 1068 commits）
+
+- 状态：锚点全绿（内容级验证），增量未触及 draft 契约面与插件父类 → 维持 2026-10-18 条目的「疑似影响待升级实测」总判定，本条无单独动作
+- 方法备注：当日 git 协议挂起（ls-remote 无响应、匿名 API 403），本次经 gh api（compare/commits/contents）+ raw CDN 完成；compare files 数组 300 上限不可信，逐文件 commits API 才是准确口径
+- 上游改动（相对 20acba0，按插件关注面逐文件核验）：
+  - **draft 契约面零改动**：stream_consumer 五文件、response_filters、scheduler_delivery、think_scrubber、stream_delivery、api_request_hooks（usage started_at 字段）、plugins/platforms/feishu/adapter.py（父类）、tools/clarify_gateway.py 全部未动
+  - 锚点 4 文件中 3 个未动；cron/scheduler.py 改 3 行 + gateway/run.py ±4：secret-scope 构建器内部迁移（`agent.secret_scope.build_profile_secret_scope` → `tui_gateway.launch_profile_policy.owner_secret_scope`，旧函数保留）；`get_secret` 本体仍在（secret_scope.py:230），vendor import 无恙；锚点 needle `**Status:** script failed` 仍在
+  - gateway/run_inbound.py +2 注释行；run_busy.py：busy 快速词表新增 "discard"（与插件前缀识别无关）
+  - gateway/run_turn.py +4/−4：执行中 admission 的用户中断不再向 FIFO 重复入队中断消息（内部去重）；CANCELLED / edit_message(finalize) 缝隙未动
+  - agent/interrupt_control.py +9/−2：gateway shutdown 的停止不再覆盖已挂起的用户 Stop 归因（user's Stop wins）；pending redirect 在重启时被丢弃并归因为重启——影响卡片 NOTICE 文本的归因来源，非契约
+  - **gateway/run_notifications.py +75/−5**：watch 通知注入被拒后从每 2s 热重试改为有界指数退避（#140899）——permanent 拒绝计入丢弃上限，transient 拒绝（重启等待期、parked profile、FIFO 满等）无限等待。与 2026-10-19 健康检查的「watch 通知注入疑似拆卡缺口待观察」同一区域，上游正在活跃重构该面
+- 影响面：无新增破坏；bg/watch 通知到达时序可能因退避变化（插件 append_notice 按内容合并、对时序不敏感）；interrupt 归因细化只影响状态行/NOTICE 文本来源
+- 建议处理方案：同 2026-10-18 条目；升级回归清单追加一项——bg/watch 通知送达时序观察（退避生效后是否仍及时合并进最近卡）
+- 关联：hermes-compat issue #118 仍 open（10-15 起无更新，已定性为旧注入工作流误报，可关闭）
