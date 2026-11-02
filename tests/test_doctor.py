@@ -88,6 +88,19 @@ def test_profile_disabled_is_fail(home: Path) -> None:
     assert _by_name(report, "profile:family: plugins.disabled")[0].status == FAIL
 
 
+def test_cli_install_layout_accepted(home: Path) -> None:
+    """CLI 安装布局（目录名 = manifest 名 feishu-streaming-platform，跨机分发形
+    态）下 doctor 照常工作——目录名探测两可，CLI 名优先（2026-11-02 梦珊机
+    实测误报三连的修复）。"""
+    deployed = home / "plugins" / "feishu-streaming"
+    cli_name = home / "plugins" / "feishu-streaming-platform"
+    deployed.rename(cli_name)
+    report = run_checks(home, repo_plugin_dir=None)
+    assert _by_name(report, "插件目录")[0].status == OK
+    # 部署目录相关的下游检查（cron 卡分支）也须命中新目录名
+    assert _by_name(report, "cron 卡分支")[0].status == OK
+
+
 def test_deploy_freshness_warns_on_stale_copy(home: Path) -> None:
     deployed = home / "plugins" / "feishu-streaming"
     (deployed / "engine.py").write_text("# 比仓库旧", encoding="utf-8")

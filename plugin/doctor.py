@@ -281,10 +281,18 @@ def check_cardkit_probe(report: Report, home: Path) -> None:
 
 
 def check_plugin_dir(report: Report, home: Path) -> Path | None:
-    plugin_dir = home / "plugins" / "feishu-streaming"
-    if not plugin_dir.is_dir():
-        report.add("插件目录", FAIL, f"{plugin_dir} 不存在",
-                   "按 README 部署：cp -R plugin ~/.hermes/plugins/feishu-streaming")
+    """部署目录定位：手动拷贝名 feishu-streaming（README 部署）或 CLI 安装名
+    feishu-streaming-platform（hermes plugins install/update，manifest 名目录）——
+    后者是跨机分发（梦珊机）的实际形态，两者都认，CLI 名优先（同存时它才是
+    metadata 追踪的生效拷贝）。"""
+    candidates = [home / "plugins" / "feishu-streaming-platform",
+                  home / "plugins" / "feishu-streaming"]
+    plugin_dir = next((p for p in candidates if p.is_dir()), None)
+    if plugin_dir is None:
+        report.add("插件目录", FAIL,
+                   f"{candidates[1]}（或 CLI 安装名 {candidates[0].name}）不存在",
+                   "按 README 部署：cp -R plugin ~/.hermes/plugins/feishu-streaming，"
+                   "或 hermes plugins install <repo>#plugin --enable")
         return None
     manifest = plugin_dir / "plugin.yaml"
     data, err = _load_yaml(manifest) if manifest.is_file() else (None, "plugin.yaml 不存在")
@@ -400,10 +408,15 @@ def check_runtime_deps(report: Report, home: Path) -> None:
     except ImportError:
         report.add("lark-oapi（当前解释器）", WARN, f"{sys.executable} 没有 lark-oapi",
                    "doctor 不在运行时环境不重要——关键是网关进程的 venv（见下一项）")
-    # PM 布局：installs/*/environments/*/venv 才是网关运行时
+    # PM 布局：installs/*/environments/*/venv 才是网关运行时。site-packages 两种
+    # 布局都探：POSIX lib/python*/… 与 Windows Lib\…（梦珊机实测后者，漏探=误报 FAIL）
     venvs = sorted((home / "installs").glob("*/environments/*/venv")) if (home / "installs").is_dir() else []
     if venvs:
-        healthy = [v for v in venvs if list(v.glob("lib/python*/site-packages/lark_oapi"))]
+        def _has_lark(v: Path) -> bool:
+            return bool(list(v.glob("lib/python*/site-packages/lark_oapi"))
+                        or list(v.glob("Lib/site-packages/lark_oapi")))
+
+        healthy = [v for v in venvs if _has_lark(v)]
         if healthy:
             report.add("lark-oapi（运行时 venv）", OK, f"{len(healthy)}/{len(venvs)} 个 PM venv 可用")
         else:
