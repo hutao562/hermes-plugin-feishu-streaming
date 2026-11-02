@@ -386,3 +386,73 @@ class TestPanelExpandedSplit:
         cfg = _make_config({"streaming": {}})
         assert cfg.tool_panel_expanded is False
         assert cfg.reasoning_panel_expanded is False
+
+
+class TestYamlFallbackChain:
+    """PyYAML → ruamel → None 回退链（2026-11-02 梦珊机实测：桌面版 PM venv
+    无 PyYAML，hermes 用自带 ruamel——裸 import yaml 建卡全败）。"""
+
+    def test_prefers_pyyaml_in_normal_env(self) -> None:
+        import yaml
+
+        from plugin._vendor.config import _resolve_safe_load
+
+        assert _resolve_safe_load() is yaml.safe_load
+
+    def test_falls_back_to_ruamel(self, monkeypatch) -> None:
+        import sys
+        import types
+
+        import plugin._vendor.config as config_mod
+
+        def fake_load(self, text):
+            return {"via": "ruamel-stub"}
+
+        ruamel = types.ModuleType("ruamel")
+        ruamel_yaml = types.ModuleType("ruamel.yaml")
+
+        class _YAML:
+            def __init__(self, typ=None, pure=None):
+                assert typ == "safe" and pure is True
+
+            load = fake_load
+
+        ruamel_yaml.YAML = _YAML
+        monkeypatch.setitem(sys.modules, "yaml", None)
+        monkeypatch.setitem(sys.modules, "ruamel", ruamel)
+        monkeypatch.setitem(sys.modules, "ruamel.yaml", ruamel_yaml)
+        loader = config_mod._resolve_safe_load()
+        assert loader("a: 1") == {"via": "ruamel-stub"}
+
+    def test_none_when_no_yaml_impl(self, monkeypatch) -> None:
+        import sys
+
+        import plugin._vendor.config as config_mod
+
+        monkeypatch.setitem(sys.modules, "yaml", None)
+        monkeypatch.setitem(sys.modules, "ruamel", None)
+        monkeypatch.setitem(sys.modules, "ruamel.yaml", None)
+        assert config_mod._resolve_safe_load() is None
+
+    def test_safe_yaml_load_degrades_when_none(self, monkeypatch, tmp_path) -> None:
+        import plugin._vendor.config as config_mod
+
+        monkeypatch.setattr(config_mod, "_SAFE_LOAD", None)
+        assert config_mod._safe_yaml_load("streaming:\n  enabled: true\n") == {}
+        # Config 主链路照常：读不到 yaml → 默认值而非抛异常（卡片不炸的关键）
+        (tmp_path / "config.yaml").write_text(
+            "streaming:\n  enabled: true\n", encoding="utf-8")
+        cfg = config_mod.Config(home=tmp_path)
+        assert cfg.enabled is False  # 读不到配置 → enabled 默认 False，不抛错
+
+    def test_safe_yaml_load_via_ruamel_equals_pyyaml(self) -> None:
+        """回退链产物与 PyYAML 语义一致（本机 ruamel 真身可用时才跑）."""
+        ruamel = pytest.importorskip("ruamel.yaml")
+        from plugin._vendor.config import _safe_yaml_load
+
+        loader = ruamel.YAML(typ="safe", pure=True)
+        text = "streaming:\n  enabled: true\n  footer:\n    model_cycle: [a, b]\n"
+        assert loader.load(text) == {"streaming": {"enabled": True,
+                                                   "footer": {"model_cycle": ["a", "b"]}}}
+        assert _safe_yaml_load(text) == {"streaming": {"enabled": True,
+                                                       "footer": {"model_cycle": ["a", "b"]}}}

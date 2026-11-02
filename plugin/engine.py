@@ -993,11 +993,9 @@ class ChatCardEngine:
             return self._candidates_cache[1]
 
         def _fetch() -> list[dict[str, Any]]:
-            import yaml
+            from ._vendor.config import _config_path, _safe_yaml_load
 
-            from ._vendor.config import _config_path
-
-            cfg = yaml.safe_load(_config_path().read_text(encoding="utf-8")) or {}
+            cfg = _safe_yaml_load(_config_path().read_text(encoding="utf-8"))
             model_cfg = cfg.get("model") or {}
             try:
                 from hermes_cli.config import get_compatible_custom_providers

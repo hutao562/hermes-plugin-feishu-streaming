@@ -6,10 +6,44 @@ import os
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 DEFAULT_DOMAIN = "https://open.feishu.cn"  # SDK 根域名，Larksuite 用 https://open.larksuite.com
 LARK_DOMAIN = "https://open.larksuite.com"
+
+
+def _resolve_safe_load() -> Any:
+    """yaml 解析回退链：PyYAML → ruamel（hermes 自带依赖）→ None.
+
+    运行时 venv 不保证装 PyYAML——hermes 自己用 ruamel 解析 config，桌面版
+    PM env 实测无 yaml 包（2026-11-02 梦珊机建卡链路 `No module named 'yaml'`
+    实证，卡片全部建败）。ruamel 0.18 移除了 safe_load 函数 API，用
+    YAML(typ='safe', pure=True).load 等价替代。None = 无任何 yaml 实现，
+    配置读取降级为默认值（卡片主链路不受影响，只是 streaming.* 旋钮失效）。
+    """
+    try:
+        import yaml
+
+        return yaml.safe_load
+    except ImportError:
+        try:
+            from ruamel.yaml import YAML
+
+            return YAML(typ="safe", pure=True).load
+        except ImportError:
+            return None
+
+
+_SAFE_LOAD: Any = _resolve_safe_load()
+
+
+def _safe_yaml_load(text: str) -> dict[str, Any]:
+    """经回退链解析 YAML；无实现/非 dict 结果一律空 dict."""
+    if _SAFE_LOAD is None:
+        return {}
+    try:
+        data = _SAFE_LOAD(text)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def hermes_home() -> Path:
@@ -305,8 +339,7 @@ class Config:
             return self._raw
         path = _config_path(self._home)
         if path.exists():
-            text = path.read_text(encoding="utf-8")
-            self._raw = yaml.safe_load(text) or {}
+            self._raw = _safe_yaml_load(path.read_text(encoding="utf-8"))
         else:
             self._raw = {}
         return self._raw
@@ -331,11 +364,9 @@ class Config:
             return cached[1]
         try:
             text = path.read_text(encoding="utf-8")
-            data = yaml.safe_load(text)
+            data = _safe_yaml_load(text)
         except Exception:
             # 读到写一半的文件（如 /reasoning 正在写）→ 不缓存，等下次重试。
             return cached[1] if cached is not None else {}
-        if not isinstance(data, dict):
-            data = {}
         self._reload_cache = (key, data)
         return data

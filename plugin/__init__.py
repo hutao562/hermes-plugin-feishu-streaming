@@ -191,10 +191,9 @@ def _current_home() -> str:
 def _profile_disabled_plugin(home: Any) -> bool:
     """该 profile 是否把本插件列入 plugins.disabled（全局默认启用的退出开关）."""
     try:
-        import yaml
+        from ._vendor.config import _safe_yaml_load
 
-        with open(Path(home) / "config.yaml", encoding="utf-8") as fh:
-            cfg = yaml.safe_load(fh) or {}
+        cfg = _safe_yaml_load((Path(home) / "config.yaml").read_text(encoding="utf-8"))
         disabled = ((cfg.get("plugins") or {}).get("disabled")) or []
         return "feishu-streaming-platform" in disabled
     except Exception:
@@ -324,11 +323,9 @@ def _model_cycle_config() -> list[str]:
     if isinstance(explicit, list) and explicit:
         return [str(m).strip() for m in explicit if str(m).strip()]
     try:
-        import yaml
+        from ._vendor.config import _config_path, _safe_yaml_load
 
-        from ._vendor.config import _config_path
-
-        raw = yaml.safe_load(_config_path().read_text(encoding="utf-8")) or {}
+        raw = _safe_yaml_load(_config_path().read_text(encoding="utf-8"))
     except Exception:
         return []
     models: list[str] = []
