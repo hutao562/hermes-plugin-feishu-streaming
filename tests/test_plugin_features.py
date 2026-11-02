@@ -412,6 +412,64 @@ async def test_redirect_post_ack_reasoning_tools_land_new_card() -> None:
 
 
 @pytest.mark.asyncio
+async def test_processing_start_before_turn_started_keeps_three_anchors() -> None:
+    """processing_start 早于 turn_started（新版 hermes 顺序可反转，2026-11-02
+    梦珊机实测 31s/35s）：原始锚经暂存回填——redirect 后 draft 锚回摆到回合
+    原始消息不再误判 followup，卡不会被空 seal 渲染成「Done.」占位
+    （v0.16.2 同款老问题的复发路径）。"""
+    engine = ChatCardEngine(_mock_client())
+    # 顺序反转：先 processing_start（无会话 → 暂存），后 turn_started（建卡回填）
+    engine.note_inbound("chat1", "om_original")
+    engine.on_turn_started("chat1")
+    await _settle(engine)
+    session = engine.active_session("chat1")
+    assert session is not None and session.turn_inbound == "om_original"
+
+    # 纠正消息到达：会话已有原始锚 → 不覆盖；redirect 开新卡（三锚随行）
+    engine.note_inbound("chat1", "om_correction")
+    assert session.turn_inbound == "om_original"
+    engine.mark_redirect("chat1", anchor="om_correction")
+    await _settle(engine)
+    new = engine.session_for("chat1")
+    assert new is not session
+    assert {"om_original", "om_correction"} <= new.accepted_anchors
+
+    # hermes redirect 语义：draft 锚不变（回摆到回合原始消息）——不拆卡
+    engine.on_draft("chat1", "纠正后的回答", reply_to="om_original")
+    await _settle(engine)
+    assert engine.session_for("chat1") is new
+    assert new.answer_seg is not None and "纠正后的回答" in new.answer_seg.text
+
+
+@pytest.mark.asyncio
+async def test_pending_turn_inbound_expires_and_no_session_steal() -> None:
+    """暂存锚的两条卫生边界：mid-turn 消息（会话已有原始锚）不得进暂存；过期
+    暂存不回填（防陈锚被未来回合误收）。"""
+    import time as _time
+
+    engine = ChatCardEngine(_mock_client())
+    engine.on_turn_started("chat1")
+    await _settle(engine)
+    session = engine.active_session("chat1")
+    engine.note_inbound("chat1", "om_mid_turn")  # 会话在、锚空 → 直接登记
+    assert session.turn_inbound == "om_mid_turn"
+    assert not engine._pending_turn_inbound  # 无暂存
+
+    # 会话终态后到达的消息 → 暂存；人工把时间戳拨过期 → 下次建会话不回填
+    # （completed_at 拨到 10s 前，绕过 on_turn_started 的 5s typing 尾巴守卫）
+    session.state = "completed"
+    session.completed_at = _time.time() - 10.0
+    engine.note_inbound("chat1", "om_stale")
+    assert engine._pending_turn_inbound.get("chat1", ("", 0))[0] == "om_stale"
+    stale_ts = engine._pending_turn_inbound["chat1"][1] - 120.0
+    engine._pending_turn_inbound["chat1"] = ("om_stale", stale_ts)
+    engine.on_turn_started("chat1")
+    await _settle(engine)
+    fresh = engine.active_session("chat1")
+    assert fresh is not session and fresh.turn_inbound is None
+
+
+@pytest.mark.asyncio
 async def test_redirect_straggler_draft_dropped() -> None:
     """旧请求取消前的残尾快照（老内容超集）不得闪进新卡."""
     engine = ChatCardEngine(_mock_client())

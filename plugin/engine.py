@@ -150,6 +150,8 @@ class ChatCardEngine:
         # chat → 见过的入站消息 id（on_processing_start 登记，drain 消息在 drain
         # 开始时也会触发）——followup 拆卡的门槛：新锚必须是真入站消息
         self._inbound_seen: dict[str, dict[str, float]] = {}
+        # processing_start 早于 turn_started 到达时的原始锚暂存（chat → (锚, 时间)）
+        self._pending_turn_inbound: dict[str, tuple[str, float]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: Any = None
 
@@ -233,14 +235,23 @@ class ChatCardEngine:
         bucket[message_id] = time.time()
         while len(bucket) > 50:  # 每_chat 只留最近 50 条，防无界增长
             bucket.pop(next(iter(bucket)))
-        # 本回合原始入站锚登记：活跃会话尚未记录时取最近创建的一个
-        # （turn_started 先于 processing_start，首条即回合原始消息；drain /
-        # 纠正消息到达时会话已有值，不覆盖——它们不是本回合的原始锚）
+        # 本回合原始入站锚登记：活跃会话尚未记录时取最近创建的一个（drain /
+        # 纠正消息到达时会话已有值，不覆盖——它们不是本回合的原始锚）。
+        # 顺序不再假设 turn_started 先行：新版 hermes processing_start 可早于
+        # turn_started 数秒（2026-11-02 梦珊机实测 31s/35s）——无活跃会话时先
+        # 暂存，_ensure_session 建会话时回填；否则 redirect 三锚缺原始锚，draft
+        # 锚回摆被误判 followup，只含 reasoning 的卡被 green seal 渲染成
+        # 「Done.」占位（v0.16.2 同款老问题复发）。
         candidates = [s for s in self._sessions.values()
                       if s.chat_id == chat_id and not s.is_terminal
                       and s.turn_inbound is None]
         if candidates:
             max(candidates, key=lambda s: s.created_at).turn_inbound = message_id
+        elif not any(s.chat_id == chat_id and not s.is_terminal
+                     for s in self._sessions.values()):
+            # 该 chat 无任何活跃会话：消息属于即将开始的回合——暂存待回填
+            # （同 chat 新消息覆盖旧暂存；60s 过期防陈锚）
+            self._pending_turn_inbound[chat_id] = (message_id, time.time())
 
     def _inbound_verified(self, chat_id: str, message_id: str | None) -> bool:
         """锚是否为引擎亲眼见过的入站消息."""
@@ -692,6 +703,11 @@ class ChatCardEngine:
             new = ChatSession(chat_id=chat_id, thread_id=thread_id)
             self._sessions[key] = new
             session = new
+            # processing_start 先于 turn_started 到达时暂存的原始锚回填（见
+            # note_inbound）——redirect 三锚与 followup 判定依赖它
+            pending = self._pending_turn_inbound.pop(chat_id, None)
+            if pending and new.turn_inbound is None and time.time() - pending[1] < 60.0:
+                new.turn_inbound = pending[0]
         self._maybe_start_card_task(session)
         return session
 
