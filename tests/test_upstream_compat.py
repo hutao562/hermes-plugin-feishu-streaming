@@ -12,7 +12,7 @@ from pathlib import Path
 
 from hermes_sources import MANIFEST_PATH, TREE_FILES, source_at
 
-from plugin.contract import CONTRACT_ANCHORS, check_tree, render_misses
+from plugin.contract import CONTRACT_ANCHORS, OPTIONAL_ANCHORS, check_tree, render_misses
 
 
 def test_contract_files_covered_by_pinned_manifest() -> None:
@@ -23,6 +23,40 @@ def test_contract_files_covered_by_pinned_manifest() -> None:
     manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     assert set(CONTRACT_ANCHORS) <= set(manifest["sha256"])
     assert set(CONTRACT_ANCHORS) <= set(TREE_FILES)
+
+
+def test_optional_anchors_absent_tree_is_clean(tmp_path: Path) -> None:
+    """可选锚点（新版启用面）文件缺席不算缺失——pinned 基线 2237be3 无这些
+    文件，插件按能力探测透传，老版本完整支持。"""
+    for relative in TREE_FILES:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source_at(relative), encoding="utf-8")
+    for relative in OPTIONAL_ANCHORS:  # pinned 树未种可选面文件 → 必须零缺失
+        assert not (tmp_path / relative).exists()
+    assert check_tree(tmp_path) == []
+
+
+def test_optional_anchors_checked_when_present(tmp_path: Path) -> None:
+    """可选锚点文件在场时逐针检查：针漂移 → 报缺失（hermes-check 每日对
+    main 的报警面；2026-11-02 升级事故的根因面）。"""
+    gateway = tmp_path / "gateway"
+    gateway.mkdir(parents=True)
+    (gateway / "platform_registry.py").write_text(
+        "class PlatformEntry:\n    env_overrides: tuple = ()\n"
+        "# 同名顶替语义注释被上游改写（针文本已不存在）\n", encoding="utf-8")
+    feishu = tmp_path / "plugins" / "platforms" / "feishu"
+    feishu.mkdir(parents=True)
+    (feishu / "gateway_env.py").write_text(
+        'ENV_OVERRIDES = ()\nENV_ENABLE_CREDENTIALS = ("FEISHU_APP_ID", "FEISHU_APP_SECRET")\n',
+        encoding="utf-8")
+
+    misses = check_tree(tmp_path)
+    # registry 的同名顶替语义针缺失 → 报缺失
+    assert any(miss.file == "gateway/platform_registry.py"
+               and "last writer wins" in miss.needle for miss in misses)
+    # gateway_env 两针齐全 → 不出现在缺失清单
+    assert not any(miss.file == "plugins/platforms/feishu/gateway_env.py" for miss in misses)
 
 
 def test_pinned_upstream_satisfies_contract(tmp_path: Path) -> None:

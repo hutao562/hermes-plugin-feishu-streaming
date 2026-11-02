@@ -121,8 +121,16 @@ def register(ctx: Any) -> None:
         apply_yaml_config_fn=_feishu_apply_yaml_config,
         setup_fn=_feishu_interactive_setup,
     )
+    # env 启用桥透传（新版 hermes 平台启用依赖；见 _official_feishu_env_bridge）。
+    # 仅在官方模块可解析且运行时 PlatformEntry 认识这些字段时附加。
+    env_overrides, env_enable_credentials = _official_feishu_env_bridge()
+    if (env_overrides or env_enable_credentials) and (
+            {"env_overrides", "env_enable_credentials"} <= _platform_entry_field_names()):
+        entry_kwargs["env_overrides"] = env_overrides
+        entry_kwargs["env_enable_credentials"] = env_enable_credentials or (
+            "FEISHU_APP_ID", "FEISHU_APP_SECRET")
     ctx.register_platform(**entry_kwargs)
-    _diag_log("platform registered via ctx (scope entry)")
+    _diag_log(f"platform registered via ctx (scope entry, env_bridge={len(env_overrides)} steps)")
     _fanout_to_profile_scopes(entry_kwargs)
 
     # reasoning 流观察（off token path）：钩子不带 chat，引擎路由按全局单活跃会话兜底
@@ -443,6 +451,39 @@ def _feishu_interactive_setup() -> None:
         raise RuntimeError("官方 feishu adapter 不可导入，无法进入交互配置；"
                            "请手动设置 FEISHU_APP_ID / FEISHU_APP_SECRET")
     fn()
+
+
+def _official_feishu_env_bridge() -> tuple[tuple, tuple]:
+    """官方 feishu 的 env→config 启用桥（ENV_OVERRIDES 步骤 + 凭据名清单）.
+
+    新版 hermes（2026-10-22 bf0203a 一线）平台启用由条目自带 env 桥驱动：config
+    pass 跑 EnvCred 步骤把 .env 凭据写进 platforms.feishu.extra 并在凭据在场时
+    启用平台。同名顶替条目不透传 → 凭据门 is_connected（看 extra.app_id）恒
+    False → feishu 永不启用、适配器不建，且同名条目还屏蔽 bundled 的 env
+    fallback（2026-11-02 升级实测 Gateway running with 1 platform(s)）。
+    官方模块不可导入（老版本 hermes）时回退空值——老版本启用不依赖此面。
+    """
+    try:
+        from plugins.platforms.feishu import gateway_env as official_env
+    except Exception:
+        return (), ()
+    return (tuple(getattr(official_env, "ENV_OVERRIDES", ()) or ()),
+            tuple(getattr(official_env, "ENV_ENABLE_CREDENTIALS", ()) or ()))
+
+
+def _platform_entry_field_names() -> set[str]:
+    """运行时 PlatformEntry 的字段名集合（跨版本能力探测；不可导入时为空）.
+
+    ctx.register_platform 对未知 kwargs 抛 TypeError——env 桥字段只在运行时
+    PlatformEntry 真有这些字段时透传，老版本 hermes 上保持原有条目形状。
+    """
+    try:
+        import dataclasses
+
+        from gateway.platform_registry import PlatformEntry
+        return {f.name for f in dataclasses.fields(PlatformEntry)}
+    except Exception:
+        return set()
 
 
 def _make_reasoning_hook() -> Any:

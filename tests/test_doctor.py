@@ -170,6 +170,54 @@ def test_cron_branch_missing_from_deploy_fails(home: Path) -> None:
     assert "重新拷贝" in branch.hint
 
 
+def _seed_new_hermes_env_bridge_face(home: Path) -> None:
+    """种出新版 hermes 的 env 桥启用面（源码根标记 + gateway_env + registry 字段）.
+
+    必须带 gateway/stream_consumer_transport.py 标记，否则 _hermes_source_root
+    回退到真实 ~/.hermes/hermes-agent，测试结果随机器漂移。
+    """
+    gateway = home / "hermes-agent" / "gateway"
+    gateway.mkdir(parents=True, exist_ok=True)
+    (gateway / "stream_consumer_transport.py").write_text("# 源码根标记\n", encoding="utf-8")
+    (gateway / "platform_registry.py").write_text(
+        "class PlatformEntry:\n    env_overrides: tuple = ()\n", encoding="utf-8")
+    feishu = home / "hermes-agent" / "plugins" / "platforms" / "feishu"
+    feishu.mkdir(parents=True, exist_ok=True)
+    (feishu / "gateway_env.py").write_text(
+        "ENV_OVERRIDES = ()\nENV_ENABLE_CREDENTIALS = ('FEISHU_APP_ID', 'FEISHU_APP_SECRET')\n",
+        encoding="utf-8")
+
+
+def test_env_bridge_ok_on_new_hermes(home: Path) -> None:
+    """新版 hermes + 部署目录带透传 → OK（home fixture 从仓库拷贝，天然含修复）."""
+    _seed_new_hermes_env_bridge_face(home)
+    report = run_checks(home, repo_plugin_dir=None)
+    assert _by_name(report, "平台启用面")[0].status == OK
+
+
+def test_env_bridge_fails_without_passthrough(home: Path) -> None:
+    """新版 hermes + 部署目录是旧版（__init__.py 无 env 桥透传）→ FAIL——
+    2026-11-02 升级事故的直接病征项（feishu 永不启用）。"""
+    _seed_new_hermes_env_bridge_face(home)
+    (home / "plugins" / "feishu-streaming" / "__init__.py").write_text(
+        "# 旧版部署：无 env 桥透传\n", encoding="utf-8")
+    report = run_checks(home, repo_plugin_dir=None)
+    bridge = _by_name(report, "平台启用面")[0]
+    assert bridge.status == FAIL
+    assert "重新拷贝" in bridge.hint
+
+
+def test_env_bridge_na_on_old_hermes(home: Path) -> None:
+    """老版本 hermes（registry 无 env_overrides 字段）→ 不适用、不算病征."""
+    gateway = home / "hermes-agent" / "gateway"
+    gateway.mkdir(parents=True, exist_ok=True)
+    (gateway / "stream_consumer_transport.py").write_text("# 源码根标记\n", encoding="utf-8")
+    (gateway / "platform_registry.py").write_text("class PlatformEntry:\n    pass\n", encoding="utf-8")
+    report = run_checks(home, repo_plugin_dir=None)
+    bridge = _by_name(report, "平台启用面")
+    assert bridge and bridge[0].status == OK and "不适用" in bridge[0].detail
+
+
 def test_reasoning_deltas_missing_warns(home: Path) -> None:
     """第 4 开关缺省 → WARN（卡能出、思考流缺，装的人不会当故障查）."""
     report = run_checks(home, repo_plugin_dir=None)

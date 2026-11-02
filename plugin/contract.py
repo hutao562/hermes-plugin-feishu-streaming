@@ -60,6 +60,39 @@ CONTRACT_ANCHORS: dict[str, tuple[tuple[str, str], ...]] = {
          "脚本门失败形状（cron 卡红 header 判定之一；⚠️ Cron ' 前缀在 "
          "scheduler_failure_copy.py，pinned revision 尚未抽出该模块，未锚——改版只降级为蓝卡）"),
     ),
+    # 插件直接父类（2026-11-02 补锚：ccc6956 改 704 行时每日检查对此文件是
+    # 盲的，只靠人工核查——覆写面签名漂移必须自动报警）
+    "plugins/platforms/feishu/adapter.py": (
+        ("class FeishuAdapter", "插件直接父类（子类化对象）"),
+        ("def send(", "send 覆写契约（终态拦截/兜底开卡/跨回合合并入口）"),
+        ("def edit_message(", "edit_message(finalize=) 覆写契约（stale-finalize 重定向）"),
+        ("def send_typing(", "send_typing 覆写（typing 徽章）"),
+        ("def send_document(", "文档交付覆写（上传 + reply 卡片消息）"),
+        ("def _dispatch_synthetic_event(", "合成事件通道（footer 🧠⇄ /model、clarify 按钮）"),
+        ("def _resolve_source_chat_type(", "chat_type 解析（event_chat_type 传 raw_type 的对端）"),
+        ("_feishu_send_with_retry", "text 兜底直发通道（clarify/降级路径）"),
+    ),
+}
+
+# ── 平台启用面（2026-10-22 上游一线引入；2026-11-02 升级事故后锚定）──
+# 新版 hermes 的平台启用由条目自带 env 桥驱动：config pass 跑 EnvCred 步骤把
+# .env 凭据写进 platforms.<name>.extra 并在凭据在场时启用平台。插件同名顶替
+# feishu 条目后必须透传官方桥（plugin/__init__._official_feishu_env_bridge），
+# 否则凭据门 is_connected 恒 False → feishu 永不启用（2026-11-02 实测：插件
+# register 正常但 Gateway running with 1 platform(s)、无 Connecting to feishu）。
+# 这些文件在 pinned 基线（2237be3 / 0.21.1）尚不存在——插件按能力探测透传，
+# 老版本无此面也完整支持（kwargs 省略）——故按「可选锚点」处理：文件在场才
+# 检查（hermes-check 每日对 main、doctor 对本机），缺席不算缺失。
+OPTIONAL_ANCHORS: dict[str, tuple[tuple[str, str], ...]] = {
+    "plugins/platforms/feishu/gateway_env.py": (
+        ("ENV_OVERRIDES", "env→config 桥步骤来源（顶替条目必须透传——缺了 feishu 永不启用）"),
+        ('ENV_ENABLE_CREDENTIALS = ("FEISHU_APP_ID", "FEISHU_APP_SECRET")',
+         "凭据名清单（is_connected 凭据门的 env 侧对应物）"),
+    ),
+    "gateway/platform_registry.py": (
+        ("env_overrides", "PlatformEntry env 桥字段（能力探测目标）"),
+        ("last writer wins on name clash", "同名顶替语义（register_platform 顶替 bundled 的前提）"),
+    ),
 }
 
 
@@ -73,15 +106,18 @@ class AnchorMiss:
 def check_tree(tree: Path) -> list[AnchorMiss]:
     """对一份 hermes 源码树检查全部契约锚点，返回缺失清单（空 = 兼容）.
 
-    ``tree`` 是 hermes-agent 源码根（含 gateway/）。文件缺失按整文件缺失报告。
+    ``tree`` 是 hermes-agent 源码根（含 gateway/）。必选锚点文件缺失按整文件
+    缺失报告；可选锚点（OPTIONAL_ANCHORS）文件缺席不算缺失（老版本 hermes
+    无此面），在场则逐针检查。
     """
     misses: list[AnchorMiss] = []
-    for relative, anchors in CONTRACT_ANCHORS.items():
+    for relative, anchors in (*CONTRACT_ANCHORS.items(), *OPTIONAL_ANCHORS.items()):
         path = tree / relative
         try:
             source = path.read_text(encoding="utf-8")
         except OSError:
-            misses.append(AnchorMiss(relative, "<file missing>", f"上游文件不存在：{relative}"))
+            if relative in CONTRACT_ANCHORS:
+                misses.append(AnchorMiss(relative, "<file missing>", f"上游文件不存在：{relative}"))
             continue
         for needle, why in anchors:
             if needle not in source:

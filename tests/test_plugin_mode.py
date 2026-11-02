@@ -418,6 +418,99 @@ def test_register_passes_official_contract_surfaces(monkeypatch) -> None:
     assert connected(SimpleNamespace(extra={})) is False
 
 
+def _seed_official_gateway_env(monkeypatch) -> tuple:
+    """注入桩版官方 feishu gateway_env（env→config 桥）到 sys.modules.
+
+    `from plugins.platforms.feishu import gateway_env` 需要整条父链可导入——
+    四级模块全部播种并挂好属性。返回桩的 (ENV_OVERRIDES, ENV_ENABLE_CREDENTIALS)。
+    """
+    import types
+
+    def step(cfg: Any) -> None:  # EnvCred 步骤桩（签名 step(GatewayConfig)）
+        return None
+
+    root = types.ModuleType("plugins")
+    platforms_mod = types.ModuleType("plugins.platforms")
+    feishu_pkg = types.ModuleType("plugins.platforms.feishu")
+    gateway_env = types.ModuleType("plugins.platforms.feishu.gateway_env")
+    overrides, enable_creds = (step,), ("FEISHU_APP_ID", "FEISHU_APP_SECRET")
+    gateway_env.ENV_OVERRIDES = overrides
+    gateway_env.ENV_ENABLE_CREDENTIALS = enable_creds
+    feishu_pkg.gateway_env = gateway_env
+    root.platforms = platforms_mod
+    platforms_mod.feishu = feishu_pkg
+    for name, mod in {
+        "plugins": root,
+        "plugins.platforms": platforms_mod,
+        "plugins.platforms.feishu": feishu_pkg,
+        "plugins.platforms.feishu.gateway_env": gateway_env,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    return overrides, enable_creds
+
+
+def _seed_platform_registry_fields(monkeypatch, *field_names: str) -> None:
+    """注入桩版 gateway.platform_registry，其 PlatformEntry 是真 dataclass 且带
+    *field_names* 字段——能力探测走 dataclasses.fields，MagicMock 过不了。"""
+    import dataclasses
+    import types
+
+    registry = types.ModuleType("gateway.platform_registry")
+    fields = [("name", str, dataclasses.field())] + [
+        (f, tuple, dataclasses.field(default=())) for f in field_names
+    ]
+    registry.PlatformEntry = dataclasses.make_dataclass("PlatformEntry", fields)
+    gateway_pkg = types.ModuleType("gateway")
+    gateway_pkg.platform_registry = registry
+    monkeypatch.setitem(sys.modules, "gateway", gateway_pkg)
+    monkeypatch.setitem(sys.modules, "gateway.platform_registry", registry)
+
+
+def test_register_passes_env_enablement_bridge(monkeypatch) -> None:
+    """新版 hermes 平台启用由条目自带 env 桥驱动（EnvCred 步骤把 .env 凭据写进
+    extra 并启用）；同名顶替条目不透传 → 凭据门 is_connected 恒 False → feishu
+    永不启用（2026-11-02 升级实测 Gateway running with 1 platform(s)，且同名
+    条目屏蔽了 bundled 的 env fallback）。官方桥 + 运行时字段面都在 → 透传。"""
+    from plugin import register
+
+    overrides, enable_creds = _seed_official_gateway_env(monkeypatch)
+    _seed_platform_registry_fields(monkeypatch, "env_overrides", "env_enable_credentials")
+
+    ctx = MagicMock()
+    register(ctx)
+    kwargs = ctx.register_platform.call_args.kwargs
+    assert kwargs["env_overrides"] == overrides
+    assert kwargs["env_enable_credentials"] == enable_creds
+
+
+def test_register_omits_env_bridge_when_fields_absent(monkeypatch) -> None:
+    """官方桥可解析、但运行时 PlatformEntry 无 env 桥字段（老版本 hermes）→
+    kwargs 不携带（ctx.register_platform 对未知字段抛 TypeError，透传会让插件
+    在老版本上整体加载失败）。"""
+    from plugin import register
+
+    _seed_official_gateway_env(monkeypatch)
+    _seed_platform_registry_fields(monkeypatch, "is_connected")
+
+    ctx = MagicMock()
+    register(ctx)
+    kwargs = ctx.register_platform.call_args.kwargs
+    assert "env_overrides" not in kwargs and "env_enable_credentials" not in kwargs
+
+
+def test_register_omits_env_bridge_when_official_module_absent(monkeypatch) -> None:
+    """运行时字段面支持、但官方 gateway_env 模块不可导入（老版本 hermes 无此
+    模块）→ 桥解析为空 → kwargs 不携带（老版本启用不依赖此面）。"""
+    from plugin import register
+
+    _seed_platform_registry_fields(monkeypatch, "env_overrides", "env_enable_credentials")
+
+    ctx = MagicMock()
+    register(ctx)
+    kwargs = ctx.register_platform.call_args.kwargs
+    assert "env_overrides" not in kwargs and "env_enable_credentials" not in kwargs
+
+
 def test_scoped_env_fallback_reads_through_secret_scope(monkeypatch) -> None:
     """_LazyClient 无绑定回退必须走 get_scoped_secret（multiplex 下绝不裸读 os.environ）.
 

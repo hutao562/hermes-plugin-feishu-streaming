@@ -343,6 +343,41 @@ def check_cron_card(report: Report, home: Path, deployed: Path | None) -> None:
                    "部署的是旧版插件——重新拷贝 plugin/ 到 ~/.hermes/plugins/feishu-streaming 并重启网关")
 
 
+def check_env_bridge(report: Report, home: Path, deployed: Path | None) -> None:
+    """平台启用面（v0.19.4）：新版 hermes 平台启用由条目自带 env 桥驱动.
+
+    官方条目带 ENV_OVERRIDES（EnvCred 步骤，config pass 把 .env 凭据写进
+    platforms.feishu.extra 并启用）；同名顶替条目不透传 → 凭据门 is_connected
+    （看 extra.app_id）恒 False → feishu 永不启用、适配器不建，且同名条目屏蔽
+    bundled 的 env fallback（2026-11-02 升级实测：Gateway running with 1
+    platform(s)、无 Connecting to feishu、插件 register 正常但零活动）。
+    本机 hermes 无此面（老版本）时输出「不适用」。
+    """
+    root = _hermes_source_root(home)
+    if root is None:
+        return  # 上游契约项已 WARN 源码缺失
+    try:
+        env_src = (root / "plugins" / "platforms" / "feishu" / "gateway_env.py").read_text(encoding="utf-8")
+        registry_src = (root / "gateway" / "platform_registry.py").read_text(encoding="utf-8")
+    except OSError:
+        report.add("平台启用面", OK, "不适用（本机 hermes 无 env 桥启用面）")
+        return
+    if "ENV_OVERRIDES" not in env_src or "env_overrides" not in registry_src:
+        report.add("平台启用面", OK, "不适用（本机 hermes 无 env 桥启用面）")
+        return
+    init_src = ""
+    if deployed is not None:
+        try:
+            init_src = (deployed / "__init__.py").read_text(encoding="utf-8")
+        except OSError:
+            init_src = ""
+    if "_official_feishu_env_bridge" in init_src and "env_overrides" in init_src:
+        report.add("平台启用面", OK, "env 启用桥透传已在部署目录")
+    else:
+        report.add("平台启用面", FAIL, "部署的 __init__.py 缺 env 启用桥透传（新版 hermes 下 feishu 永不启用）",
+                   "重新拷贝 plugin/ 到 ~/.hermes/plugins/feishu-streaming 并重启网关")
+
+
 def check_contract(report: Report, home: Path) -> None:
     root = _hermes_source_root(home)
     if root is None:
@@ -462,6 +497,7 @@ def run_checks(home: Path, repo_plugin_dir: Path | None) -> Report:
     deployed = check_plugin_dir(report, home)
     check_deploy_freshness(report, repo_plugin_dir, deployed)
     check_cron_card(report, home, deployed)
+    check_env_bridge(report, home, deployed)
     check_contract(report, home)
     check_runtime_deps(report, home)
     check_injection_residue(report, home)

@@ -20,6 +20,7 @@
     "agent/think_scrubber.py": "6ceb04bbc2549811f16380728e559dabad60a19d5a40777270ccc3742612d0ad",
     "agent/stream_delivery.py": "38d3fda9b9ab09048c14154588e30fa695db89db20efb06fdeb6ffdbf00721c3",
     "LICENSE": "821556e6336796450ab852d375117b48a4887e71d255794fd6318d99982a5ab6",
-    "gateway/run_startup.py": "8b90dca7c2fe5167597f09724cbef44ba98c7ab20c066fff5e42a7b83c1c6c00"
+    "gateway/run_startup.py": "8b90dca7c2fe5167597f09724cbef44ba98c7ab20c066fff5e42a7b83c1c6c00",
+    "plugins/platforms/feishu/adapter.py": "3381601bb4fdbf4ac8d39688a62600b98a8b760025c8a0e1a2af64e068b09a0b"
   }
 }

@@ -54,3 +54,12 @@
 - 影响面：无新增破坏；bg/watch 通知到达时序可能因退避变化（插件 append_notice 按内容合并、对时序不敏感）；interrupt 归因细化只影响状态行/NOTICE 文本来源
 - 建议处理方案：同 2026-10-18 条目；升级回归清单追加一项——bg/watch 通知送达时序观察（退避生效后是否仍及时合并进最近卡）
 - 关联：hermes-compat issue #118 仍 open（10-15 起无更新，已定性为旧注入工作流误报，可关闭）
+
+## 2026-11-02 本机升级 bf0203a（用户升级实测，非自动巡检）
+
+- 状态：**升级即破坏，当日修复（v0.19.4）**——feishu 平台整体未启用，非 draft 契约面问题（锚点全绿）
+- 事故形态：升级重启后 `Gateway running with 1 platform(s)`（仅 a2a），无 `Connecting to feishu`、无 `adapter factory`、插件零活动日志；插件 register() 正常（diag 日志有 platform registered），doctor 全绿——契约检查对此面完全盲区
+- 根因：新版 hermes 平台启用由**条目自带 env 桥**驱动——config pass 跑 `env_overrides`（EnvCred 步骤）把 .env 凭据写进 `platforms.feishu.extra` 并在场即启用，凭据门 `is_connected` 看 `extra.app_id`。官方条目带 `gateway_env.ENV_OVERRIDES`/`ENV_ENABLE_CREDENTIALS`，插件同名顶替条目没透传 → 凭据门恒 False → feishu 永不启用；且同名条目存在还屏蔽 `_bundled_env_fallbacks`（bundled env 兜底只查无条目平台）。config.yaml 从未显式 `platforms.feishu.enabled`（一直走凭据自动启用），故两份 profile 同时失效
+- 修复（v0.19.4，当日部署实测恢复 3 platform(s)）：`plugin/__init__._official_feishu_env_bridge` 延迟解析官方桥并透传，`_platform_entry_field_names` 能力探测（老版本 PlatformEntry 无 env 桥字段，盲透传会被 `ctx.register_platform` 以未知字段 TypeError 拒绝——保持 0.21.1 双版本兼容，基线不 bump）；doctor 新增「平台启用面」病征项
+- 补锚（本次事故的直接教训，即 2026-10-18 记录的盲区 1）：①`OPTIONAL_ANCHORS` 新层——`plugins/platforms/feishu/gateway_env.py` + `gateway/platform_registry.py`（env 桥面 + last-writer-wins 同名顶替语义），文件在场才检查（pinned 基线无此文件，缺席不算缺失），hermes-check 每日对 main 自动覆盖；②插件父类 `plugins/platforms/feishu/adapter.py` 进必选锚点（八针：类名 + send/edit_message/send_typing/send_document/_dispatch_synthetic_event/_resolve_source_chat_type/_feishu_send_with_retry，2237be3 与 bf0203a 双版核对稳定）+ 进 `hermes_sources.json` manifest（同 revision 扩清单，sha256 3381601b…）
+- 遗留：`tools/clarify_gateway.py`（clarify 交互依赖）仍未锚——2026-10-18 盲区清单的最后一项，待下个锚点窗口
