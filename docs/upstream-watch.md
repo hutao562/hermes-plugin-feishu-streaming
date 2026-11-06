@@ -64,3 +64,21 @@
 - 补锚（本次事故的直接教训，即 2026-10-18 记录的盲区 1）：①`OPTIONAL_ANCHORS` 新层——`plugins/platforms/feishu/gateway_env.py` + `gateway/platform_registry.py`（env 桥面 + last-writer-wins 同名顶替语义），文件在场才检查（pinned 基线无此文件，缺席不算缺失），hermes-check 每日对 main 自动覆盖；②插件父类 `plugins/platforms/feishu/adapter.py` 进必选锚点（八针：类名 + send/edit_message/send_typing/send_document/_dispatch_synthetic_event/_resolve_source_chat_type/_feishu_send_with_retry，2237be3 与 bf0203a 双版核对稳定）+ 进 `hermes_sources.json` manifest（同 revision 扩清单，sha256 3381601b…）
 - 遗留：`tools/clarify_gateway.py`（clarify 交互依赖）仍未锚——2026-10-18 盲区清单的最后一项，待下个锚点窗口
 - 追记（同日 23 时，升级适配全链路收口）：梦珊机（Windows 桌面版）升级后实测暴露两个后续问题并当日修复——①CLI 安装布局（目录名 = manifest 名 feishu-streaming-platform）doctor 误报三连 + Windows venv `Lib\site-packages` 布局漏探（v0.19.5）；②该机 PM venv 无 PyYAML，`_vendor/config.py` 顶层裸 import yaml 建卡全败（v0.19.6：回退链 PyYAML→ruamel→降级）。另清出 7 份影子目录（.bak-0190 按扫描序 last-writer-wins 长期压赢，该机实际跑的是 0.19.0）。双机 v0.19.6 验证通过，流式卡恢复。
+
+## 2026-11-06 上游 90d6b98（基线 2237be3，较前记录 ebc9960 全窗 10-23~11-06）
+
+- 状态：锚点全绿（missing=0，含 11-02 补的父类八针与 OPTIONAL env 桥锚，首次实战覆盖父类面）；疑似影响（低危）——父类 choice-cards 重构触及 clarify/按钮卡面，插件入口拦截层未破
+- 巡检备注：10-23~11-05 每日巡检未执行（队列堆积），本条为追赶性全窗检查；git 协议仍断（ls-remote 40s 零字节自止）、raw CDN 并发 429 限流，最终口径 = gh api contents（raw Accept 头）双版下载 24 文件 + 本地 blob diff（比逐文件 commits API 快且为 blob 级精确判定）
+- 上游改动（24 关注文件：14 变 / 9 未变）：
+  - **父类 `plugins/platforms/feishu/adapter.py` +80/−44**：类 MRO 变为 `FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter)`（新文件 adapter_choice_cards.py）——clarify 从纯文本升级为按钮卡（value 键 `hermes_clarify_action`，与插件**同键**）、新增 choice-picker 卡（`hermes_choice_picker_action`）、`_CARD_ACTION_ROUTES` 路由表化（approval/update-prompt/clarify/picker 四键）、`retire_clarify_card` 网关侧清理已解 clarify 卡、审批解析卡保留正文（body 回显）、interactive 鉴权透传 user_id/union_id、`send_voice` 新增 `is_voice` 参数 + ogg 仅 audio 意图才转 voice。**八针锚点全部在位**（send/edit_message/send_typing/send_document/_dispatch_synthetic_event/_resolve_source_chat_type/_feishu_send_with_retry）
+  - draft 契约面：`stream_consumer_transport.py`/`think`/`fences`/`think_scrubber` 未变；`stream_consumer.py` +68/−6 与 `response_filters.py` +84/−3 = 静默标记机制大扩展（`SilenceMarkerStreamHold`、`strip_trailing_silence_marker`、segment 级 `_adopt_recovered_reply` 调和）——edit/native 传输内部，draft 帧路径无改动；fallback +3/−2 同主题
+  - 回合机器：run.py/run_inbound/run_busy/run_turn/run_turn_runner/run_notifications/run_startup 七模块 seam 零命中（CANCELLED/edit_message/already_sent/_draft_metadata/reply_to_message_id/_MIN_NEW/supports_draft/_dispatch_synthetic 全无）；run_turn −221 为删减重构
+  - cron：`scheduler_delivery.py` +36/−6 新增 room 投递目标 + 媒体 ack 丢失（ambiguous）语义 + is_voice 透传——CRON_WRAP 信封未动；`scheduler.py` +73/−89 取消事件管道清理 + operator_cancelled，锚点 needle `**Status:** script failed` 在位
+  - `agent/stream_delivery.py` +40/−6 = held-row 显示机制（display_kind hidden/publish），reasoning/usage 钩子签名未动；`api_request_hooks.py`/`interrupt_control.py`/`clarify_gateway.py`/`platform_registry.py`/`gateway_env.py` 全部未变
+- 影响面：
+  1. **clarify 入口无冲突但依赖拦截层**：插件 `_on_card_action_trigger`（类定义期覆写，SDK connect 绑定）先于上游路由表拦截 `hermes_clarify_action`/`hermes_model_action`——正常部署下插件 handler 仍独占 clarify 点击。风险场景：若未来 SDK 改绑定方式或上游改回调入口名使插件覆写失效，上游 `_handle_clarify_card_action` 会接手插件格式的值（查它自己的空 `_clarify_state` → no-op）——clarify 点击将静默失效。此面无锚（入口覆写不进 CONTRACT_ANCHORS），doctor 也测不到线上 SDK 绑定，只能靠实测。
+  2. **`retire_clarify_card` no-op**：文本回答等方式解掉 clarify 时，网关调 `adapter.retire_clarify_card` 清按钮卡；插件 clarify 卡不注册上游 `_clarify_state` → no-op → 插件卡按钮残留（低危 UX；上游旧实现是纯文本、无此清理概念，11-02 升级后的新版 hermes 上此面已激活）。
+  3. 上游 clarify 卡与插件同键同前缀（`hermes_clarify_action`+`clarify_id`）但值格式不同（上游用序号 int，插件用 "choice"/"other"+index/text）——若同一 chat 上两类卡并存（不会：send_clarify 类定义期覆写全量接管，官方卡发不出），无实际碰撞。
+  4. 其余均为上游内部演进：静默标记、held-row、room 投递、审批 user_id 透传——插件消费面无接口变化。
+- 建议处理方案：总判定同 2026-10-18 条目（升级实测流程）；升级回归清单追加三项——①clarify 内联单选实测（按钮点击 → 插件 handler 仍独占）②文本回答解 clarify 后插件按钮卡是否残留（retire no-op 的 UX 影响评估，可在插件 send_clarify 时顺手注册上游 `_clarify_state` 消除）③点击已解 clarify 卡旧按钮的过期反馈是否正常。锚点面无需改动（全绿）；`tools/clarify_gateway.py` 补锚（11-02 遗留）仍待窗口。
+- 关联：hermes-compat issue #118 已于 2026-11-02 关闭（用户操作，与升级事故同日）。
