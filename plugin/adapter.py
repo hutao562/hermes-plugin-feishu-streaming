@@ -223,6 +223,26 @@ class StreamingFeishuMixin:
                 message_id=(f"lark-card:{session.card_msg_id}"
                             if session is not None and session.card_msg_id else None))
 
+        if (not interim and reply_to is None and content.strip()
+                and not content.lstrip().startswith(_BUSY_ACK_PREFIXES)
+                and not (metadata or {}).get("thread_id")
+                and not (metadata or {}).get("notify")
+                and not (metadata or {}).get("job_id")
+                and (session is None or not session.has_draft)):
+            # 无锚通知类 send（watch/process 注入直投：无 reply 锚、无 thread、
+            # 无 notify、无 job_id）——绝不当终态完成渲染。此前它会命中下方
+            # streaming 完成分支，把当时唯一活跃的卡 complete 成通知文本：
+            # redirect 刚拆开的新卡（零 draft）21 秒即被劫持完成，真回答被迫
+            # 再开一张卡、前半程纯 loading（2026-11-04 梦珊机 2/2 实测）。
+            # 与 bg 交付同语义：NOTICE 合并进该 chat 最近一张卡（活跃卡由
+            # flush 渲 NOTICE 段，流式不受影响）；无可用卡片落回原生文本。
+            # has_draft 防误伤：自己 draft 过的无锚 final（v0.19.3 无探针
+            # 通知回合秒回场景）仍走下方完成分支正常收卡。
+            card_msg_id = await engine.append_notice(chat_id, content, thread_id=None)
+            if card_msg_id is not None:
+                return _compat.send_result(success=True, message_id=card_msg_id)
+            # 无可用卡片 → 落到底部原生文本
+
         if session is not None and session.state in ("creating", "streaming"):
             # 回合终态文本 → 完成卡（官方 transport 在 draft 后仍会真发最终文本，
             # 此处接管渲染；已发送标记由 gateway 流机制去重）

@@ -72,6 +72,10 @@ class ChatSession:
     # 本回合可接受的 draft 锚集合（followup 边界判定用）。redirect 场景同回合
     # 会出现两个锚（新指令消息 + 老回合消息），都算本回合不算新回合。
     accepted_anchors: set[str] = field(default_factory=set)
+    # 本会话是否见过 draft 帧——无锚通知类 send 与「本回合终态」的判别依据
+    # （watch/process 注入直投恰好落在活跃卡上时，卡可能是 redirect 刚拆开、
+    # 尚无任何 draft 的新卡，绝不能当终态完成渲染）
+    has_draft: bool = False
     _reasoning_logged: bool = False
     tool_seg: Segment | None = None
     heartbeat_text: str = ""
@@ -394,6 +398,7 @@ class ChatCardEngine:
         # 思考泄漏清洗（模型裸文本碎片两种模式都无法剥，此处只防标签形态）
         session.answer_seg.text = strip_reasoning_tags(content)
         session.answer_seg.dirty = True
+        session.has_draft = True  # adapter 无锚 send 的劫持判别用（见 send 路由）
         self._schedule(session)
 
     def on_tool_start(self, tool_name: str, detail: str = "",

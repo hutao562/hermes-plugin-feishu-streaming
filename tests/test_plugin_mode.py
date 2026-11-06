@@ -794,3 +794,85 @@ async def test_stale_finalize_edit_updates_card_not_native(adapter) -> None:
     # 非卡片消息 id 的编辑不受影响，仍走原生
     await adapter.edit_message("chat1", "om_plain_text", "x", finalize=True)
     assert adapter.native_edits[-1][1] == "om_plain_text"
+
+
+# ── v0.19.8：无锚通知类 send 不劫持活跃卡（watch/process 注入防线）──
+
+
+@pytest.mark.asyncio
+async def test_anchorless_notice_send_not_hijacks_redirect_card(adapter) -> None:
+    """redirect 刚拆开的新卡（零 draft）上到达无锚通知 send → NOTICE 合并，不当终态.
+
+    2026-11-04 梦珊机 2/2 实测：watch/process 注入直投（无 reply/thread/notify/
+    job_id 全无）命中 send() 完成分支，redirect 新卡 21 秒被劫持完成成通知文本
+    （reply 锚定用户纠正消息、正文却是通知），真回答被迫再开一张卡、前半程纯
+    loading——用户视角即「插入新指令没拆旧卡、新内容编辑进旧卡 + 卡片卡住」。
+    """
+    engine = adapter._engine()
+    engine.on_turn_started("chat1")
+    engine.note_inbound("chat1", "om_orig")
+    engine.on_draft("chat1", "旧答案开头", reply_to="om_orig")
+    await _settle(engine)
+    engine.mark_redirect("chat1", anchor="om_fix")  # 拆①开②：新卡活跃且零 draft
+    await _settle(engine)
+    new_session = engine.active_session("chat1")
+    assert new_session is not None and not new_session.has_draft
+    engine._client.cardkit_close_streaming.reset_mock()
+
+    result = await adapter.send("chat1", "[IMPORTANT] Background process completed",
+                                reply_to=None)  # watch 注入特征：无锚无标记
+
+    # 新卡仍活跃流式——通知只作 NOTICE 并入，未被完成渲染
+    session = engine.active_session("chat1")
+    assert session is not None and not session.is_terminal
+    engine._client.cardkit_close_streaming.assert_not_called()
+    notices = [s for s in session.segment_state.segments if s.type == "notice"]
+    assert len(notices) == 1 and "Background process" in notices[0].text
+    assert result.success is True
+
+
+@pytest.mark.asyncio
+async def test_anchorless_notice_send_with_terminal_card_merges_notice(adapter) -> None:
+    """无活跃卡时通知合并进该 chat 最近一张完成卡（与 bg 交付同语义）."""
+    engine = adapter._engine()
+    engine.on_draft("chat1", "回答", reply_to="om_u1")
+    await _settle(engine)
+    msg_id = await engine.complete("chat1", "回答")
+    assert msg_id == "om_card_msg"
+    engine._client.cardkit_update.reset_mock()
+
+    result = await adapter.send("chat1", "进程 proc_x 已完成", reply_to=None)
+
+    session = engine.session_for("chat1")
+    notices = [s for s in session.segment_state.segments if s.type == "notice"]
+    assert len(notices) == 1 and "proc_x" in notices[0].text
+    engine._client.cardkit_update.assert_called_once()  # 完成卡重渲带 NOTICE
+    assert result.message_id == "om_card_msg"
+
+
+@pytest.mark.asyncio
+async def test_anchorless_notice_send_no_card_falls_back_native(adapter) -> None:
+    """无任何卡片时通知落原生文本（不吞通知）."""
+    result = await adapter.send("chat1", "watch 通知文本", reply_to=None)
+    assert adapter.native_sends[-1][1] == "watch 通知文本"
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_anchorless_final_after_draft_still_completes(adapter) -> None:
+    """自己 draft 过的无锚 final（v0.19.3 无探针通知回合秒回）仍走完成渲染.
+
+    has_draft 判别的另一半：draft→final 间隔短于建卡的秒回回合不能被当成
+    通知合并（否则回答永不出完成卡）。
+    """
+    engine = adapter._engine()
+    engine.on_draft("chat1", "整段秒回的回答")  # 合成入站无 om_ id → 无锚 draft
+    await _settle(engine)
+    session = engine.active_session("chat1")
+    assert session is not None and session.has_draft
+
+    result = await adapter.send("chat1", "整段秒回的回答", reply_to=None)
+
+    assert result.message_id == "om_card_msg"
+    assert engine.session_for("chat1").state == "completed"
+    engine._client.cardkit_close_streaming.assert_called_once()
