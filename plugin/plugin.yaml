@@ -3,7 +3,7 @@ label: Feishu Streaming Cards (CardKit v2)
 kind: platform
 # manifest v2：manifest_version 管文件格式，api_version 管 hermes 插件 API 代际
 manifest_version: 2
-version: 0.19.8
+version: 0.20.0
 description: >-
   Feishu/Lark platform adapter with CardKit v2 draft-streaming cards:
   typewriter streaming, structured tool panel, in-card heartbeat,
@@ -21,7 +21,7 @@ tags:
   - streaming
   - cardkit
 # 插件依赖官方 draft-streaming 契约锚点（plugin/contract.py），0.21.1 为已验证下限
-requires_hermes: ">=0.21.1"
+requires_hermes: ">=0.23.0"
 requires_env:
   - name: FEISHU_APP_ID
     description: Feishu app id (from the Feishu open platform app credentials)

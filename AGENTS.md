@@ -6,6 +6,8 @@ Hermes Gateway **platform 插件**（`plugin/`，`kind: platform`）：子类化
 
 **形态（v0.14.0 收敛）**：本仓库只有这一种形态，不再是可 pip 安装的包——分发物 = `plugin/` 目录拷贝（**自包含**：底层件 vendor 在 `plugin/_vendor/`，运行环境无需安装本包）。旧 AST 注入形态已归档在 git tag `archive/injection-mode`（回滚：checkout 该 tag 按当时 README 操作）。
 
+**部署路径（v0.20.0 起按官方覆盖规范）**：装到 `~/.hermes/plugins/platforms/feishu/`——manifest key（路径派生 `platforms/feishu`）与 bundled feishu-platform 插件一致，discovery 做 user-covers-bundled 单赢家裁决。hermes 0.22.5 起 bundled 平台改插件形态 lazy 注册，旧平铺目录（`plugins/feishu-streaming[-platform]`）与本插件同名 claim 平台会撞注册竞态（boot sweep 时序随机，lazy 后写可反向覆盖本插件——2026-11-07 梦珊机实证内置赢后卡片功能静默失效，特征：feishu 连接行 logger 是 `hermes_plugins.platforms__feishu` 而非 `plugins.platforms.feishu`；另有一个概率型 sweep 竞态：import 链早期 sweep 在 config 未加载时跑完会缓存空注册表 `_discovered=True`，之后 boot 全部插件不加载）。`hermes plugins install/update` 只装平铺 name 目录（manifest name 禁斜杠）——跨机分发后手动落位 `platforms/feishu`；doctor 认覆盖路径优先、平铺路径提示迁移。
+
 **锚点**：draft 帧 metadata 的 `reply_to_message_id`（transport `_draft_metadata()` 注入）→ 卡片 reply 用户消息；无锚直发 chat（chat_id 做 reply 目标会 230001）。**sequence**：cardkit close/update 必须各自独立 +1（同号 300317），所有卡片 API 经会话级 `card_op_lock` 串行化取号——complete/seal/notice 与在飞 flush 并发各自 +1 会共享基号，后落地者 300317 且卡片永久停留 loading（2026-10-17 两次实测，v0.19.2 修）。**短回答**：transport `_MIN_NEW_MSG_CHARS=4` 吞帧 + finalize 时 draft 让位真发 → send() 无会话兜底现场开卡即完成。诊断日志 grep `[feishu-streaming]`（插件 logger 不进 gateway.log，engine logger 走 `gateway.run`）。部署需 `streaming.enabled: true` + `display.platforms.feishu.streaming: true`（transport: auto）。
 
 ## Commands
@@ -23,11 +25,12 @@ $HERMES_PYTHON -m ruff check plugin tests
 $HERMES_PYTHON -m mypy
 
 # 部署（plugin/ 自包含，改完拷贝 + 重启；重启约 50s，会打断进行中回合）
-rm -rf ~/.hermes/plugins/feishu-streaming && cp -R plugin ~/.hermes/plugins/feishu-streaming
+rm -rf ~/.hermes/plugins/platforms/feishu && mkdir -p ~/.hermes/plugins/platforms && \
+  cp -R plugin ~/.hermes/plugins/platforms/feishu
 launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway
 
 # 自检（只读；仓库内运行会额外比对部署目录漂移）
-$HERMES_PYTHON plugin/doctor.py          # 或 python3 ~/.hermes/plugins/feishu-streaming/doctor.py
+$HERMES_PYTHON plugin/doctor.py          # 或 python3 ~/.hermes/plugins/platforms/feishu/doctor.py
 ```
 
 **上游契约检查**：`plugin/contract.py` 是单一定义源，三个通道共用——
@@ -74,7 +77,7 @@ plugin/
 - **busy ack 进心跳行**：`_BUSY_ACK_PREFIXES`（↪⏳⚡⚠️♻️）识别，进卡片末尾状态行，完成卡重渲自然消失；不渲染成卡、不并进完成卡。
 - **卡片体积上限**：飞书 JSON 体积上限 200860 "card over max size"——思考面板头尾摘录（`cap_reasoning_text`）、工具步数流式封顶 15 / 完成卡按元素+字符双预算动态放宽（15–50，`_complete_tool_max_steps`）、单步结果 900+240 截断、回答正文不截。**折叠栏信号**：有失败步骤时标题带 ⚠️ N failed 且转红（不展开可见）；多段工具面板标题带全局步区间（`steps 6–8`，`step_offset` 贯穿 builder/segment_helper/engine，流式更新按段切片防跨段重复渲染）；完成卡面板默认展开由 `streaming.tool_panel_expanded`/`reasoning_panel_expanded` 控制（缺省回退旧键 `panel_expanded`——曾因 engine 漏接全程不生效）。
 - **multiplex / scope 桶**：插件 `register()` 进程级只跑一次；平台注册表按 profile scope 分桶，`_fanout_to_profile_scopes` 把条目补注册到每个 live profile（profile 在自己 config 的 `plugins.disabled` 写 `feishu-streaming-platform` 可退出，fail-open）。**跨 engine 路由（usage/reasoning）依赖 `_ENGINES` 全局表**：`agent.session_id` 是 date_hash 形、不含 chat，usage 路由在「恰好一个 engine 有进行中回合（open_sessions，creating 也算）」时兜底——10-08 晚 fan-out 上线（boot 即建双 engine）到 0.16.1 之间，单 engine 兜底失效 → footer 静默只剩时间（usage 每次调用被丢弃、无日志）。并发流式歧义时放弃，footer 退化为纯时长。**契约面对齐**：同名顶替后 PlatformEntry 必须带内置 feishu 条目的 `is_connected`/`validate_config`/`ensure_deps_fn`/`apply_yaml_config_fn`/`setup_fn`——否则 `hermes gateway setup`/`gateway status` 对 feishu 整体回归；实现经 `_official_feishu_attr` 延迟解析自官方模块（bundled 是 deferred loader，discover 时未加载；辅助函数与类身份无关，源码路径影子模块安全）。**hook fan-out 全公开面**：`_fanout_hooks_to_profile_scopes` 经 hermes_constants 公开 home override → `get_plugin_manager()`（官方缺席即建+缓存）→ `PluginContext.register_hook`（官方 facade）——**禁止写 hermes 私有字段**（catalog 准入 "no core override" 红线，`hermes plugins validate` 会扫）。每 profile 独立 engine + client（凭据按 profile 作用域绑定 adapter 实例的 lark client；`_LazyClient` 回退经 `_scoped_env`→`get_scoped_secret`，multiplex 下绝不裸读 os.environ）。诊断特征：gateway.log 每 boot 只 1 行 `adapter factory`（family 装配段被 hermes 压制属正常，fan-out 以 `_diag_log` 落盘为准）。
-- **官方验收**：`hermes plugins validate ~/.hermes/plugins/feishu-streaming` 必须全绿（安全扫描禁 `rm -rf` 字样进代码文案；"no core override" 禁私有字段写入；plugin.yaml 为 manifest v2，`requires_hermes` 必须真实）。改动 plugin/ 后提交前跑一次。
+- **官方验收**：`hermes plugins validate ~/.hermes/plugins/platforms/feishu` 必须全绿（安全扫描禁 `rm -rf` 字样进代码文案；"no core override" 禁私有字段写入；plugin.yaml 为 manifest v2，`requires_hermes` 必须真实）。改动 plugin/ 后提交前跑一次。
 - **诊断黑洞**：`hermes_lark_streaming.plugin` logger 不进 gateway.log（hermes logging 配置）；诊断日志统一 `logging.getLogger("gateway.run").info("[feishu-streaming] ...")`；register() 期 hermes logging 未配置，关键生命周期事件走 `_diag_log` 落 `~/.hermes/logs/feishu-streaming-plugin.log`。
 - **live 运行时**：`ps aux | grep gateway run` → shim 进程，真源码在 `~/.hermes/installs/*/environments/*/venv` 的 editable 指向 workspace；`~/.hermes/hermes-agent/` 有副本但不被 import。判「包装没装进某 venv」必须看 site-packages，cwd import 会假报警。
 - **测试**：注入形态的单测已随归档移除；streaming 核心单测（cardkit/flush/segments/tooluse/text/config/feishu）测 `plugin._vendor`；插件行为测试在 `test_plugin_mode.py`/`test_plugin_features.py`（`_FakeBaseAdapter` + `_mock_client`，不依赖 hermes 源树）；契约测试 `test_upstream_compat.py`（pinned 样本）；doctor 测试 `test_doctor.py`（tmp HERMES_HOME 树）。

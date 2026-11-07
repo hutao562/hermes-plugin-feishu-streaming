@@ -12,7 +12,7 @@ import pytest
 
 def test_all_pinned_files_match_manifest():
     manifest = json.loads(hermes_sources.MANIFEST_PATH.read_text())
-    assert manifest["version"] == "0.21.1"
+    assert manifest["version"] == "0.23.0"
     assert len(manifest["revision"]) == 40
     assert set(hermes_sources.TREE_FILES) <= manifest["sha256"].keys()
     for relative in manifest["sha256"]:

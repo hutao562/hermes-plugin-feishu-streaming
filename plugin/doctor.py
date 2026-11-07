@@ -281,19 +281,29 @@ def check_cardkit_probe(report: Report, home: Path) -> None:
 
 
 def check_plugin_dir(report: Report, home: Path) -> Path | None:
-    """部署目录定位：手动拷贝名 feishu-streaming（README 部署）或 CLI 安装名
-    feishu-streaming-platform（hermes plugins install/update，manifest 名目录）——
-    后者是跨机分发（梦珊机）的实际形态，两者都认，CLI 名优先（同存时它才是
-    metadata 追踪的生效拷贝）。"""
-    candidates = [home / "plugins" / "feishu-streaming-platform",
+    """部署目录定位（v0.20.0 起按官方覆盖规范）：首选 ``plugins/platforms/feishu``
+    ——user 目录同名覆盖 bundled feishu-platform（manifest key 一致 → discovery
+    单赢家裁决，无运行时注册竞态；hermes 0.22.5 曾因 bundled 插件 lazy 注册晚于
+    本插件 boot 期注册、last-writer-wins 反向覆盖，2026-11-07 梦珊机实证）。
+    兼容认旧平铺目录（feishu-streaming / feishu-streaming-platform），并提示迁移。
+    """
+    override = home / "plugins" / "platforms" / "feishu"
+    candidates = [override,
+                  home / "plugins" / "feishu-streaming-platform",
                   home / "plugins" / "feishu-streaming"]
     plugin_dir = next((p for p in candidates if p.is_dir()), None)
     if plugin_dir is None:
         report.add("插件目录", FAIL,
-                   f"{candidates[1]}（或 CLI 安装名 {candidates[0].name}）不存在",
-                   "按 README 部署：cp -R plugin ~/.hermes/plugins/feishu-streaming，"
-                   "或 hermes plugins install <repo>#plugin --enable")
+                   f"{override}（官方覆盖规范路径）不存在",
+                   "部署：mkdir -p ~/.hermes/plugins/platforms && "
+                   "cp -R plugin ~/.hermes/plugins/platforms/feishu，并重启网关")
         return None
+    if plugin_dir != override:
+        report.add("插件目录: 覆盖形态", WARN,
+                   f"当前为平铺目录 {plugin_dir.name}（存在与 bundled feishu-platform "
+                   "插件的注册竞态，hermes 0.22.5 实证可被反向覆盖）",
+                   "迁移到官方覆盖路径：mkdir -p ~/.hermes/plugins/platforms && "
+                   f"mv {plugin_dir} ~/.hermes/plugins/platforms/feishu，并重启网关")
     manifest = plugin_dir / "plugin.yaml"
     data, err = _load_yaml(manifest) if manifest.is_file() else (None, "plugin.yaml 不存在")
     if data is None:

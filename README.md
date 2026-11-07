@@ -60,23 +60,30 @@ See [INSTALL.md](INSTALL.md) for the full walkthrough:
 
 ```bash
 git clone https://github.com/hutao562/hermes-plugin-feishu-streaming.git
-cp -R hermes-lark-streaming/plugin ~/.hermes/plugins/feishu-streaming
+mkdir -p ~/.hermes/plugins/platforms
+cp -R hermes-lark-streaming/plugin ~/.hermes/plugins/platforms/feishu
 
 # config.yaml: plugins.enabled: [feishu-streaming-platform]
 #             streaming.enabled: true
 #             display.platforms.feishu.streaming: true
 
 hermes gateway restart
-python3 ~/.hermes/plugins/feishu-streaming/doctor.py
+python3 ~/.hermes/plugins/platforms/feishu/doctor.py
 ```
+
+> **为什么装到 `plugins/platforms/feishu/`**（v0.20.0 起）：这是 hermes 官方的
+> 「user 目录同名覆盖 bundled 插件」规范——manifest key 与 bundled
+> `feishu-platform` 插件一致，discovery 做单赢家裁决，杜绝与内置 feishu
+> 插件的运行时注册竞态（hermes 0.22.5 曾发生 lazy 注册反向覆盖本插件）。
+> 平铺旧路径仍被 doctor 兼容识别，但会提示迁移。
 
 ## Doctor (self-check)
 
 A read-only diagnostic script shipped inside the plugin directory — zero install, stdlib only:
 
 ```bash
-python3 ~/.hermes/plugins/feishu-streaming/doctor.py          # human-readable
-python3 ~/.hermes/plugins/feishu-streaming/doctor.py --json   # CI/script friendly
+python3 ~/.hermes/plugins/platforms/feishu/doctor.py          # human-readable
+python3 ~/.hermes/plugins/platforms/feishu/doctor.py --json   # CI/script friendly
 ```
 
 It checks exactly the failure classes this project has historically hit silently:
@@ -130,7 +137,7 @@ cd hermes-lark-streaming && git pull
 rm -rf ~/.hermes/plugins/feishu-streaming
 cp -R plugin ~/.hermes/plugins/feishu-streaming
 hermes gateway restart
-python3 ~/.hermes/plugins/feishu-streaming/doctor.py
+python3 ~/.hermes/plugins/platforms/feishu/doctor.py
 ```
 
 ## Uninstall
