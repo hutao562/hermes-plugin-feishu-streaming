@@ -34,7 +34,7 @@ $HERMES_PYTHON plugin/doctor.py          # 或 python3 ~/.hermes/plugins/platfor
 ```
 
 **上游契约检查**：`plugin/contract.py` 是单一定义源，三个通道共用——
-① `tests/test_upstream_compat.py` 对 pinned revision 回归；② 每日 hermes-check.yml 对上游 main 检查（失败自动开 hermes-compat issue）；③ doctor 对本机 hermes 验证。上游改 draft 契约时：核对语义 → 改 `plugin/adapter.py` → 同步锚点清单 + `tests/hermes_sources.json` revision。
+① `tests/test_upstream_compat.py` 对 pinned revision 回归；② 每日对上游 main 检查（**2026-11-11 起 hermes-check.yml 工作流已禁用**——其 sparse-checkout 只检出 gateway/、锚点扩清单后自 10-10 天天误报，现由本地自动化承担：锚点核查 + 语义级 diff + 记录 `docs/upstream-watch.md`；重启前须先修 sparse-checkout 补 `cron`/`plugins/platforms/feishu`/`tools` 路径）；③ doctor 对本机 hermes 验证。上游改 draft 契约时：核对语义 → 改 `plugin/adapter.py` → 同步锚点清单 + `tests/hermes_sources.json` revision。
 
 ## Architecture
 
