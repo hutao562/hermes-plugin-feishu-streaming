@@ -21,6 +21,7 @@
     "agent/stream_delivery.py": "acdc41c213db188a8452cd7866f12bf8880096e02b0c71612598fcf9b9d3b8b8",
     "LICENSE": "821556e6336796450ab852d375117b48a4887e71d255794fd6318d99982a5ab6",
     "gateway/run_startup.py": "ab836c1a752b84b008c3826d32304ec4537839900e0b7cd2a76eee34b970e70e",
-    "plugins/platforms/feishu/adapter.py": "47c1ddd2c9dd5257e6e225d46b1e16c571184baee79429727b4f0163e3d219f2"
+    "plugins/platforms/feishu/adapter.py": "47c1ddd2c9dd5257e6e225d46b1e16c571184baee79429727b4f0163e3d219f2",
+    "tools/clarify_gateway.py": "7052ea9832fc93e40146fb1226753fd1bd5618943cf437d822a2821840fba26c"
   }
 }

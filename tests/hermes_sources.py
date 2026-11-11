@@ -33,6 +33,8 @@ TREE_FILES = (
     # 插件直接父类（2026-11-02 补：官方 FeishuAdapter 覆写面签名——此前每日
     # 检查对此文件是盲的，ccc6956 改 704 行只靠人工核查）
     "plugins/platforms/feishu/adapter.py",
+    # clarify 交互依赖（2026-11-11 补：插件 _clarify 的回调入口面）
+    "tools/clarify_gateway.py",
 )
 
 

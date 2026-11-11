@@ -72,6 +72,22 @@ CONTRACT_ANCHORS: dict[str, tuple[tuple[str, str], ...]] = {
         ("def _resolve_source_chat_type(", "chat_type 解析（event_chat_type 传 raw_type 的对端）"),
         ("_feishu_send_with_retry", "text 兜底直发通道（clarify/降级路径）"),
     ),
+    # clarify 交互依赖面（2026-11-11 补锚：本文件第二次在无锚状态下变动——
+    # 11-06 SAME、a55a299 +26/−15（authority 字段 + 超时默认 3600→90s）——
+    # 插件 _clarify 的按钮回调与「其他」转文本全走此模块。四针在 pinned
+    # （2bd378e / 0.23.0）与上游 main（a55a299）双版核对在场。
+    # attempt_text_response 太新（a55a299 窗口才拆出）不锚。
+    "tools/clarify_gateway.py": (
+        ("def resolve_gateway_clarify(clarify_id: str, response: str) -> bool",
+         "网关侧解 clarify（插件按钮回调的落点；id+response 口径可变，签名不可变）"),
+        ("def mark_awaiting_text(clarify_id: str) -> bool",
+         "「其他」按钮转文本捕获（插件 clarify other 分支依赖）"),
+        ("def resolve_clarify_timeout(config: dict) -> int",
+         "clarify 过期时长解析（插件过期反馈分支依赖；上游 11-11 起默认 90s，"
+         "产品需长窗口在 hermes config 设 agent.clarify_timeout）"),
+        ("def get_pending(clarify_id: str)",
+         "按 id 取挂起 clarify 条目（engine/adapter 过期反馈判定的查询面）"),
+    ),
 }
 
 # ── 平台启用面（2026-10-22 上游一线引入；2026-11-02 升级事故后锚定）──

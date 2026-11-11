@@ -97,3 +97,5 @@
 - 影响面：①clarify 卡按钮 90s 过期（升级后点旧按钮走插件「已过期」反馈分支，此前 1h 窗口）——最直接的体感变化；②authority 语义不对称：上游文本路径会拒答非授权者，插件按钮路径不拒（非发起人点击仍可解 clarify）——是否对齐由用户定；③cron 卡/流式卡/bg 通知面无接口变化
 - 建议处理方案：总判定同 2026-10-18 条目；升级回归清单追加——①clarify 全流程实测（90s 内点击有效、超时后过期反馈正确；产品上若需长窗口，hermes config 设 `agent.clarify_timeout`）②评估 authority 拒答是否要覆盖插件按钮路径（上游语义=发起人+approver+admin）③重复投递回归（ambiguous 仲裁上线后）。**补锚重申**：`tools/clarify_gateway.py` 已两次在无锚状态下变动（11-06 SAME、本次 +26/−15），强烈建议下个锚点窗口补锚（resolve_gateway_clarify/mark_awaiting_text/attempt_text_response/resolve_clarify_timeout 四针）。
 - 关联：hermes-compat issue 0 open；本地 v0.20.0（f2da601，hermes 0.23.0 适配）在案。
+
+- 追记（同日，用户批准执行 11-11 条目的补锚建议）：`tools/clarify_gateway.py` 已补锚——`CONTRACT_ANCHORS` 四针（resolve_gateway_clarify / mark_awaiting_text / resolve_clarify_timeout / get_pending 签名，均在 pinned 2bd378e 与上游 main a55a299 双版核对）+ `TREE_FILES`/manifest 同 revision 扩清单（sha 7052ea98…，样本自动下载验证）；`attempt_text_response` 太新（a55a299 窗口才拆出）刻意不锚。pytest 契约回归 12 通过、ruff/mypy 全绿、`hermes plugins validate` passed。至此 2026-10-18 盲区清单（父类覆写面 11-02 已锚、env 桥 11-02 已锚、clarify_gateway 本次）全部闭合。待办仅剩：authority 是否覆盖插件按钮路径（产品决策）、部署/版本号随下次发版。
