@@ -82,3 +82,18 @@
   4. 其余均为上游内部演进：静默标记、held-row、room 投递、审批 user_id 透传——插件消费面无接口变化。
 - 建议处理方案：总判定同 2026-10-18 条目（升级实测流程）；升级回归清单追加三项——①clarify 内联单选实测（按钮点击 → 插件 handler 仍独占）②文本回答解 clarify 后插件按钮卡是否残留（retire no-op 的 UX 影响评估，可在插件 send_clarify 时顺手注册上游 `_clarify_state` 消除）③点击已解 clarify 卡旧按钮的过期反馈是否正常。锚点面无需改动（全绿）；`tools/clarify_gateway.py` 补锚（11-02 遗留）仍待窗口。
 - 关联：hermes-compat issue #118 已于 2026-11-02 关闭（用户操作，与升级事故同日）。
+
+## 2026-11-11 上游 a55a299（基线 2237be3，较前已验证 a3defaf 全窗 11-08~11-11 三天）
+
+- 状态：锚点全绿（missing=0，父类八针 + OPTIONAL env 桥均绿）；疑似影响——clarify 交互语义变化 + 发送不确定仲裁机制上线，插件 import 面与覆写面无破坏
+- 巡检备注：11-08~11-10 三天调度未产出执行（任务本身 active、runCount 15、lastRun 11-08 09:03——为宿主侧计算排队堆积，与 10-23~11-05 同因，非仓库/网络问题）；本条覆盖三天窗口。当日执行本身也多磨：raw CDN 并发 429、zsh 数组/目录事故，最终 gh api 全量串行重取定案
+- 上游改动（23 关注文件 19 变 / 4 未变，按主题归纳）：
+  1. **clarify 交互语义（对插件最直接）**：`tools/clarify_gateway.py` +26/−15——`agent.clarify_timeout` 默认 **3600→90 秒**（`resolve_clarify_timeout`，`get("clarify_timeout", 90)`）；`_ClarifyEntry` 新增 `authority` 字段（默认=当前回合 actor+approvers+admins，`prompt_authority()`）；`run_inbound.py` +130/−26 新增 `_refused_clarify`/`_refused_slash_confirm`/`_hm_update_reply_refused`（谁有资格以**文本消息**回答 prompt 的拒答层）+ clarify 撤回重构为 `_withdraw_clarify`。插件兼容性：`resolve_gateway_clarify(id, response)` / `mark_awaiting_text(id)` 签名未变，按钮点击路径不经 authority 拒答（拒答层只管 inbound 文本）——插件 clarify 全链路可继续工作，但**按钮卡有效期变 90s**
+  2. **发送不确定仲裁**：`stream_consumer_transport.py` +56/−11、`stream_consumer_fallback.py` +123/−41、`stream_consumer.py` +21/−7、`stream_consumer_fences.py` +11（`_uncertain_send_fully_shown` 异步化取代 `_send_failure_may_have_delivered`、`_preview_uncertain`/`_delivery_uncertain` 状态、fresh-final 超时不再盲目重投、`raw_response["delivery_uncertain"]` 标记、`open_code_fence_span` 显示侧围栏）——全部在 edit/native 兜底机械内，**draft 帧路径未动**（probe/_draft_metadata/_MIN_NEW 锚点原样）；对插件净效果=插件 send() 抛异常时上游「宁可不发不重发」，重复投递风险下降
+  3. stale-finalize 响应契约小改：`run_turn.py` 中 `response["already_sent"]` 旁新增可选 `response["delivery_uncertain"]`——插件 `edit_message(finalize=True)` 拦截返回成功即可，新键取 getattr 默认 False，无需适配
+  4. 父类 `plugins/platforms/feishu/adapter.py` +81/−77：send() 分块发送重构（`_send_one` 抽取 + 首个被拒 chunk 即停并标 partial）、`CallBackToast` 进卡片回调响应类型、审批 refusal 引入（`gateway.approval_actor`）——插件全量覆写 send() 不经父类分块体；`_card_response(card_data=)` 签名未变；八针锚点全绿
+  5. `platform_registry.py` +33/−4：`deps_resolved_off_loop`（ensure_deps 离线结果缓存）+ `platform_hint_tool_notes` 字段——additive；同名顶替/last-writer-wins 语义未动（OPTIONAL 锚绿）
+  6. 其余：`cron/scheduler_delivery.py` +55/−9（Telegram 命名 DM 话题解析、媒体超时按体积放宽——**CRON_WRAP 信封未动**）；`cron/scheduler.py` ±（sys.path append 防遮蔽已装包）；`run_busy`/`run_turn_runner`/`run_notifications`/`run_startup`/`run.py`/`think_scrubber` seam 零命中；`response_filters`/`stream_delivery`/`api_request_hooks`/`interrupt_control`/`gateway_env` 未变
+- 影响面：①clarify 卡按钮 90s 过期（升级后点旧按钮走插件「已过期」反馈分支，此前 1h 窗口）——最直接的体感变化；②authority 语义不对称：上游文本路径会拒答非授权者，插件按钮路径不拒（非发起人点击仍可解 clarify）——是否对齐由用户定；③cron 卡/流式卡/bg 通知面无接口变化
+- 建议处理方案：总判定同 2026-10-18 条目；升级回归清单追加——①clarify 全流程实测（90s 内点击有效、超时后过期反馈正确；产品上若需长窗口，hermes config 设 `agent.clarify_timeout`）②评估 authority 拒答是否要覆盖插件按钮路径（上游语义=发起人+approver+admin）③重复投递回归（ambiguous 仲裁上线后）。**补锚重申**：`tools/clarify_gateway.py` 已两次在无锚状态下变动（11-06 SAME、本次 +26/−15），强烈建议下个锚点窗口补锚（resolve_gateway_clarify/mark_awaiting_text/attempt_text_response/resolve_clarify_timeout 四针）。
+- 关联：hermes-compat issue 0 open；本地 v0.20.0（f2da601，hermes 0.23.0 适配）在案。
