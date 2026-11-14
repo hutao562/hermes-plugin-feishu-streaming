@@ -267,11 +267,17 @@ async def test_adapter_send_draft_feeds_engine(adapter) -> None:
 
 @pytest.mark.asyncio
 async def test_format_tool_event_eats_line_and_records(adapter) -> None:
-    chunk = SimpleNamespace(tool_name="web_search", preview="query", args={"q": "hermes"})
+    try:
+        from gateway.stream_events import ToolCallChunk
+        chunk = ToolCallChunk(tool_name="web_search", preview="query",
+                              args={"q": "hermes"})
+    except ImportError:
+        chunk = SimpleNamespace(tool_name="web_search", preview="query",
+                                args={"q": "hermes"})
+    # Gateway 调用顺序：回合探针先给 adapter 建立精确路由锚，再接收工具事件。
+    assert adapter.supports_draft_streaming(chat_id="chat1") is True
     assert adapter.format_tool_event(chunk, mode="all") is None
-    adapter._engine().on_draft("chat1", "searching")
     await _settle(adapter._engine())
-    adapter._engine().on_tool_start("web_search", "query")
     steps = adapter._engine().session_for("chat1").tool_tracker.build_display_steps()
     assert steps and steps[0]["name"] == "web_search"
 

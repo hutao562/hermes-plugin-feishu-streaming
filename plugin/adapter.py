@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Any, cast
 
@@ -44,6 +45,8 @@ _logger = logging.getLogger("hermes_lark_streaming.plugin")
 # 不渲染成卡、不并进完成卡（gateway.progress.* / gateway lifecycle locale）
 _BUSY_ACK_PREFIXES = ("↪", "⏳", "⚡", "⚠️", "♻️")
 _draft_log_state: dict[int, int] = {}
+_tool_route: ContextVar[tuple[Any, str, str | None] | None] = ContextVar(
+    "feishu_streaming_tool_route", default=None)
 
 # cron 结果 wrap 信封（cron.wrap_response）——常量与锚点 needle 同源于
 # plugin/contract.py（上游改文案 → 每日 hermes-check 锚点报警）；解析范式同
@@ -136,6 +139,7 @@ class StreamingFeishuMixin:
             # 话题回合：metadata 带 thread_id（hermes dm:oc_x:omt_y 会话键）——
             # 卡片会话必须同粒度隔离，否则话题与主聊互相串写
             thread = (metadata or {}).get("thread_id")
+            _tool_route.set((self._engine(), chat_id, thread))
             self._engine().on_turn_started(chat_id, thread_id=thread)
             # 当回合锚（format_tool_event 落在本 adapter 上但事件本身不带 chat）
             self._turn_anchor = (chat_id, thread)
@@ -149,6 +153,7 @@ class StreamingFeishuMixin:
                 "[feishu-streaming] draft chat=%s len=%d", chat_id[:12], len(content))
         reply_to = (metadata or {}).get("reply_to_message_id")
         thread = (metadata or {}).get("thread_id")
+        _tool_route.set((self._engine(), chat_id, thread))
         self._turn_anchor = (chat_id, thread)
         self._engine().on_draft(chat_id, content, reply_to=reply_to,
                                 thread_id=thread)
@@ -166,8 +171,9 @@ class StreamingFeishuMixin:
             first_val = next(iter(event.args.values()))
             if not detail and first_val is not None:
                 detail = str(first_val)
-        self._engine().on_tool_start(event.tool_name, detail[:200],
-                                     anchor=getattr(self, "_turn_anchor", None))
+        route = _tool_route.get()
+        anchor = (route[1], route[2]) if route and route[0] is self._engine() else None
+        self._engine().on_tool_start(event.tool_name, detail[:200], anchor=anchor)
         return None
 
     # ── 出站拦截 ──
@@ -181,6 +187,15 @@ class StreamingFeishuMixin:
         interim = bool((metadata or {}).get("_interim_send"))
         thread_id = (metadata or {}).get("thread_id")
         session = engine.active_session(chat_id, thread_id)
+        background_topic = (
+            not interim
+            and bool(thread_id)
+            and reply_to is None
+            and not (metadata or {}).get("reply_to_message_id")
+            and not (metadata or {}).get("notify")
+            and bool(content.strip())
+            and not content.lstrip().startswith(_BUSY_ACK_PREFIXES)
+        )
 
         if interim and session is not None:
             # 心跳/进度 → 卡片末尾状态行（不产生真消息）
@@ -188,21 +203,49 @@ class StreamingFeishuMixin:
             return _compat.send_result(success=True,
                                        message_id=f"lark-card:{session.card_msg_id}")
 
-        card_session = engine.latest_session_for_chat(chat_id)  # 含终态 + 任意 thread（bg 通知常在主回合完成后到达）
-        if (not interim and card_session is not None and card_session.card_id
-                and content.strip()
-                and not content.lstrip().startswith(_BUSY_ACK_PREFIXES)
-                and not (metadata or {}).get("notify")
-                and (metadata or {}).get("thread_id")):
+        turn_anchor = (session.turn_inbound or session.reply_to) if session is not None else None
+        progress_send = (
+            not interim
+            and session is not None
+            and session.state in ("creating", "streaming")
+            and not session.has_draft
+            and not background_topic
+            and bool(reply_to or thread_id)
+            and bool(turn_anchor and str(turn_anchor).startswith("om_"))
+            and bool(session.tool_tracker.build_display_steps())
+            and not (metadata or {}).get("notify")
+            and not (metadata or {}).get("job_id")
+            and bool(content.strip())
+            and not content.lstrip().startswith(_BUSY_ACK_PREFIXES)
+        )
+        if progress_send:
+            assert session is not None
+            # Some Hermes progress paths call adapter.send() without the
+            # ``_interim_send`` marker. A real gateway final is notify=True;
+            # before the first answer draft, an unmarked send is tool/status
+            # progress and must not seal the live card.
+            engine.on_heartbeat(chat_id, content, thread_id=thread_id)
+            return _compat.send_result(
+                success=True,
+                message_id=(f"lark-card:{session.card_msg_id}"
+                            if session.card_msg_id else None))
+
+        card_session = engine.delivery_session(chat_id, thread_id, reply_to)
+        if background_topic and card_session is not None and card_session.card_id:
             # background 回合交付 / watcher 通知（特征：无 notify 标记 + thread
             # metadata，与普通 final 的 _mark_notify_metadata 相区分）→ 追加进
-            # 该 chat 最近一张卡（跨回合合并；thread_id 是来源标记，合并目标是
-            # 最新卡），不再散落纯文本。
+            # Only the explicit topic (or a uniquely known legacy message anchor)
+            # may receive a background completion, including after turn completion.
             card_msg_id = await engine.append_notice(chat_id, content,
                                                      thread_id=card_session.thread_id)
             if card_msg_id is not None:
                 return _compat.send_result(success=True, message_id=card_msg_id)
-            # 无可用卡片 → 落回原生文本（append_notice 已带 thread）
+        if background_topic:
+            # A background delivery must never complete an unrelated active turn.
+            # Preserve the original thread metadata and let Feishu deliver natively
+            # when no verified card exists (or the card update failed).
+            return await super().send(chat_id, content, reply_to=reply_to,  # type: ignore[misc]
+                                      metadata=metadata, **kwargs)
 
         if (session is not None and session.state in ("creating", "streaming") and not interim
                 and content and len(content) <= 200
@@ -294,10 +337,11 @@ class StreamingFeishuMixin:
         if message_id.startswith("lark-card:"):
             card_msg_id = message_id.split(":", 1)[1]
             for session in self._engine()._sessions.values():
-                if session.card_msg_id == card_msg_id:
+                if session.chat_id == chat_id and session.card_msg_id == card_msg_id:
                     self._engine().on_heartbeat(session.chat_id, content,
                                                 thread_id=session.thread_id)
                     return _compat.send_result(success=True, message_id=message_id)
+            return _compat.send_result(success=False, error="Unknown card status route")
         if (finalize and message_id and not message_id.startswith("lark-card:")
                 and str(content or "").strip()):
             # stale-finalize / transformed-final 的编辑目标是我们返回的卡片消息
@@ -307,7 +351,8 @@ class StreamingFeishuMixin:
             # already_sent 不再补发；失败落回官方 edit（行为同旧版）。
             engine = self._engine()
             card_session = engine.session_by_card_msg_id(message_id)
-            if card_session is not None and await engine.reconcile_card(card_session, content):
+            if (card_session is not None and card_session.chat_id == chat_id
+                    and await engine.reconcile_card(card_session, content)):
                 return _compat.send_result(success=True, message_id=message_id)
         return await super().edit_message(chat_id, message_id, content,  # type: ignore[misc]
                                           finalize=finalize, **kwargs)
@@ -329,7 +374,10 @@ class StreamingFeishuMixin:
         chat_id = getattr(getattr(event, "source", None), "chat_id", "") or ""
         # 入站登记：followup 拆卡门槛的数据源（drain 消息在 drain 开始时也触发）
         if msg_id != "?" and chat_id:
-            self._engine().note_inbound(chat_id, str(msg_id))
+            source = event.source
+            thread = getattr(source, "thread_id", None)
+            self._engine().note_inbound(chat_id, str(msg_id), thread_id=thread)
+            _tool_route.set((self._engine(), chat_id, thread))
         logging.getLogger("gateway.run").info(
             "[feishu-streaming] processing_start msg=%s typing_badge=%s",
             msg_id[:16],
@@ -493,9 +541,20 @@ class StreamingFeishuMixin:
         target = str(action_value.get("target") or "").strip()
         open_id = str(getattr(getattr(event, "operator", None), "open_id", "") or "")
         chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
+        opened_message_id = str(getattr(getattr(event, "context", None),
+                                        "open_message_id", "") or "")
         token = str(getattr(event, "token", "") or "")
         if not open_id or not chat_id or (action_kind in ("switch", "toggle") and not target):
             return self._card_response()  # type: ignore[attr-defined]
+        # A topic is derived only from the actual card message the user clicked.
+        # Action values are client-controlled; never accept a supplied thread_id.
+        route = self._resolve_model_card_route(chat_id, opened_message_id)
+        if route is None:
+            logging.getLogger("gateway.run").warning(
+                "[feishu-streaming] model action has no known card route: chat=%s msg=%s",
+                chat_id[:12], opened_message_id[:16])
+            return self._card_response()  # type: ignore[attr-defined]
+        _, thread_id, source_message_id = route
         # 官方同款 token 去重：防双击重复派发
         if token and self._is_card_action_duplicate(token):  # type: ignore[attr-defined]
             return self._card_response()  # type: ignore[attr-defined]
@@ -507,7 +566,8 @@ class StreamingFeishuMixin:
         if action_kind == "pick":
             submitted = self._submit_on_loop(  # type: ignore[attr-defined]
                 self._loop,  # type: ignore[attr-defined]
-                self._send_model_picker(chat_id=chat_id))
+                self._send_model_picker(chat_id=chat_id, thread_id=thread_id,
+                                        reply_to_message_id=source_message_id))
             logging.getLogger("gateway.run").info(
                 "[feishu-streaming] model picker requested: chat=%s submitted=%s",
                 chat_id[:12], submitted)
@@ -516,7 +576,8 @@ class StreamingFeishuMixin:
         if action_kind == "admin":
             submitted = self._submit_on_loop(  # type: ignore[attr-defined]
                 self._loop,  # type: ignore[attr-defined]
-                self._send_model_admin_card(chat_id=chat_id))
+                self._send_model_admin_card(chat_id=chat_id, thread_id=thread_id,
+                                            reply_to_message_id=source_message_id))
             logging.getLogger("gateway.run").info(
                 "[feishu-streaming] model admin requested: chat=%s submitted=%s",
                 chat_id[:12], submitted)
@@ -540,7 +601,8 @@ class StreamingFeishuMixin:
             submitted = self._submit_on_loop(  # type: ignore[attr-defined]
                 self._loop,  # type: ignore[attr-defined]
                 self._dispatch_model_switch(chat_id=chat_id, open_id=open_id,
-                                            target=target, raw=data, message_id=token))
+                                            target=target, raw=data, message_id=token,
+                                            thread_id=thread_id))
             logging.getLogger("gateway.run").info(
                 "[feishu-streaming] model switch click: target=%s chat=%s submitted=%s",
                 target, chat_id[:12], submitted)
@@ -549,17 +611,63 @@ class StreamingFeishuMixin:
                 card_data=build_model_switch_ack_card(target))
         return self._card_response()  # type: ignore[attr-defined]
 
-    async def _send_model_picker(self, chat_id: str) -> None:
+    def _resolve_model_card_route(self, chat_id: str, message_id: str
+                                   ) -> tuple[str, str | None, str] | None:
+        """Resolve a clicked model card to its verified chat/topic source.
+
+        Streaming cards are looked up in the engine. Plugin-created picker cards
+        are kept in a small per-adapter map because they are ordinary Feishu
+        messages and do not have ChatCardEngine sessions.
+        """
+        if not message_id:
+            # Older callback payloads may omit open_message_id. Preserve their
+            # main-chat behavior only when this adapter has no topic session for
+            # that chat; an ambiguous/missing id must never select a topic.
+            sessions = getattr(self._engine(), "_sessions", {}).values()  # type: ignore[attr-defined]
+            if any(s.chat_id == chat_id and s.thread_id for s in sessions):
+                return None
+            return chat_id, None, ""
+        routes = cast(dict[str, tuple[str, str | None, str]],
+                      getattr(self, "_model_card_routes", {}))
+        route = routes.get(message_id)
+        if route:
+            if route[0] == chat_id:
+                return route
+            return None
+        session = self._engine().session_by_card_msg_id(message_id)  # type: ignore[attr-defined]
+        if session is None or session.chat_id != chat_id:
+            return None
+        return chat_id, session.thread_id, message_id
+
+    def _remember_model_card_route(self, message_id: str, chat_id: str,
+                                   thread_id: str | None,
+                                   source_message_id: str) -> None:
+        """Remember only cards actually sent by this adapter; bound memory per profile."""
+        if not message_id:
+            return
+        routes = getattr(self, "_model_card_routes", None)
+        if routes is None:
+            routes = {}
+            self._model_card_routes = routes  # type: ignore[attr-defined]
+        routes[message_id] = (chat_id, thread_id, source_message_id)
+        while len(routes) > 512:
+            routes.pop(next(iter(routes)))
+
+    async def _send_model_picker(self, chat_id: str, thread_id: str | None = None,
+                                 reply_to_message_id: str | None = None) -> None:
         data = self._engine().model_picker_data(chat_id)  # type: ignore[attr-defined]
         if not data:
             logging.getLogger("gateway.run").warning(
                 "[feishu-streaming] model picker unavailable (cycle <2)")
             return
         card = build_model_picker_card(data["current"], data["models"])
-        await self._engine()._client.send_card_to_chat(  # type: ignore[attr-defined]
-            chat_id, card)
+        message_id = await self._engine()._client.send_card_to_chat(  # type: ignore[attr-defined]
+            chat_id, card, reply_to_message_id=reply_to_message_id)
+        self._remember_model_card_route(message_id, chat_id, thread_id,
+                                        reply_to_message_id or message_id)
 
-    async def _send_model_admin_card(self, chat_id: str) -> None:
+    async def _send_model_admin_card(self, chat_id: str, thread_id: str | None = None,
+                                     reply_to_message_id: str | None = None) -> None:
         """补发常用模型管理卡（⚙ 入口）；候选池获取失败回退选择卡."""
         engine = self._engine()  # type: ignore[attr-defined]
         data = engine.model_picker_data(chat_id) or {"current": "", "models": []}
@@ -568,12 +676,18 @@ class StreamingFeishuMixin:
             # 候选池拿不到（hermes provider 目录异常）——选择卡可用性不受影响
             logging.getLogger("gateway.run").warning(
                 "[feishu-streaming] model admin candidates empty, fallback to picker")
-            await engine._client.send_card_to_chat(
-                chat_id, build_model_picker_card(data["current"], data["models"]))
+            message_id = await engine._client.send_card_to_chat(
+                chat_id, build_model_picker_card(data["current"], data["models"]),
+                reply_to_message_id=reply_to_message_id)
+            self._remember_model_card_route(message_id, chat_id, thread_id,
+                                            reply_to_message_id or message_id)
             return
-        await engine._client.send_card_to_chat(
+        message_id = await engine._client.send_card_to_chat(
             chat_id, build_model_admin_card(
-                data["current"], engine._load_model_favorites(), providers))
+                data["current"], engine._load_model_favorites(), providers),
+            reply_to_message_id=reply_to_message_id)
+        self._remember_model_card_route(message_id, chat_id, thread_id,
+                                        reply_to_message_id or message_id)
 
     def _rebuild_admin_card(self, chat_id: str, favorites: list[str],
                             notice: str) -> dict[str, Any]:
@@ -584,7 +698,8 @@ class StreamingFeishuMixin:
         return build_model_admin_card(current, favorites, providers, notice=notice)
 
     async def _dispatch_model_switch(self, *, chat_id: str, open_id: str,
-                                     target: str, raw: Any, message_id: str) -> None:
+                                     target: str, raw: Any, message_id: str,
+                                     thread_id: str | None = None) -> None:
         from types import SimpleNamespace
 
         try:
@@ -604,14 +719,45 @@ class StreamingFeishuMixin:
         except Exception:
             chat_info = {}
         chat_type = str((chat_info or {}).get("raw_type") or "") or "p2p"
-        await self._dispatch_synthetic_event(  # type: ignore[attr-defined]
-            text=f"/model {target}",
+        # Preserve the upstream path unchanged for main-chat cards (including its
+        # ordinary DM/group behavior). Only topic callbacks need the guarded event
+        # construction below because upstream hardcodes source.thread_id=None.
+        if thread_id is None:
+            await self._dispatch_synthetic_event(  # type: ignore[attr-defined]
+                text=f"/model {target}",
+                chat_id=chat_id,
+                sender_id=SimpleNamespace(open_id=open_id, user_id=None, union_id=None),
+                event_chat_type=chat_type, raw_message=raw,
+                message_id=message_id or str(uuid.uuid4()),
+                **kwargs,
+            )
+            return
+        # Keep the official synthetic event pipeline (sender resolution, source
+        # construction, channel prompt, and guards), while supplying the verified
+        # topic from the clicked card. The official dispatcher hardcodes None.
+        sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+        sender_profile = await self._resolve_sender_profile(sender_id)  # type: ignore[attr-defined]
+        chat_info = await self.get_chat_info(chat_id)  # type: ignore[attr-defined]
+        source = self.build_source(  # type: ignore[attr-defined]
             chat_id=chat_id,
-            sender_id=SimpleNamespace(open_id=open_id, user_id=None, union_id=None),
-            event_chat_type=chat_type, raw_message=raw,
-            message_id=message_id or str(uuid.uuid4()),
-            **kwargs,
+            chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
+            chat_type=self._resolve_source_chat_type(  # type: ignore[attr-defined]
+                chat_info=chat_info, event_chat_type=chat_type),
+            user_id=sender_profile["user_id"],
+            user_name=sender_profile["user_name"],
+            thread_id=thread_id,
+            user_id_alt=sender_profile["user_id_alt"],
         )
+        from gateway.platforms.event import MessageEvent
+
+        synthetic_event = MessageEvent(
+            text=f"/model {target}", message_type=kwargs.get("message_type"),
+            source=source, raw_message=raw,
+            message_id=message_id or str(uuid.uuid4()),
+            channel_prompt=self._resolve_channel_prompt(chat_id),  # type: ignore[attr-defined]
+            timestamp=datetime.now(),
+        )
+        await self._handle_message_with_guards(synthetic_event)  # type: ignore[attr-defined]
 
     async def retire_clarify_card(self, clarify_id: str, notice: Any = None) -> None:
         """官方钩子：clarify 未点击而终结（超时/重置/自由文本取代）时清理状态.
@@ -630,9 +776,10 @@ class StreamingFeishuMixin:
                             file_name: str | None = None, **kwargs: Any) -> Any:
         """文档交付：有卡片时上传后 reply 到卡片消息下方（飞书卡片无 file 组件）."""
         engine = self._engine()
-        # 文档锚：该 chat 任意 thread 的会话都算，取最近创建那张（latest 语义
-        # 与 bg 合并一致——插入序第一张在主聊+话题并存时会挂到旧卡）
-        latest = engine.latest_session_for_chat(chat_id)
+        metadata = kwargs.get("metadata") or {}
+        latest = engine.delivery_session(
+            chat_id, metadata.get("thread_id"),
+            kwargs.get("reply_to") or metadata.get("reply_to_message_id"))
         card_msg_id = latest.card_msg_id if latest else None
         if card_msg_id:
             try:
