@@ -227,7 +227,7 @@ class ChatCardEngine:
                          chat_id[:12], (thread_id or "-")[:16])
         # typing 2s 心跳循环的重复调用：会话健在时静默（此前每 2s 刷一条）
 
-    def note_inbound(self, chat_id: str, message_id: str) -> None:
+    def note_inbound(self, chat_id: str, message_id: str, thread_id: str | None = None) -> None:
         """入站消息登记（adapter.on_processing_start 调用，drain 消息在 drain
         开始时同样触发）——followup 拆卡门槛的数据源：draft 锚只有在里面才
         允许拆卡。工具边界换 consumer 的重锚不是入站消息，不得拆卡
@@ -246,16 +246,17 @@ class ChatCardEngine:
         # 暂存，_ensure_session 建会话时回填；否则 redirect 三锚缺原始锚，draft
         # 锚回摆被误判 followup，只含 reasoning 的卡被 green seal 渲染成
         # 「Done.」占位（v0.16.2 同款老问题复发）。
-        candidates = [s for s in self._sessions.values()
-                      if s.chat_id == chat_id and not s.is_terminal
-                      and s.turn_inbound is None]
-        if candidates:
-            max(candidates, key=lambda s: s.created_at).turn_inbound = message_id
-        elif not any(s.chat_id == chat_id and not s.is_terminal
-                     for s in self._sessions.values()):
+        key = self._skey(chat_id, thread_id)
+        session = self.active_session(chat_id, thread_id)
+        if session is not None and session.turn_inbound is None:
+            session.turn_inbound = message_id
+            if thread_id and session.reply_to is None:
+                session.reply_to = message_id
+                self._maybe_start_card_task(session)
+        elif session is None:
             # 该 chat 无任何活跃会话：消息属于即将开始的回合——暂存待回填
             # （同 chat 新消息覆盖旧暂存；60s 过期防陈锚）
-            self._pending_turn_inbound[chat_id] = (message_id, time.time())
+            self._pending_turn_inbound[key] = (message_id, time.time())
 
     def _inbound_verified(self, chat_id: str, message_id: str | None) -> bool:
         """锚是否为引擎亲眼见过的入站消息."""
@@ -310,6 +311,25 @@ class ChatCardEngine:
 
     def session_for(self, chat_id: str, thread_id: str | None = None) -> ChatSession | None:
         return self._sessions.get(self._skey(chat_id, thread_id))
+
+    def delivery_session(self, chat_id: str, thread_id: str | None = None,
+                         reply_to: str | None = None) -> ChatSession | None:
+        """Resolve an explicit topic or known message anchor, never the latest group card.
+
+        Older background carriers use a message ID as their thread ID. Accept that
+        alias only when it identifies exactly one retained card in this chat.
+        """
+        if thread_id:
+            exact = self.session_for(chat_id, thread_id)
+            if exact is not None:
+                return exact
+        anchor = thread_id or reply_to
+        if anchor:
+            candidates = [s for s in self._sessions.values() if s.chat_id == chat_id
+                          and anchor in ({s.reply_to, s.card_msg_id, s.turn_inbound}
+                                         | s.accepted_anchors)]
+            return candidates[0] if len(candidates) == 1 else None
+        return self.session_for(chat_id)
 
     def active_session(self, chat_id: str, thread_id: str | None = None) -> ChatSession | None:
         """活跃（非终态）会话 — send() 完成路由的判定入口."""
@@ -405,25 +425,28 @@ class ChatCardEngine:
                       anchor: tuple[str, str | None] | None = None) -> None:
         """format_tool_event(ToolCallChunk) 的落点 — 记录步骤并刷新工具面板.
 
-        工具事件可能先于任何 draft（带工具回合的常态）：无会话时也建卡，
-        让工具面板从第一步就滚动在用户眼里。``anchor``=(chat, thread) 是
-        adapter 侧记录的当回合锚（format_tool_event 落在当回合的 adapter 上，
-        adapter 知道自己在服务谁）——并发多会话时按锚路由，杜绝 B 会话的
-        工具名/参数画进 A 会话的卡（2026-10-10 catalog review 指出的串扰）。
+        工具事件可能先于任何 draft（带工具回合的常态），但 adapter 探针先提供
+        当回合锚，因此可写入准确会话。``anchor``=(chat, thread) 是 adapter
+        侧记录的当回合锚；无锚仅在唯一活跃会话时兼容接收。未知锚、零会话或
+        多会话歧义都丢弃，避免创建空 chat 卡或串写其他话题。
         """
-        session = None
         if anchor is not None:
+            # Adapter 的回合锚是唯一可信的工具事件归属。锚过期/目标尚未建好
+            # 时直接丢弃；绝不回落到其他 chat/thread 的活跃卡。
             session = self.active_session(anchor[0], anchor[1])
-        if session is None:
-            session = self._any_active_session()
-        if session is None:
-            # 工具事件先于 typing 的兜底：在事件循环线程上捕获 loop 建""占位
-            # 会话（typing 到达后按 chat 归位）；跨线程无 loop 时丢弃该事件
-            try:
-                self._capture_loop()
-            except RuntimeError:
+            if session is None:
+                _logger.debug("[feishu-streaming] drop tool event for inactive anchor: chat=%s thread=%s",
+                              anchor[0][:12], (anchor[1] or "-")[:16])
                 return
-            session = self._ensure_session("")
+        else:
+            # 兼容没有回合锚的旧调用方，但只在归属唯一时接受。零会话时不能
+            # 用空 chat 建占位卡，多会话时也不能猜测，否则都会污染其他话题。
+            active = [s for s in self._sessions.values() if not s.is_terminal]
+            if len(active) != 1:
+                _logger.debug("[feishu-streaming] drop unanchored tool event: active_sessions=%d",
+                              len(active))
+                return
+            session = active[0]
         session.tool_tracker.record_start(tool_name, detail)
         if session.tool_seg is None:
             session.segment_state.on_tool_event(len(session.tool_tracker.build_display_steps()))
@@ -432,10 +455,17 @@ class ChatCardEngine:
         session.tool_seg.dirty = True
         self._schedule(session)
 
-    def on_tool_end(self, tool_name: str, *, error: str = "", output: str = "") -> None:
-        session = self._any_active_session()
-        if session is None:
-            return
+    def on_tool_end(self, tool_name: str, *, error: str = "", output: str = "",
+                    anchor: tuple[str, str | None] | None = None) -> None:
+        if anchor is not None:
+            session = self.active_session(anchor[0], anchor[1])
+            if session is None:
+                return
+        else:
+            active = [s for s in self._sessions.values() if not s.is_terminal]
+            if len(active) != 1:
+                return
+            session = active[0]
         session.tool_tracker.record_end(tool_name, error=error, output=output)
         if session.tool_seg is not None:
             session.tool_seg.dirty = True
@@ -710,9 +740,13 @@ class ChatCardEngine:
             session = new
             # processing_start 先于 turn_started 到达时暂存的原始锚回填（见
             # note_inbound）——redirect 三锚与 followup 判定依赖它
-            pending = self._pending_turn_inbound.pop(chat_id, None)
+            pending = self._pending_turn_inbound.pop(key, None)
             if pending and new.turn_inbound is None and time.time() - pending[1] < 60.0:
                 new.turn_inbound = pending[0]
+                # processing_start already supplied a real message in this exact topic:
+                # open its loading card before the model emits its first draft.
+                if thread_id:
+                    new.reply_to = pending[0]
         self._maybe_start_card_task(session)
         return session
 

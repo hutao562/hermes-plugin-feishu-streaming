@@ -351,8 +351,10 @@ async def test_final_send_on_anchorless_deferred_topic_session_fails_not_phantom
     engine.on_turn_started("chat1", thread_id="omt_1")
     assert engine.active_session("chat1", "omt_1").card_create_task is None  # 等锚推迟
 
+    # Normal gateway finals are marked notify=True; not every thread-addressed
+    # anchorless send is a background delivery.
     result = await adapter.send("chat1", "答案", reply_to=None,
-                                metadata={"thread_id": "omt_1"})
+                                metadata={"thread_id": "omt_1", "notify": True})
 
     assert engine.session_for("chat1", "omt_1").state == "failed"
     assert result.message_id == "om_native"  # 原生文本兜底
@@ -2060,7 +2062,9 @@ async def test_tool_event_routes_by_turn_anchor(adapter) -> None:
         chunk = ToolCallChunk(tool_name="terminal", preview="ls")
     except ImportError:  # 无 hermes 源树环境：duck-typing 替身
         chunk = SimpleNamespace(tool_name="terminal", preview="ls", args={})
-    adapter._turn_anchor = (chat_b, None)
+    # Set the same per-turn route used by the stream transport. format_tool_event
+    # consumes the context-local route so concurrent tasks cannot overwrite it.
+    assert adapter.supports_draft_streaming(chat_id=chat_b) is True
     adapter.format_tool_event(chunk)
     await _settle(engine)
 

@@ -57,7 +57,7 @@ def hermes_home() -> Path:
 
 def _get_secret(name: str) -> str:
     try:
-        from agent.secret_scope import get_secret  # type: ignore[import-not-found]
+        from agent.secret_scope import get_secret  # type: ignore[import-not-found,import-untyped]
     except ImportError:
         return os.environ.get(name, "")
     return get_secret(name, "") or ""
