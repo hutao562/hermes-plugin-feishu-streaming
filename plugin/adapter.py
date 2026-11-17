@@ -37,6 +37,9 @@ from .contract import CRON_WRAP_DIVIDER, CRON_WRAP_FOOTER_PREFIX, CRON_WRAP_HEAD
 from .engine import ChatCardEngine
 
 _logger = logging.getLogger("hermes_lark_streaming.plugin")
+# 诊断日志统一走 gateway.run（插件 logger 的 info 级不进 gateway.log——
+# 媒体投递成功/回退必须可观测，2026-11-17 自测实证其 info 被丢弃）
+_gw = logging.getLogger("gateway.run")
 
 # busy ack（redirect/queue 确认文本）的前缀特征 — 无官方语义标记时的启发式。
 # 文案来自 hermes locales（gateway.progress.redirected_head / queued_head）。
@@ -677,17 +680,17 @@ class StreamingFeishuMixin:
                 if file_key:
                     name = local_file_name(file_path, file_name)
                     if await client.reply_file_by_id(card_msg_id, file_key, name):
-                        _logger.info(
-                            "plugin media delivered to card: kind=document "
+                        _gw.info(
+                            "[feishu-streaming] media delivered to card: kind=document "
                             "thread=%s card=%s name=%s",
                             (getattr(session, "thread_id", None) or "-")[:16],
                             str(card_msg_id)[:16], name)
                         return _compat.send_result(success=True, message_id=card_msg_id)
             except Exception as e:
-                _logger.warning("plugin doc delivery to card failed: %s", e)
+                _gw.warning("[feishu-streaming] media card delivery failed (document): %s", e)
         fallback_anchor = self._media_reply_anchor(session, reply_to)
-        _logger.info(
-            "plugin media fallback to native: kind=document card=%s caption=%s reply_to=%s",
+        _gw.info(
+            "[feishu-streaming] media fallback to native: kind=document card=%s caption=%s reply_to=%s",
             "yes" if card_msg_id else "no", "yes" if caption else "no",
             str(fallback_anchor)[:16] if fallback_anchor else "-")
         return await super().send_document(chat_id, file_path,  # type: ignore[misc]
@@ -712,17 +715,17 @@ class StreamingFeishuMixin:
                 client = engine.client
                 image_key = await client.upload_image_file(image_path)
                 if image_key and await client.reply_image_by_id(card_msg_id, image_key):
-                    _logger.info(
-                        "plugin media delivered to card: kind=image "
+                    _gw.info(
+                        "[feishu-streaming] media delivered to card: kind=image "
                         "thread=%s card=%s",
                         (getattr(session, "thread_id", None) or "-")[:16],
                         str(card_msg_id)[:16])
                     return _compat.send_result(success=True, message_id=card_msg_id)
             except Exception as e:
-                _logger.warning("plugin image delivery to card failed: %s", e)
+                _gw.warning("[feishu-streaming] media card delivery failed (image): %s", e)
         fallback_anchor = self._media_reply_anchor(session, reply_to)
-        _logger.info(
-            "plugin media fallback to native: kind=image card=%s caption=%s reply_to=%s",
+        _gw.info(
+            "[feishu-streaming] media fallback to native: kind=image card=%s caption=%s reply_to=%s",
             "yes" if card_msg_id else "no", "yes" if caption else "no",
             str(fallback_anchor)[:16] if fallback_anchor else "-")
         return await super().send_image_file(chat_id, image_path,  # type: ignore[misc]
