@@ -437,6 +437,41 @@ async def test_send_image_file_replies_to_thread_card(adapter) -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_image_anchors_to_turn_inbound_when_card_missing(adapter) -> None:
+    """话题卡延迟建卡 + 媒体早于首 draft（模型只回 MEDIA 行）→ reply 到入站消息.
+
+    2026-11-17 16:30 实测：该场景回落官方原生 send_image_file 必 99992402，
+    图片丢失。修复后在无卡时走 vendor reply_image_by_id 锚到回合入站消息，
+    仍落在话题线程内。
+    """
+    engine = adapter._engine()
+    engine.note_inbound("chat1", "om_inbound_1")
+    engine.on_turn_started("chat1", thread_id="omt_1")
+    session = engine.session_for("chat1", "omt_1")
+    assert session is not None and session.card_msg_id is None  # 话题卡尚未建
+
+    result = await adapter.send_image_file(
+        "chat1", "/tmp/photo.jpg", metadata={"thread_id": "omt_1"})
+
+    assert result.success is True and result.message_id == "om_inbound_1"
+    engine.client.reply_image_by_id.assert_awaited_once_with("om_inbound_1", "img_key_1")
+    assert adapter.native_images == [], "不得回落官方原生图片发送（99992402）"
+
+
+@pytest.mark.asyncio
+async def test_close_ghost_creating_marks_failed(adapter) -> None:
+    """卡从未建的 creating 会话在回合正常结束后必须置终态（防幽灵 open session）."""
+    engine = adapter._engine()
+    engine.on_turn_started("chat1", thread_id="omt_1")  # 话题会话：建卡推迟
+    session = engine.session_for("chat1", "omt_1")
+    assert session.state == "creating" and session.card_id is None
+
+    assert engine.close_ghost_creating("chat1", thread_id="omt_1") is True
+    assert session.state == "failed"
+    assert engine.close_ghost_creating("chat1", thread_id="omt_1") is False  # 幂等
+
+
+@pytest.mark.asyncio
 async def test_send_document_fallback_carries_thread_anchor(adapter) -> None:
     """卡片上传失败时官方回退也要带线程内回复锚（不顶层直发）."""
     await _thread_and_main_sessions(adapter)

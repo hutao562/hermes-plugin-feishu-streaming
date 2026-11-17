@@ -357,6 +357,14 @@ class StreamingFeishuMixin:
             if chat_id:
                 await self._engine().abandon(
                     chat_id, thread_id=getattr(source, "thread_id", None))
+        elif getattr(outcome, "name", outcome) == "SUCCESS":
+            # 幽灵会话清理：卡从未建（无 draft/无 final send，如模型只回 MEDIA 行）
+            # ——不清理则永停 creating，污染 usage/reasoning 的回合进行中判据
+            source = getattr(event, "source", None)
+            chat_id = getattr(source, "chat_id", "") or ""
+            if chat_id:
+                self._engine().close_ghost_creating(
+                    chat_id, thread_id=getattr(source, "thread_id", None))
 
     # ── clarify 内联单选（类定义期覆写；SDK connect() 注册的绑定方法即本版本）──
 
@@ -650,14 +658,36 @@ class StreamingFeishuMixin:
         return engine.latest_session_for_chat(chat_id)
 
     def _media_reply_anchor(self, session: Any, fallback: str | None) -> str | None:
-        """官方回退路径的回复锚：卡消息优先，卡未建成用会话回复锚（用户消息）.
+        """媒体投递的回复锚：卡消息 → 会话回复锚 → 回合原始入站消息 → 调用方锚.
 
-        官方 send_document/send_image_file 接受 reply_to——带锚可让回退投递
-        仍落线程内，而不是顶层直发。
+        话题回合的卡要等首个 draft 才建（延迟建卡）——媒体若在 draft 之前到达
+        （2026-11-17 16:30 实测：模型只回 MEDIA 行、无正文 → 无 draft），卡不
+        存在，官方原生 send_image_file 顶层直发必 99992402（图片丢失）。此时
+        退回 reply 到回合入站消息（turn_inbound）：同样落在话题线程内，且走
+        vendor reply_image_by_id 不吃官方那条坏路径。
         """
         if session is None:
             return fallback
-        return session.card_msg_id or session.reply_to or fallback
+        return (session.card_msg_id or session.reply_to
+                or getattr(session, "turn_inbound", None) or fallback)
+
+    async def _reply_media_to_anchor(self, client: Any, anchor: str, *,
+                                     image_path: str | None = None,
+                                     file_path: str | None = None,
+                                     file_name: str | None = None) -> bool:
+        """无卡时的媒体投递：上传后 reply 到锚消息（图片/文档二选一）."""
+        if image_path is not None:
+            image_key = await client.upload_image_file(image_path)
+            if not image_key:
+                return False
+            return bool(await client.reply_image_by_id(anchor, image_key))
+        if file_path is not None:
+            file_key = await client.upload_document(file_path, file_name=file_name)
+            if not file_key:
+                return False
+            return bool(await client.reply_file_by_id(
+                anchor, file_key, local_file_name(file_path, file_name)))
+        return False
 
     async def send_document(self, chat_id: str, file_path: str, *,
                             caption: str | None = None, file_name: str | None = None,
@@ -689,6 +719,18 @@ class StreamingFeishuMixin:
             except Exception as e:
                 _gw.warning("[feishu-streaming] media card delivery failed (document): %s", e)
         fallback_anchor = self._media_reply_anchor(session, reply_to)
+        if fallback_anchor and not caption:
+            # 无卡（话题延迟建卡 + 媒体早于首 draft）→ reply 到锚消息，仍在线程内
+            try:
+                if await self._reply_media_to_anchor(
+                        engine.client, fallback_anchor,
+                        file_path=file_path, file_name=file_name):
+                    _gw.info(
+                        "[feishu-streaming] media delivered to anchor: kind=document anchor=%s",
+                        str(fallback_anchor)[:16])
+                    return _compat.send_result(success=True, message_id=fallback_anchor)
+            except Exception as e:
+                _gw.warning("[feishu-streaming] media anchor delivery failed (document): %s", e)
         _gw.info(
             "[feishu-streaming] media fallback to native: kind=document card=%s caption=%s reply_to=%s",
             "yes" if card_msg_id else "no", "yes" if caption else "no",
@@ -724,6 +766,16 @@ class StreamingFeishuMixin:
             except Exception as e:
                 _gw.warning("[feishu-streaming] media card delivery failed (image): %s", e)
         fallback_anchor = self._media_reply_anchor(session, reply_to)
+        if fallback_anchor and not caption:
+            try:
+                if await self._reply_media_to_anchor(
+                        engine.client, fallback_anchor, image_path=image_path):
+                    _gw.info(
+                        "[feishu-streaming] media delivered to anchor: kind=image anchor=%s",
+                        str(fallback_anchor)[:16])
+                    return _compat.send_result(success=True, message_id=fallback_anchor)
+            except Exception as e:
+                _gw.warning("[feishu-streaming] media anchor delivery failed (image): %s", e)
         _gw.info(
             "[feishu-streaming] media fallback to native: kind=image card=%s caption=%s reply_to=%s",
             "yes" if card_msg_id else "no", "yes" if caption else "no",

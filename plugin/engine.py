@@ -654,6 +654,23 @@ class ChatCardEngine:
         await self.complete(chat_id, session.answer_seg.text if session.answer_seg else "",
                             is_error=True, thread_id=thread_id)
 
+    def close_ghost_creating(self, chat_id: str, thread_id: str | None = None) -> bool:
+        """回合正常结束但卡从未建（creating + 无 card）→ 置 failed 防幽灵会话.
+
+        真实场景（2026-11-17 16:30 自测）：模型只回 MEDIA 行、无正文 → transport
+        不发任何 draft/send；话题会话的卡本就推迟到首个 draft，故卡从未创建。
+        processing_complete 若不管，会话永停 creating → 污染 usage/reasoning
+        路由的「回合进行中」判据（单活跃兜底被占位）。返回 True 表示清理了。
+        """
+        session = self.active_session(chat_id, thread_id)
+        if session is None or session.state != "creating" or session.card_id is not None:
+            return False
+        session.state = "failed"
+        session.completed_at = time.time()
+        _logger.info("[feishu-streaming] ghost session closed: chat=%s thread=%s "
+                     "(no card, no final send)", chat_id[:12], (thread_id or "-")[:16])
+        return True
+
     def session_by_card_msg_id(self, message_id: str) -> ChatSession | None:
         """按卡片消息 id 找会话（stale-finalize 编辑重定向的入口）."""
         for s in self._sessions.values():
