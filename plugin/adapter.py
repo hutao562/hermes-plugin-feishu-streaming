@@ -355,8 +355,24 @@ class StreamingFeishuMixin:
             source = getattr(event, "source", None)
             chat_id = getattr(source, "chat_id", "") or ""
             if chat_id:
-                await self._engine().abandon(
+                session = await self._engine().abandon(
                     chat_id, thread_id=getattr(source, "thread_id", None))
+                if session is not None and session.card_id is None:
+                    # 无卡可渲（话题延迟建卡 + 零 draft 就被 /stop）→ 原生文本
+                    # 反馈，reply 到回合入站锚保证落在线程内（否则用户侧静默）
+                    anchor = (getattr(session, "turn_inbound", None)
+                              or session.reply_to)
+                    try:
+                        import json as _json
+
+                        await self._feishu_send_with_retry(  # type: ignore[attr-defined]
+                            chat_id=chat_id, msg_type="text",
+                            payload=_json.dumps({"text": "⏹ 本回合已中断"},
+                                                ensure_ascii=False),
+                            reply_to=anchor, metadata=None)
+                    except Exception as exc:
+                        logging.getLogger("gateway.run").warning(
+                            "[feishu-streaming] cancel text fallback failed: %s", exc)
         elif getattr(outcome, "name", outcome) == "SUCCESS":
             # 幽灵会话清理：卡从未建（无 draft/无 final send，如模型只回 MEDIA 行）
             # ——不清理则永停 creating，污染 usage/reasoning 的回合进行中判据

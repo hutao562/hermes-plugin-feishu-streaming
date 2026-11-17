@@ -636,7 +636,7 @@ class ChatCardEngine:
                             chat_id[:12], e)
             return None
 
-    async def abandon(self, chat_id: str, thread_id: str | None = None) -> None:
+    async def abandon(self, chat_id: str, thread_id: str | None = None) -> ChatSession | None:
         """流被弃（/stop、/new、/reset 等 adapter 路由的取消）— 红卡收尾，防永久转圈.
 
         触发链：adapter.on_processing_complete 收到 CANCELLED（上游语义见
@@ -644,15 +644,21 @@ class ChatCardEngine:
         自己路由的取消才是 CANCELLED，redirect 不产生、drain 正常路径是
         SUCCESS）。2026-10-17 实测缺口：/stop 后无人收卡，卡片转圈 10 分钟
         直到 /new 的回执被错当回答渲染成完成卡。
+
+        返回被收的会话（None=无活跃会话）；调用方据 ``session.card_id`` 判断
+        是否有可见卡片——无卡（话题延迟建卡 + 零 draft 就被取消）卡面无处可
+        渲，需 adapter 回落原生文本反馈（2026-11-17 实测：/stop 打在零 draft
+        话题回合上，用户侧完全静默）。
         """
         session = self.active_session(chat_id, thread_id)
         if session is None:
-            return
-        _logger.info("[feishu-streaming] abandoned (cancelled turn): chat=%s state=%s",
-                     chat_id[:12], session.state)
+            return None
+        _logger.info("[feishu-streaming] abandoned (cancelled turn): chat=%s state=%s card=%s",
+                     chat_id[:12], session.state, "yes" if session.card_id else "no")
         session.segment_state.add_notice("⏹ 本回合已中断")
         await self.complete(chat_id, session.answer_seg.text if session.answer_seg else "",
                             is_error=True, thread_id=thread_id)
+        return session
 
     def close_ghost_creating(self, chat_id: str, thread_id: str | None = None) -> bool:
         """回合正常结束但卡从未建（creating + 无 card）→ 置 failed 防幽灵会话.

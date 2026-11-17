@@ -227,6 +227,7 @@ class _FakeBaseAdapter:
         self.native_edits: list[tuple] = []
         self.native_docs: list[tuple] = []
         self.native_images: list[tuple] = []
+        self.native_texts: list[dict] = []
 
     async def send(self, chat_id, content, reply_to=None, metadata=None, **kwargs):
         self.native_sends.append((chat_id, content, reply_to, metadata))
@@ -248,6 +249,10 @@ class _FakeBaseAdapter:
 
     async def send_typing(self, chat_id, metadata=None):
         return None
+
+    async def _feishu_send_with_retry(self, **kwargs):
+        self.native_texts.append(kwargs)
+        return _compat.send_result(success=True, message_id="om_native_text")
 
 
 @pytest.fixture
@@ -469,6 +474,43 @@ async def test_close_ghost_creating_marks_failed(adapter) -> None:
     assert engine.close_ghost_creating("chat1", thread_id="omt_1") is True
     assert session.state == "failed"
     assert engine.close_ghost_creating("chat1", thread_id="omt_1") is False  # 幂等
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_card_falls_back_to_native_text(adapter) -> None:
+    """零 draft 的话题回合被 /stop：无卡可渲 → 原生文本 reply 到入站锚.
+
+    2026-11-17 实测：该场景用户侧完全静默（卡片从未建、ack 被吞）。
+    """
+    engine = adapter._engine()
+    engine.note_inbound("chat1", "om_in_cancel")
+    engine.on_turn_started("chat1", thread_id="omt_1")
+    event = SimpleNamespace(
+        message_id="om_in_cancel",
+        source=SimpleNamespace(chat_id="chat1", thread_id="omt_1"))
+    outcome = SimpleNamespace(name="CANCELLED")
+
+    await adapter.on_processing_complete(event, outcome)
+
+    assert adapter.native_texts, "无卡取消必须回落原生文本"
+    assert adapter.native_texts[0].get("reply_to") == "om_in_cancel"
+    assert "已中断" in adapter.native_texts[0].get("payload", "")
+
+
+@pytest.mark.asyncio
+async def test_abandon_returns_session_card_state(adapter) -> None:
+    """abandon 返回会话：有卡 → card_id 非空；无卡 → card_id None（adapter 据此兜底）."""
+    engine = adapter._engine()
+    engine.on_draft("chat1", "内容", reply_to="om_a")
+    await _settle(engine)
+    got = await engine.abandon("chat1")
+    assert got is not None and got.card_id is not None
+    assert got.state == "failed"  # 取消收尾 = 红卡（is_error）
+
+    engine.on_turn_started("chat2", thread_id="omt_2")  # 话题：卡未建
+    got2 = await engine.abandon("chat2", thread_id="omt_2")
+    assert got2 is not None and got2.card_id is None
+    assert got2.state == "failed"
 
 
 @pytest.mark.asyncio
