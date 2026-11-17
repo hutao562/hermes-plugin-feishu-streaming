@@ -268,6 +268,18 @@ class ChatCardEngine:
             return False
         return message_id in self._inbound_seen.get(chat_id, {})
 
+    def _inbound_seen_after(self, chat_id: str, message_id: str, since: float) -> bool:
+        """入站消息是否在 *since* 之后登记（followup 拆卡的时间门槛）.
+
+        hermes feishu 话题把 draft 锚定在线程根消息（_initial_reply_to_id =
+        thread parent）——redirect/边界后锚回摆到**早于本会话创建**的老入站，
+        不是新回合；只有比会话更新的入站才可能是排队 followup 被 drain
+        （2026-11-17 14:49 实测：redirect 卡被「followup」空 seal，真答案
+        拆去第三张卡挂在线程根下）。
+        """
+        seen_at = self._inbound_seen.get(chat_id, {}).get(message_id)
+        return seen_at is not None and seen_at > since
+
     def mark_redirect(self, chat_id: str, anchor: str | None = None,
                       thread_id: str | None = None) -> None:
         """↪ redirect ack（用户纠正、interrupt 模式）→ **立即收旧开新**.
@@ -369,17 +381,20 @@ class ChatCardEngine:
             {session.reply_to} if session.reply_to else set())
         if (session.state != "creating" and reply_to and session.reply_to
                 and reply_to not in accepted):
-            if not self._inbound_verified(chat_id, reply_to):
+            if not self._inbound_verified(chat_id, reply_to) or not self._inbound_seen_after(
+                    chat_id, reply_to, session.created_at):
                 # 新锚不是入站消息 = 工具边界换 consumer 的重锚（同一回合继续，
                 # 2026-10-09 实测：redirected 回合写文件后锚变全新 id）——改锚
-                # 不拆卡。拆卡门槛必须是「新锚 = 新入站消息」（排队 followup
-                # 被 drain，processing_start 在 drain 开始时触发，先于首帧）。
-                _logger.info("[feishu-streaming] anchor swing (not an inbound msg), "
+                # 不拆卡。拆卡门槛必须是「新锚 = 比本会话更新的入站消息」：
+                # 排队 followup 的 processing_start 在 drain 开始时触发（晚于
+                # 会话创建）；而话题根等老入站的锚回摆不是新回合（见
+                # _inbound_seen_after）。
+                _logger.info("[feishu-streaming] anchor swing (not a newer inbound msg), "
                              "re-anchor in place: %s -> %s", session.reply_to, reply_to)
                 session.reply_to = reply_to
                 session.accepted_anchors.add(reply_to)
             else:
-                # draft 锚变成新入站消息 = 新回合开始（排队 followup 被 drain）：
+                # draft 锚变成更新的入站消息 = 新回合开始（排队 followup 被 drain）：
                 # 旧卡按已有内容收尾（绿色完成态），新回合开新卡。
                 _logger.info(
                     "[feishu-streaming] followup boundary: anchor %s -> %s (inbound), "
@@ -389,7 +404,12 @@ class ChatCardEngine:
                 new.accepted_anchors = {reply_to}
                 self._sessions[self._skey(chat_id, thread_id)] = new
                 session = self._ensure_session(chat_id, thread_id)  # 新会话补建卡 task
-                self._seal_session(old_session)
+                # 旧卡零正文（redirect 后未出文本就被新消息接管）时别渲染成
+                # 「Done.」空占位——给一句转卡提示，用户知道看下面那张
+                has_body = bool(old_session.answer_seg and old_session.answer_seg.text.strip())
+                self._seal_session(
+                    old_session,
+                    notice=None if has_body else "↪ 已按新消息开启新卡片")
         if session.reply_to is None and reply_to:
             session.reply_to = reply_to
             session.accepted_anchors = {reply_to}

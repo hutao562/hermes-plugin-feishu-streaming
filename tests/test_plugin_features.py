@@ -223,6 +223,43 @@ async def test_draft_anchor_change_seals_old_and_opens_new() -> None:
 
 
 @pytest.mark.asyncio
+async def test_draft_anchor_swing_to_older_inbound_does_not_split() -> None:
+    """话题根等「早于本会话」的入站锚回摆不算新回合（2026-11-17 14:49 实测）.
+
+    hermes 话题把 draft 锚在线程根消息上：redirect 后首 draft 的锚回摆到线程根
+    （14:41 的入站，早于 redirect 会话创建）——旧逻辑只查「是否入站」→ 误判
+    followup，redirect 卡被空 seal 成「Done.」，真答案拆去第三张卡。
+    """
+    import time as _time
+
+    engine = ChatCardEngine(_mock_client())
+    engine.note_inbound("chat1", "om_thread_root")  # 线程根：远早于后续会话
+    engine.on_draft("chat1", "第一回合", reply_to="om_thread_root")
+    await _settle(engine)
+    await engine.complete("chat1", "第一回合")
+
+    # 第二回合：无 draft 即被 redirect（accepted 只有纠正锚 + 回合入站）。
+    # on_turn_started 有 5s 防抖（typing 心跳尾巴）——回拨 completed_at 模拟
+    # 「上一回合早已结束、新消息开启新会话」的真实时序（现场间隔 48s）。
+    engine.session_for("chat1").completed_at -= 10.0
+    engine.note_inbound("chat1", "om_turn2_inbound")
+    engine.on_turn_started("chat1")
+    await _settle(engine)
+    assert _time.time() - engine.session_for("chat1").created_at < 5.0
+    engine.mark_redirect("chat1", anchor="om_correction")
+    await _settle(engine)
+    redirect_session = engine.session_for("chat1")
+    creates_before = engine._client.cardkit_create.call_count
+
+    engine.on_draft("chat1", "真答案", reply_to="om_thread_root")  # 锚回摆到线程根
+    await _settle(engine)
+
+    assert engine.session_for("chat1") is redirect_session, "老入站锚回摆不得拆卡"
+    assert redirect_session.reply_to == "om_thread_root"  # 原地改锚
+    assert engine._client.cardkit_create.call_count == creates_before, "不应新建第三张卡"
+
+
+@pytest.mark.asyncio
 async def test_draft_same_anchor_keeps_session() -> None:
     engine = ChatCardEngine(_mock_client())
     engine.on_draft("chat1", "同一回合继续", reply_to="om_msg_A")

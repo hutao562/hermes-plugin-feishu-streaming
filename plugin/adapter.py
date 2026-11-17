@@ -677,12 +677,22 @@ class StreamingFeishuMixin:
                 if file_key:
                     name = local_file_name(file_path, file_name)
                     if await client.reply_file_by_id(card_msg_id, file_key, name):
+                        _logger.info(
+                            "plugin media delivered to card: kind=document "
+                            "thread=%s card=%s name=%s",
+                            (getattr(session, "thread_id", None) or "-")[:16],
+                            str(card_msg_id)[:16], name)
                         return _compat.send_result(success=True, message_id=card_msg_id)
             except Exception as e:
                 _logger.warning("plugin doc delivery to card failed: %s", e)
+        fallback_anchor = self._media_reply_anchor(session, reply_to)
+        _logger.info(
+            "plugin media fallback to native: kind=document card=%s caption=%s reply_to=%s",
+            "yes" if card_msg_id else "no", "yes" if caption else "no",
+            str(fallback_anchor)[:16] if fallback_anchor else "-")
         return await super().send_document(chat_id, file_path,  # type: ignore[misc]
                                            caption=caption, file_name=file_name,
-                                           reply_to=self._media_reply_anchor(session, reply_to),
+                                           reply_to=fallback_anchor,
                                            metadata=metadata, **kwargs)
 
     async def send_image_file(self, chat_id: str, image_path: str, *,
@@ -702,12 +712,22 @@ class StreamingFeishuMixin:
                 client = engine.client
                 image_key = await client.upload_image_file(image_path)
                 if image_key and await client.reply_image_by_id(card_msg_id, image_key):
+                    _logger.info(
+                        "plugin media delivered to card: kind=image "
+                        "thread=%s card=%s",
+                        (getattr(session, "thread_id", None) or "-")[:16],
+                        str(card_msg_id)[:16])
                     return _compat.send_result(success=True, message_id=card_msg_id)
             except Exception as e:
                 _logger.warning("plugin image delivery to card failed: %s", e)
+        fallback_anchor = self._media_reply_anchor(session, reply_to)
+        _logger.info(
+            "plugin media fallback to native: kind=image card=%s caption=%s reply_to=%s",
+            "yes" if card_msg_id else "no", "yes" if caption else "no",
+            str(fallback_anchor)[:16] if fallback_anchor else "-")
         return await super().send_image_file(chat_id, image_path,  # type: ignore[misc]
                                              caption=caption,
-                                             reply_to=self._media_reply_anchor(session, reply_to),
+                                             reply_to=fallback_anchor,
                                              metadata=metadata, **kwargs)
 
 
