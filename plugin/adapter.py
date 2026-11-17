@@ -801,6 +801,42 @@ class StreamingFeishuMixin:
                                              reply_to=fallback_anchor,
                                              metadata=metadata, **kwargs)
 
+    def _media_anchor_for_native(self, chat_id: str, metadata: Any,
+                                 reply_to: str | None, kind: str) -> str | None:
+        """语音/视频/动图的线程锚（官方实现接受 reply_to，注入即可落线程）."""
+        session = self._media_session(chat_id, metadata)
+        anchor = self._media_reply_anchor(session, reply_to)
+        _gw.info("[feishu-streaming] media native send: kind=%s reply_to=%s",
+                 kind, str(anchor)[:16] if anchor else "-")
+        return anchor
+
+    async def send_voice(self, chat_id: str, audio_path: str, *,
+                         caption: str | None = None, reply_to: str | None = None,
+                         metadata: Any = None, **kwargs: Any) -> Any:
+        """语音消息：注入线程锚，话题回合不落群顶层（官方负责转码/上传）."""
+        anchor = self._media_anchor_for_native(chat_id, metadata, reply_to, "voice")
+        return await super().send_voice(chat_id, audio_path,  # type: ignore[misc]
+                                        caption=caption, reply_to=anchor,
+                                        metadata=metadata, **kwargs)
+
+    async def send_video(self, chat_id: str, video_path: str, *,
+                         caption: str | None = None, reply_to: str | None = None,
+                         metadata: Any = None, **kwargs: Any) -> Any:
+        """视频消息：同上（官方负责上传封面，这里只补线程锚）."""
+        anchor = self._media_anchor_for_native(chat_id, metadata, reply_to, "video")
+        return await super().send_video(chat_id, video_path,  # type: ignore[misc]
+                                        caption=caption, reply_to=anchor,
+                                        metadata=metadata, **kwargs)
+
+    async def send_animation(self, chat_id: str, animation_url: str, *,
+                             caption: str | None = None, reply_to: str | None = None,
+                             metadata: Any = None, **kwargs: Any) -> Any:
+        """GIF/动图：同上（官方降级为文件发送，锚定同样保持线程内）."""
+        anchor = self._media_anchor_for_native(chat_id, metadata, reply_to, "animation")
+        return await super().send_animation(chat_id, animation_url,  # type: ignore[misc]
+                                            caption=caption, reply_to=anchor,
+                                            metadata=metadata, **kwargs)
+
 
 def build_adapter_class(base_cls: type, engine: ChatCardEngine) -> type[Any]:
     """合成 StreamingFeishuAdapter 并绑定引擎实例（每 profile 一个）."""

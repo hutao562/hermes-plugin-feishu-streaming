@@ -228,6 +228,8 @@ class _FakeBaseAdapter:
         self.native_docs: list[tuple] = []
         self.native_images: list[tuple] = []
         self.native_texts: list[dict] = []
+        self.native_voices: list[tuple] = []
+        self.native_videos: list[tuple] = []
 
     async def send(self, chat_id, content, reply_to=None, metadata=None, **kwargs):
         self.native_sends.append((chat_id, content, reply_to, metadata))
@@ -249,6 +251,16 @@ class _FakeBaseAdapter:
 
     async def send_typing(self, chat_id, metadata=None):
         return None
+
+    async def send_voice(self, chat_id, audio_path, *, caption=None, reply_to=None,
+                         metadata=None, **kwargs):
+        self.native_voices.append((chat_id, audio_path, reply_to, metadata))
+        return _compat.send_result(success=True, message_id="om_voice")
+
+    async def send_video(self, chat_id, video_path, *, caption=None, reply_to=None,
+                         metadata=None, **kwargs):
+        self.native_videos.append((chat_id, video_path, reply_to, metadata))
+        return _compat.send_result(success=True, message_id="om_video")
 
     async def _feishu_send_with_retry(self, **kwargs):
         self.native_texts.append(kwargs)
@@ -511,6 +523,21 @@ async def test_abandon_returns_session_card_state(adapter) -> None:
     got2 = await engine.abandon("chat2", thread_id="omt_2")
     assert got2 is not None and got2.card_id is None
     assert got2.state == "failed"
+
+
+@pytest.mark.asyncio
+async def test_send_voice_and_video_inject_thread_anchor(adapter) -> None:
+    """语音/视频走官方实现，但必须注入线程锚——否则话题回合落群顶层."""
+    engine = adapter._engine()
+    engine.on_draft("chat1", "内容", reply_to="om_a")
+    await _settle(engine)
+    card = engine.session_for("chat1").card_msg_id
+
+    await adapter.send_voice("chat1", "/tmp/a.opus")
+    await adapter.send_video("chat1", "/tmp/v.mp4")
+
+    assert adapter.native_voices[0][2] == card, "语音应 reply 到卡"
+    assert adapter.native_videos[0][2] == card, "视频应 reply 到卡"
 
 
 @pytest.mark.asyncio
