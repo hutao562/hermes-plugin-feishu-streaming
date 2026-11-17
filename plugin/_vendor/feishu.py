@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import URLError
+from urllib.parse import unquote
 from urllib.request import Request, urlopen
 
 import lark_oapi as lark
@@ -55,6 +56,25 @@ _FILE_TYPE_BY_EXT: dict[str, str] = {
     ".opus": "opus",
     ".ogg": "opus",
 }
+
+
+def local_file_path(path: str) -> str:
+    """file:// URL → 本地路径（quote 解码）；裸路径原样返回.
+
+    gateway run_notifications 以 f"file://{quote(p)}" 传本地媒体——Windows
+    盘符路径必含 %3A%5C，含空格/中文路径必被 quote，不解码读取必失败
+    （2026-11-17 梦珊机话题群文件投递事故链之一）。
+    """
+    if path.startswith("file://"):
+        return unquote(path[len("file://"):])
+    return path
+
+
+def local_file_name(path: str, override: str | None = None) -> str:
+    """展示用文件名：显式指定优先，否则取（解码后）路径 basename."""
+    if override:
+        return override
+    return os.path.basename(local_file_path(path))
 
 
 _logger = logging.getLogger("hermes_lark_streaming")
@@ -391,10 +411,9 @@ class FeishuClient:
 
     @staticmethod
     def _read_image_file(path: str) -> bytes | None:
-        """读取本地图片文件（在线程池中运行）."""
+        """读取本地图片文件（在线程池中运行；file:// 按 quote 解码）."""
         try:
-            p = path[7:] if path.startswith("file://") else path
-            with open(p, "rb") as f:
+            with open(local_file_path(path), "rb") as f:
                 return bytes(f.read())
         except OSError:
             _logger.debug("image file read failed: %s", path)
@@ -431,8 +450,8 @@ class FeishuClient:
 
         file_type 按扩展名映射（pdf/doc/xls/ppt/mp4/opus），未知扩展名用 stream。
         """
-        p = file_path[7:] if file_path.startswith("file://") else file_path
-        name = file_name or os.path.basename(p)
+        p = local_file_path(file_path)
+        name = local_file_name(file_path, file_name)
         ext = os.path.splitext(name)[1].lower()
         file_type = _FILE_TYPE_BY_EXT.get(ext, "stream")
         try:
@@ -464,6 +483,29 @@ class FeishuClient:
         )
         resp = await self._checked_call(
             "reply_file_by_id",
+            lambda: self._client.im.v1.message.areply(request),
+        )
+        return bool(resp.data and resp.data.message_id)
+
+    async def reply_image_by_id(self, message_id: str, image_key: str) -> bool:
+        """以 image 消息回复指定消息——话题内卡片锚定图片（reply_file_by_id 同构）.
+
+        官方 send_image_file 顶层直发无线程锚，话题群回合的图片会落群顶层
+        （2026-11-17 梦珊机实测）；此路径把图片 reply 到线程内卡片正下方。
+        """
+        request = (
+            ReplyMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                ReplyMessageRequestBody.builder()
+                .msg_type("image")
+                .content(self._dumps({"image_key": image_key}))
+                .build()
+            )
+            .build()
+        )
+        resp = await self._checked_call(
+            "reply_image_by_id",
             lambda: self._client.im.v1.message.areply(request),
         )
         return bool(resp.data and resp.data.message_id)

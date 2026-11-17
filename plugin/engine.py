@@ -159,6 +159,11 @@ class ChatCardEngine:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: Any = None
 
+    @property
+    def client(self) -> Any:
+        """飞书 client（_LazyClient 代理）— adapter 侧媒体上传等复用同凭据通道."""
+        return self._client
+
     # ── usage 聚合（post_api_request 钩子 → footer tokens/t/s）──
 
     @staticmethod

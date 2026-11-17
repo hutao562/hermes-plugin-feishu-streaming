@@ -32,6 +32,7 @@ from ._vendor.cardkit.builder import (
     build_model_picker_card,
     build_model_switch_ack_card,
 )
+from ._vendor.feishu import local_file_name
 from .contract import CRON_WRAP_DIVIDER, CRON_WRAP_FOOTER_PREFIX, CRON_WRAP_HEADER, CRON_WRAP_JOBID_LINE
 from .engine import ChatCardEngine
 
@@ -626,34 +627,88 @@ class StreamingFeishuMixin:
             logging.getLogger("gateway.run").info(
                 "[feishu-streaming][clarify] retired id=%s (no click)", clarify_id[:12])
 
-    async def send_document(self, chat_id: str, file_path: str, *,
-                            file_name: str | None = None, **kwargs: Any) -> Any:
-        """文档交付：有卡片时上传后 reply 到卡片消息下方（飞书卡片无 file 组件）."""
+    def _media_session(self, chat_id: str, metadata: Any) -> Any:
+        """媒体交付（文件/图片）的锚会话：metadata.thread_id 精确命中优先.
+
+        话题群回合的卡在线程里——run_notifications 的 post-stream 媒体交付带
+        thread_id metadata（2026-11-17 梦珊机实测：忽略它会把话题回合的文件
+        挂到 chat 级最近卡/顶层直发，落群顶层）。查 session_for 含终态：交付
+        发生在 complete 之后；thread 未命中退 chat 级最近卡（latest 语义与
+        bg 合并一致——插入序第一张在主聊+话题并存时会挂到旧卡，v0.17.8）。
+        """
         engine = self._engine()
-        # 文档锚：该 chat 任意 thread 的会话都算，取最近创建那张（latest 语义
-        # 与 bg 合并一致——插入序第一张在主聊+话题并存时会挂到旧卡）
-        latest = engine.latest_session_for_chat(chat_id)
-        card_msg_id = latest.card_msg_id if latest else None
-        if card_msg_id:
+        thread_id = ""
+        if isinstance(metadata, dict):
+            thread_id = str(metadata.get("thread_id") or "")
+        if thread_id:
+            session = engine.session_for(chat_id, thread_id)
+            if session is not None:
+                return session
+        return engine.latest_session_for_chat(chat_id)
+
+    def _media_reply_anchor(self, session: Any, fallback: str | None) -> str | None:
+        """官方回退路径的回复锚：卡消息优先，卡未建成用会话回复锚（用户消息）.
+
+        官方 send_document/send_image_file 接受 reply_to——带锚可让回退投递
+        仍落线程内，而不是顶层直发。
+        """
+        if session is None:
+            return fallback
+        return session.card_msg_id or session.reply_to or fallback
+
+    async def send_document(self, chat_id: str, file_path: str, *,
+                            caption: str | None = None, file_name: str | None = None,
+                            reply_to: str | None = None, metadata: Any = None,
+                            **kwargs: Any) -> Any:
+        """文档交付：有卡片时上传后 reply 到卡片消息下方（飞书卡片无 file 组件）.
+
+        上传/回复一律走引擎 client（vendor FeishuClient）——官方 adapter 无
+        upload_document/reply_file_by_id（v0.20.0 前调 self.* 必 AttributeError，
+        测试替身曾伪造该方法掩盖断裂）。caption 走官方回退（file 消息无 caption
+        载体，官方路径可渲染）。
+        """
+        engine = self._engine()
+        session = self._media_session(chat_id, metadata)
+        card_msg_id = getattr(session, "card_msg_id", None) if session else None
+        if card_msg_id and not caption:
             try:
-                file_key = await self._upload_document_for_card(file_path, file_name)
-                if file_key and await self._reply_file_to_card(card_msg_id, file_key,
-                                                               file_name or file_path):
-                    return _compat.send_result(success=True, message_id=card_msg_id)
+                client = engine.client
+                file_key = await client.upload_document(file_path, file_name=file_name)
+                if file_key:
+                    name = local_file_name(file_path, file_name)
+                    if await client.reply_file_by_id(card_msg_id, file_key, name):
+                        return _compat.send_result(success=True, message_id=card_msg_id)
             except Exception as e:
                 _logger.warning("plugin doc delivery to card failed: %s", e)
         return await super().send_document(chat_id, file_path,  # type: ignore[misc]
-                                           file_name=file_name, **kwargs)
+                                           caption=caption, file_name=file_name,
+                                           reply_to=self._media_reply_anchor(session, reply_to),
+                                           metadata=metadata, **kwargs)
 
-    async def _upload_document_for_card(self, file_path: str, file_name: str | None) -> str | None:
-        result: str | None = await self.upload_document(  # type: ignore[attr-defined]
-            file_path, file_name=file_name)
-        return result
+    async def send_image_file(self, chat_id: str, image_path: str, *,
+                              caption: str | None = None, reply_to: str | None = None,
+                              metadata: Any = None, **kwargs: Any) -> Any:
+        """本地图片交付：上传后以 image 消息 reply 到卡片（话题内锚定）.
 
-    async def _reply_file_to_card(self, card_msg_id: str, file_key: str, file_name: str) -> bool:
-        result: bool = await self.reply_file_by_id(  # type: ignore[attr-defined]
-            card_msg_id, file_key, file_name)
-        return result
+        base.send_multiple_images 对 file:// 已 url2pathname 解码后路由到此
+        （alt 作 caption）；官方 send_image_file 顶层直发无线程锚且曾在
+        Windows 实测 99992402——覆写后图片随回合落进话题线程。
+        """
+        engine = self._engine()
+        session = self._media_session(chat_id, metadata)
+        card_msg_id = getattr(session, "card_msg_id", None) if session else None
+        if card_msg_id and not caption:
+            try:
+                client = engine.client
+                image_key = await client.upload_image_file(image_path)
+                if image_key and await client.reply_image_by_id(card_msg_id, image_key):
+                    return _compat.send_result(success=True, message_id=card_msg_id)
+            except Exception as e:
+                _logger.warning("plugin image delivery to card failed: %s", e)
+        return await super().send_image_file(chat_id, image_path,  # type: ignore[misc]
+                                             caption=caption,
+                                             reply_to=self._media_reply_anchor(session, reply_to),
+                                             metadata=metadata, **kwargs)
 
 
 def build_adapter_class(base_cls: type, engine: ChatCardEngine) -> type[Any]:

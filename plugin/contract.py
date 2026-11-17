@@ -68,6 +68,7 @@ CONTRACT_ANCHORS: dict[str, tuple[tuple[str, str], ...]] = {
         ("def edit_message(", "edit_message(finalize=) 覆写契约（stale-finalize 重定向）"),
         ("def send_typing(", "send_typing 覆写（typing 徽章）"),
         ("def send_document(", "文档交付覆写（上传 + reply 卡片消息）"),
+        ("def send_image_file(", "本地图片交付覆写（图片随话题卡进线程，v0.21.0）"),
         ("def _dispatch_synthetic_event(", "合成事件通道（footer 🧠⇄ /model、clarify 按钮）"),
         ("def _resolve_source_chat_type(", "chat_type 解析（event_chat_type 传 raw_type 的对端）"),
         ("_feishu_send_with_retry", "text 兜底直发通道（clarify/降级路径）"),
@@ -104,6 +105,17 @@ OPTIONAL_ANCHORS: dict[str, tuple[tuple[str, str], ...]] = {
         ("ENV_OVERRIDES", "env→config 桥步骤来源（顶替条目必须透传——缺了 feishu 永不启用）"),
         ('ENV_ENABLE_CREDENTIALS = ("FEISHU_APP_ID", "FEISHU_APP_SECRET")',
          "凭据名清单（is_connected 凭据门的 env 侧对应物）"),
+    ),
+    "gateway/run_notifications.py": (
+        # 2026-11-17 话题群文件/图片投递事故锚：post-stream 媒体交付带线程
+        # metadata（send_document/send_image_file 的 thread 锚输入）+ file://
+        # 经 quote 传递（vendor local_file_path 解码的契约对端）
+        ("send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)",
+         "post-stream 文档交付调用形态（metadata 线程锚）"),
+        ("send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)",
+         "post-stream 图片批交付（file:// → send_image_file 路由）"),
+        ('images = [(f"file://{_quote(p)}", "")',
+         "本地媒体以 quote(file://) 传递（vendor local_file_path 解码的对端契约）"),
     ),
     "gateway/platform_registry.py": (
         ("env_overrides", "PlatformEntry env 桥字段（能力探测目标）"),

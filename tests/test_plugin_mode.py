@@ -36,6 +36,11 @@ def _mock_client() -> MagicMock:
     client.cardkit_close_streaming = AsyncMock()
     client.cardkit_update = AsyncMock()
     client.send_card_to_chat = AsyncMock(return_value="om_card_msg")
+    # 媒体交付（send_document/send_image_file 卡片锚路径）
+    client.upload_document = AsyncMock(return_value="file_key_1")
+    client.reply_file_by_id = AsyncMock(return_value=True)
+    client.upload_image_file = AsyncMock(return_value="img_key_1")
+    client.reply_image_by_id = AsyncMock(return_value=True)
     return client
 
 
@@ -211,12 +216,17 @@ async def test_reasoning_single_session_routing(engine: ChatCardEngine) -> None:
 
 
 class _FakeBaseAdapter:
-    """最小基类替身 — 记录原生调用."""
+    """最小基类替身 — 记录原生调用.
+
+    刻意不实现 upload_document/reply_file_by_id：官方 FeishuAdapter 没有这俩
+    方法（v0.20.0 事故——替身伪造掩盖了 self.* 误调，生产必 AttributeError）。
+    """
 
     def __init__(self, config: Any = None) -> None:
         self.native_sends: list[tuple] = []
         self.native_edits: list[tuple] = []
         self.native_docs: list[tuple] = []
+        self.native_images: list[tuple] = []
 
     async def send(self, chat_id, content, reply_to=None, metadata=None, **kwargs):
         self.native_sends.append((chat_id, content, reply_to, metadata))
@@ -226,18 +236,18 @@ class _FakeBaseAdapter:
         self.native_edits.append((chat_id, message_id, content, finalize))
         return _compat.send_result(success=True, message_id=message_id)
 
-    async def send_document(self, chat_id, file_path, *, file_name=None, **kwargs):
-        self.native_docs.append((chat_id, file_path))
+    async def send_document(self, chat_id, file_path, *, caption=None, file_name=None,
+                            reply_to=None, metadata=None, **kwargs):
+        self.native_docs.append((chat_id, file_path, reply_to, metadata))
         return _compat.send_result(success=True, message_id="om_doc")
 
-    async def upload_document(self, file_path, *, file_name=None):
-        return "file_key_1"
+    async def send_image_file(self, chat_id, image_path, *, caption=None, reply_to=None,
+                              metadata=None, **kwargs):
+        self.native_images.append((chat_id, image_path, reply_to, metadata))
+        return _compat.send_result(success=True, message_id="om_img")
 
     async def send_typing(self, chat_id, metadata=None):
         return None
-
-    async def reply_file_by_id(self, message_id, file_key, file_name):
-        return True
 
 
 @pytest.fixture
@@ -374,6 +384,83 @@ async def test_send_document_replies_to_card(adapter) -> None:
 async def test_send_document_without_card_falls_to_native(adapter) -> None:
     await adapter.send_document("ghost_chat", "/tmp/x.pdf")
     assert adapter.native_docs
+
+
+async def _thread_and_main_sessions(adapter) -> tuple[Any, Any]:
+    """话题 + 主聊双会话：卡消息 id 区分（om_thread_card / om_main_card）.
+
+    主聊会话后建（chat 级 latest = 主聊卡）——验证媒体锚不被 latest 带偏。
+    """
+    engine = adapter._engine()
+    engine.client.reply_card_by_id = AsyncMock(
+        side_effect=["om_thread_card", "om_main_card"])
+    engine.on_draft("chat1", "话题正文", reply_to="om_user_thread", thread_id="omt_1")
+    await _settle(engine)
+    await engine.complete("chat1", "话题正文", thread_id="omt_1")
+    engine.on_draft("chat1", "主聊正文", reply_to="om_user_main")
+    await _settle(engine)
+    await engine.complete("chat1", "主聊正文")
+    thread_session = engine.session_for("chat1", "omt_1")
+    main_session = engine.session_for("chat1")
+    assert thread_session.card_msg_id == "om_thread_card"
+    assert main_session.card_msg_id == "om_main_card"
+    return thread_session, main_session
+
+
+@pytest.mark.asyncio
+async def test_send_document_thread_metadata_targets_thread_card(adapter) -> None:
+    """话题回合的文件必须进话题（metadata.thread_id 锚），不能挂到 chat 级最新卡."""
+    await _thread_and_main_sessions(adapter)
+    engine = adapter._engine()
+
+    result = await adapter.send_document(
+        "chat1", "/tmp/report.pdf", metadata={"thread_id": "omt_1"})
+
+    assert result.success is True and result.message_id == "om_thread_card"
+    assert engine.client.reply_file_by_id.await_args.args[0] == "om_thread_card"
+    assert adapter.native_docs == []  # 不走官方顶层直发
+
+
+@pytest.mark.asyncio
+async def test_send_image_file_replies_to_thread_card(adapter) -> None:
+    """本地图片（base.send_multiple_images 的 file:// 分支）随话题卡进线程."""
+    await _thread_and_main_sessions(adapter)
+    engine = adapter._engine()
+
+    result = await adapter.send_image_file(
+        "chat1", "/tmp/photo.jpg", metadata={"thread_id": "omt_1"})
+
+    assert result.success is True and result.message_id == "om_thread_card"
+    engine.client.upload_image_file.assert_awaited_once_with("/tmp/photo.jpg")
+    assert engine.client.reply_image_by_id.await_args.args[0] == "om_thread_card"
+    assert adapter.native_images == []
+
+
+@pytest.mark.asyncio
+async def test_send_document_fallback_carries_thread_anchor(adapter) -> None:
+    """卡片上传失败时官方回退也要带线程内回复锚（不顶层直发）."""
+    await _thread_and_main_sessions(adapter)
+    engine = adapter._engine()
+    engine.client.upload_document = AsyncMock(return_value=None)  # 上传失败 → 回退
+
+    await adapter.send_document("chat1", "/tmp/x.pdf", metadata={"thread_id": "omt_1"})
+
+    assert adapter.native_docs, "应回退官方 send_document"
+    _chat_id, _file_path, reply_to, _metadata = adapter.native_docs[0]
+    assert reply_to == "om_thread_card"  # 线程内锚（卡消息），非 None 顶层
+
+
+@pytest.mark.asyncio
+async def test_send_document_quoted_file_url_decodes_name(adapter) -> None:
+    """file:// + quote 的路径（run_notifications 契约）解码出文件名传给 reply."""
+    adapter._engine().on_draft("chat1", "给你文件")
+    await _settle(adapter._engine())
+    await adapter._engine().complete("chat1", "给你文件")
+
+    await adapter.send_document("chat1", "file:///tmp/my%20report.pdf")
+
+    _card_msg_id, _file_key, file_name = adapter._engine().client.reply_file_by_id.await_args.args
+    assert file_name == "my report.pdf"
 
 
 # ── manifest 与 register ──
