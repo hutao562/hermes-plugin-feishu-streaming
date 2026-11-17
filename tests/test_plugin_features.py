@@ -1173,7 +1173,13 @@ async def test_usage_hook_routes_by_chat_across_engines() -> None:
 
 
 def test_fanout_registers_profile_scopes() -> None:
-    """补注册把平台条目写进每个 live profile 的 registry scope 桶."""
+    """补注册把平台条目写进**每个** live profile 的 registry scope 桶（含 default）.
+
+    2026-11-17 梦珊机事故：ctx.register_platform 落桶在 manager.scope_key，
+    不保证等于 default home 键——default 桶空 + 内置 feishu 被 user-covers-bundled
+    挤出 discovery → default profile「No adapter available」。fan-out 不得跳过
+    任何 live profile 桶。
+    """
     import plugin as plugin_pkg
 
     registered = {}
@@ -1206,7 +1212,7 @@ def test_fanout_registers_profile_scopes() -> None:
             else:
                 sys.modules[m] = mod
     assert "key:/h/family" in registered, "family scope 必须被补注册"
-    assert "key:/h/default" not in registered, "注册 scope 本身不重复"
+    assert "key:/h/default" in registered, "default scope 必须被补注册（manager.scope_key 不可假设）"
     assert registered["key:/h/family"]["name"] == "feishu"
 
 

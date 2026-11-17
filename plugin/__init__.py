@@ -201,8 +201,14 @@ def _profile_disabled_plugin(home: Any) -> bool:
 
 
 def _fanout_to_profile_scopes(entry_kwargs: dict[str, Any]) -> None:
-    """把平台条目补注册到每个 live profile 的 registry scope 桶.
+    """把平台条目补注册到**每个** live profile 的 registry scope 桶（含 current）.
 
+    ctx.register_platform 落桶在 manager.scope_key——multiplex 下 plugin boot
+    现场的 manager scope 不保证等于 default home 键（2026-11-17 梦珊机确定性
+    复现：j-s 建档后首次全量重启，default 桶空 + user-covers-bundled 又把内置
+    feishu 插件挤出 discovery → default profile「No adapter available for
+    feishu」，bot 掉线直到下一次重启也不自愈）。因此这里不做 current 跳过：
+    所有 live profile 桶无条件补注册（同桶重写为同一 entry，幂等无害）。
     全局默认全 profile 启用；profile 在自己 config 的 plugins.disabled 里
     写 feishu-streaming-platform 可退出（回退官方 bundled adapter）。
     """
@@ -211,11 +217,8 @@ def _fanout_to_profile_scopes(entry_kwargs: dict[str, Any]) -> None:
         from hermes_cli.profiles import profiles_to_serve  # type: ignore[import-not-found]
         from hermes_constants import hermes_home_key  # type: ignore[import-not-found]
 
-        current = hermes_home_key()
         for profile_name, home in profiles_to_serve(multiplex=True):
             key = hermes_home_key(home)
-            if key == current:
-                continue
             if _profile_disabled_plugin(home):
                 _diag_log(f"profile '{profile_name}' disabled this plugin — skip fan-out")
                 continue
