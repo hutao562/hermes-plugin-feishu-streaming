@@ -705,7 +705,7 @@ def test_hook_fanout_registers_into_other_profile_manager(monkeypatch: Any) -> N
     plugins_mod = _stub_hermes_plugin_scope(
         monkeypatch, [("default", "/hermes"), ("family", "/home-family")])
     cb = lambda **kw: None  # noqa: E731
-    plugin_pkg._FANED_HOOK_IDS.clear()
+    plugin_pkg._HOOKED_MANAGERS.clear()
 
     plugin_pkg._fanout_hooks_to_profile_scopes({"on_stream_delta": cb}, manifest=object())
     mgr = plugins_mod._managers["/home-family"]
@@ -720,7 +720,7 @@ def test_hook_fanout_reuses_existing_manager_and_dedupes(monkeypatch: Any) -> No
     plugins_mod = _stub_hermes_plugin_scope(
         monkeypatch, [("default", "/hermes"), ("family", "/home-family")])
     cb = lambda **kw: None  # noqa: E731
-    plugin_pkg._FANED_HOOK_IDS.clear()
+    plugin_pkg._HOOKED_MANAGERS.clear()
 
     plugin_pkg._fanout_hooks_to_profile_scopes({"on_stream_delta": cb}, manifest=object())
     plugin_pkg._fanout_hooks_to_profile_scopes({"on_stream_delta": cb}, manifest=object())  # 重跑幂等
@@ -728,6 +728,25 @@ def test_hook_fanout_reuses_existing_manager_and_dedupes(monkeypatch: Any) -> No
     mgr = next(iter(plugins_mod._managers.values()))
     assert mgr.scope_key == "/home-family"
     assert mgr._hooks["on_stream_delta"] == [cb]
+
+
+def test_register_hooks_idempotent_per_manager(monkeypatch: Any) -> None:
+    """v0.21.2 per-profile 拷贝：register() 每装一份的 scope PM 各调一次——同一
+    manager 只挂一份钩子（官方 append 无去重，双挂 = reasoning 增量双倍渲染）."""
+    import plugin as plugin_pkg
+
+    plugins_mod = _stub_hermes_plugin_scope(
+        monkeypatch, [("default", "/hermes"), ("family", "/home-family")])
+    plugin_pkg._HOOKED_MANAGERS.clear()
+    mgr = plugins_mod.get_plugin_manager()  # default scope 的 manager
+    ctx = plugins_mod.PluginContext(object(), mgr)
+    hooks = {"on_stream_delta": lambda **kw: None, "post_api_request": lambda **kw: None}
+
+    plugin_pkg._register_hooks_to_context(ctx, hooks, mgr)
+    plugin_pkg._register_hooks_to_context(ctx, hooks, mgr)  # 第二次 register() 同 manager
+
+    assert len(mgr._hooks["on_stream_delta"]) == 1
+    assert len(mgr._hooks["post_api_request"]) == 1
 
 
 @pytest.mark.asyncio

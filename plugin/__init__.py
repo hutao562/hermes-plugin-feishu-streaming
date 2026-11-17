@@ -16,6 +16,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -137,13 +138,13 @@ def register(ctx: Any) -> None:
     if hasattr(ctx, "register_hook"):
         reasoning_hook = _make_reasoning_hook()
         usage_hook = _make_usage_hook()
-        ctx.register_hook("on_stream_delta", reasoning_hook)
-        # usage 聚合（footer tokens/t/s）：session_id 含 chat_id 路由到所属 engine
-        ctx.register_hook("post_api_request", usage_hook)
-        # hook 注册表按 profile 分 manager（get_plugin_manager 按 home 缓存，各自
-        # 独立 _hooks）——与平台条目分桶同病：这里注册的回调只落在当前 scope，
-        # secondary profile 的流线程查自己的 manager 为空 → reasoning 流静默
-        # 丢弃（安安侧折叠条消失的根因）。补注册到每个 live profile 的 manager。
+        # register() 会被每个装了本插件的 scope PM 各调一次（v0.21.2 per-profile
+        # 拷贝）——同 manager 只挂一份（_HOOKED_MANAGERS 去重），未装拷贝的
+        # profile 由 fan-out 兜底
+        _register_hooks_to_context(ctx, {
+            "on_stream_delta": reasoning_hook,
+            "post_api_request": usage_hook,
+        }, getattr(ctx, "_manager", None))
         _fanout_hooks_to_profile_scopes({
             "on_stream_delta": reasoning_hook,
             "post_api_request": usage_hook,
@@ -232,8 +233,22 @@ def _fanout_to_profile_scopes(entry_kwargs: dict[str, Any]) -> None:
         _diag_log(f"profile scope fan-out FAILED: {exc!r}")
 
 
-# 钩子 fan-out 已注册的回调身份（reload-plugins/重跑幂等；官方 append 无去重）
-_FANED_HOOK_IDS: set[int] = set()
+# 已挂上本插件钩子的 PluginManager（弱引用集合：reload 后 manager 重建、旧对象
+# 被回收即自动除名——重复 register() 幂等，官方 append 无去重）。v0.21.2 起
+# register() 会被**每个装了本插件的 scope PM** 各调一次（per-profile 拷贝部署），
+# 按 manager 身份去重取代旧的回调 id 集合（回调 id 会让第二次 register 的
+# fan-out 全跳，且挡不住同 manager 重复 append）。
+_HOOKED_MANAGERS: weakref.WeakSet[Any] = weakref.WeakSet()
+
+
+def _register_hooks_to_context(context: Any, hooks: dict[str, Any], manager: Any) -> None:
+    """把钩子挂到 context 所属 manager（已挂过则跳过——多 scope register 幂等）."""
+    if manager is not None and manager in _HOOKED_MANAGERS:
+        return
+    for name, callback in hooks.items():
+        context.register_hook(name, callback)
+    if manager is not None:
+        _HOOKED_MANAGERS.add(manager)
 
 
 def _fanout_hooks_to_profile_scopes(hooks: dict[str, Any], manifest: Any = None) -> None:
@@ -242,11 +257,11 @@ def _fanout_hooks_to_profile_scopes(hooks: dict[str, Any], manifest: Any = None)
     manager 按解析到的 home 缓存（_plugin_home_key → get_hermes_home contextvar），
     插件只在 discovery scope 注册一次，secondary profile 的 manager 查不到本插件
     的回调 → 其流线程按自己的 manager 迭代钩子为空（安安侧 reasoning 丢失根因）。
-    官方 startup 的 per-profile discover_plugins() 并不会把本插件重复装进 secondary
-    manager（生产实证 register() 每进程仅一次）——因此这里显式补注册。catalog 准入
-    "no core override" 红线禁止写 hermes 私有字段，全程走公开面：home override
-    （hermes_constants 公开 contextvar API）→ get_plugin_manager()（官方：缺席即建
-    +缓存）→ PluginContext.register_hook（官方 facade 方法）。
+    v0.21.2 起装了 per-profile 拷贝的 profile 由自己的 discovery 注册（官方路径），
+    fan-out 只兜未装拷贝的 profile。catalog 准入 "no core override" 红线禁止写
+    hermes 私有字段，全程走公开面：home override（hermes_constants 公开 contextvar
+    API）→ get_plugin_manager()（官方：缺席即建+缓存）→ PluginContext.register_hook
+    （官方 facade 方法）。
     """
     try:
         from hermes_cli import plugins as plugins_mod
@@ -271,11 +286,7 @@ def _fanout_hooks_to_profile_scopes(hooks: dict[str, Any], manifest: Any = None)
             finally:
                 reset_hermes_home_override(token)
             context = plugins_mod.PluginContext(manifest, manager)
-            for name, callback in hooks.items():
-                if id(callback) in _FANED_HOOK_IDS:
-                    continue
-                context.register_hook(name, callback)
-                _FANED_HOOK_IDS.add(id(callback))
+            _register_hooks_to_context(context, hooks, manager)
             _diag_log(f"hooks fanned out to profile '{profile_name}' (scope={key})")
         except Exception as exc:
             _diag_log(f"hook fan-out to profile '{profile_name}' FAILED: {exc!r}")
