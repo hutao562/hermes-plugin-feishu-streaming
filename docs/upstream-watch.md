@@ -99,3 +99,19 @@
 - 关联：hermes-compat issue 0 open；本地 v0.20.0（f2da601，hermes 0.23.0 适配）在案。
 
 - 追记（同日，用户批准执行 11-11 条目的补锚建议）：`tools/clarify_gateway.py` 已补锚——`CONTRACT_ANCHORS` 四针（resolve_gateway_clarify / mark_awaiting_text / resolve_clarify_timeout / get_pending 签名，均在 pinned 2bd378e 与上游 main a55a299 双版核对）+ `TREE_FILES`/manifest 同 revision 扩清单（sha 7052ea98…，样本自动下载验证）；`attempt_text_response` 太新（a55a299 窗口才拆出）刻意不锚。pytest 契约回归 12 通过、ruff/mypy 全绿、`hermes plugins validate` passed。至此 2026-10-18 盲区清单（父类覆写面 11-02 已锚、env 桥 11-02 已锚、clarify_gateway 本次）全部闭合。待办仅剩：authority 是否覆盖插件按钮路径（产品决策）、部署/版本号随下次发版。
+
+## 2026-11-18 上游 da9c2bd（基线 2bd378e，较前已验证 fae118d 全窗 11-13~11-18 六天）
+
+- 状态：**锚点缺失 1 处（结构性，非行为破坏）**——`plugins/platforms/feishu/adapter.py: _dispatch_synthetic_event(` 在上游 main 缺席：合成事件面整体迁出到新文件 `plugins/platforms/feishu/adapter_synthetic_events.py`（`FeishuSyntheticEventsMixin`，与 11-06 choice_cards 同一拆分模式）；**签名逐字未变**（`text/message_type/chat_id/sender_id/event_chat_type/raw_message/message_id` 六 keyword-only 参数一致）——footer 🧠⇄ / clarify 按钮的 SDK 入口拦截与覆写面无实质破坏，插件可继续工作；其余 27 锚全绿
+- 巡检备注：11-13~11-17 每日调度未产出执行（队列堆积），本条覆盖六天窗口
+- 上游改动（24 关注文件 18 变 / 6 未变，按主题归纳）：
+  1. **父类模块化继续**：`adapter.py` +38/−127，合成事件面迁出（`_dispatch_synthetic_event` 现于 adapter_synthetic_events.py:129）；choice_cards ±3——**锚点清单须跟进上游模块化**（本次缺失即此因）
+  2. **draft 传输韧性增强**：`stream_consumer_transport.py` +52/−10——draft 帧发送失败从「永久禁用本回合 draft」改为**预算延迟重试**（`_defer_draft_retry`/`_draft_retry_until`/`_should_push_draft`，flood 冷却期暂停而非放弃）；stream_consumer +138/−35、fallback +124/−16 同主题（发送不确定仲裁继续演进）——对插件利好：临时失败不再全回合降级到纯文本
+  3. **cron 调度拆模块**：scheduler_delivery +117/−215、scheduler +86/−117——CRON_WRAP 信封 needle 内容级验证仍在（新 scheduler_delivery 中 header/管理尾 count=2）
+  4. `run_notifications.py` +97/−122：继续演进，thread_id 媒体路由面仍在（23 处），v0.21.0 三锚绿
+  5. `clarify_gateway.py` +3/−21：删 per-session `_notify_cbs` 桥 + `_coerce_text_response` 薄包装——四针（resolve_gateway_clarify/mark_awaiting_text/resolve_clarify_timeout/get_pending）绿
+  6. `stream_delivery.py` +60/−31：`_deliver_interim` 加参 + codex commentary 提取——**on_stream_delta/started_at 钩子签名零命中**，usage/reasoning 钩子面未动
+  7. 其余 run.py/run_inbound/run_busy/run_turn/run_turn_runner/run_startup/platform_registry/response_filters ±（scope/入站/调度演进）；stream_consumer_think/fences/think_scrubber/api_request_hooks/interrupt_control/gateway_env 未动
+- 影响面：①**锚点体系与上游模块化的赛跑**——父类已拆三块（adapter/choice_cards/synthetic_events），needle 锚「文件路径+子串」形态对拆分敏感；②draft 重试增强、cron 拆分、clarify 内部精简均无插件接口变化；③合成事件语义未变（event_chat_type/raw_type 口径照旧）
+- 建议处理方案（下个锚点窗口执行，本次不处理）：①`contract.py` 合成事件面锚迁移——`adapter.py` 保留 MRO 锚（`FeishuSyntheticEventsMixin` import 行）+ `adapter_synthetic_events.py` 新文件锚 `_dispatch_synthetic_event(` 签名，**双文件锚**防再次拆分；②`adapter_choice_cards.py`/`adapter_synthetic_events.py` 纳入 manifest/TREE_FILES（同 revision 扩清单）；③验证：pytest 契约回归 + check_tree 对 pinned/main 双树 + ruff/mypy + `hermes plugins validate`
+- 关联：hermes-compat issue 0 open（hutao562 #1 已于 11-11 关闭，GH Action 已禁用，本记录为唯一报警通道）
