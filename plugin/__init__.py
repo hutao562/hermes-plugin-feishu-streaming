@@ -134,21 +134,19 @@ def register(ctx: Any) -> None:
     _diag_log(f"platform registered via ctx (scope entry, env_bridge={len(env_overrides)} steps)")
     _fanout_to_profile_scopes(entry_kwargs)
 
-    # reasoning 流观察（off token path）：钩子不带 chat，引擎路由按全局单活跃会话兜底
+    # reasoning 流观察（off token path）：钩子不带 chat，引擎路由按 profile 作用域 +
+    # session_id 精确路由（pre_api_request 登记），未路由时按本 profile 单活跃会话兜底
     if hasattr(ctx, "register_hook"):
-        reasoning_hook = _make_reasoning_hook()
-        usage_hook = _make_usage_hook()
+        hooks = {
+            "on_stream_delta": _make_reasoning_hook(),
+            "pre_api_request": _make_pre_api_hook(),
+            "post_api_request": _make_usage_hook(),
+        }
         # register() 会被每个装了本插件的 scope PM 各调一次（v0.21.2 per-profile
         # 拷贝）——同 manager 只挂一份（_HOOKED_MANAGERS 去重），未装拷贝的
         # profile 由 fan-out 兜底
-        _register_hooks_to_context(ctx, {
-            "on_stream_delta": reasoning_hook,
-            "post_api_request": usage_hook,
-        }, getattr(ctx, "_manager", None))
-        _fanout_hooks_to_profile_scopes({
-            "on_stream_delta": reasoning_hook,
-            "post_api_request": usage_hook,
-        }, manifest=getattr(ctx, "manifest", None))
+        _register_hooks_to_context(ctx, hooks, getattr(ctx, "_manager", None))
+        _fanout_hooks_to_profile_scopes(hooks, manifest=getattr(ctx, "manifest", None))
 
 
 def _build_scoped_engine() -> tuple[ChatCardEngine, Any]:
@@ -173,6 +171,9 @@ def _build_scoped_engine() -> tuple[ChatCardEngine, Any]:
         tool_panel_expanded=_panel_expanded_config("tool_panel_expanded"),
         reasoning_panel_expanded=_panel_expanded_config("reasoning_panel_expanded"),
     )
+    # 构建现场 = 目标 profile 的 runtime scope：记下作用域键，钩子路由按它收敛
+    # 到本 profile 的 engine（_scope_engines）
+    engine.scope_key = _current_scope_key()
     with _ENGINES_LOCK:
         _ENGINES.append(engine)
     _diag_log(f"scoped engine built (home={_current_home()})")
@@ -295,35 +296,106 @@ def _fanout_hooks_to_profile_scopes(hooks: dict[str, Any], manifest: Any = None)
 # 跨 engine 钩子路由（multiplex 下每 profile 一个 engine）
 _ENGINES: list[ChatCardEngine] = []
 _ENGINES_LOCK = threading.Lock()
-# hermes session_id（date_hash）→ (engine, chat)：usage 钩子在回合并发窗口登记，
-# reasoning 增量按它精确路由（hermes 会话跨回合持久——自第 2 回合起生效，
-# 首回合仍走单活跃兜底）。TTL 10 分钟防陈旧映射跨会话误路由。
-_SESSION_ROUTE: dict[str, tuple[ChatCardEngine, str, float]] = {}
+# hermes session_id（date_hash）→ (engine, chat, thread, 登记时间)。pre_api_request
+# 与 usage 钩子在「本 profile 恰好一个进行中回合」窗口登记，reasoning 增量按它
+# 精确路由。TTL 防陈旧映射跨会话误路由——pre_api_request 每次 API 调用前续期。
+_SESSION_ROUTE: dict[str, tuple[ChatCardEngine, str, str | None, float]] = {}
 _SESSION_ROUTE_TTL = 600.0
 
 
-def _note_session_route(session_id: str, engine: ChatCardEngine, chat_id: str) -> None:
-    if not session_id or not chat_id:
+def _current_scope_key() -> str | None:
+    """当前 profile 作用域键（contextvar 感知）；hermes 不可导入时 None."""
+    try:
+        from hermes_constants import hermes_home_key  # type: ignore[import-not-found]
+
+        return str(hermes_home_key())
+    except Exception:
+        return None
+
+
+def _scope_engines() -> list[ChatCardEngine]:
+    """当前 profile 作用域内的 engine；无法判定或无命中则返回全部（单测/未标记 engine）.
+
+    钩子回调运行在**发起回合的 contextvars** 里（上游 plugin_stream_hooks 的
+    dispatcher 以 context.copy().run 调回调），hermes_home_key() 取到的就是该回合
+    的 profile——multiplex 下路由先按 profile 收敛，不再把别的 profile 的进行中
+    会话当成并发歧义（2026-11-19~24 两机实测：`reasoning dropped (multi-session)
+    engines=2 sessions=[1, 1]` 数百次，另一 engine 只是有个进行中会话）。
+    """
+    with _ENGINES_LOCK:
+        engines = list(_ENGINES)
+    key = _current_scope_key()
+    if key is not None:
+        scoped = [e for e in engines if e.scope_key == key]
+        if scoped:
+            return scoped
+    return engines
+
+
+def _single_open_session(engines: list[ChatCardEngine]) -> tuple[ChatCardEngine, Any] | None:
+    """恰好一个 engine 有恰好一个进行中会话（creating 也算）→ (engine, session)；歧义 None."""
+    hit: tuple[ChatCardEngine, Any] | None = None
+    for engine in engines:
+        opens = engine.open_sessions()
+        if not opens:
+            continue
+        if len(opens) > 1 or hit is not None:
+            return None
+        hit = (engine, opens[0])
+    return hit
+
+
+def _hook_platform(kwargs: dict[str, Any]) -> str:
+    """钩子载荷里的回合来源：pre/post_api_request 的 platform、stream 钩子的 surface."""
+    return str(kwargs.get("platform") or kwargs.get("surface") or "").strip().lower()
+
+
+def _non_feishu_turn(kwargs: dict[str, Any]) -> bool:
+    """载荷明确标注了非 feishu 来源（cron / 子代理 / 其它平台）——其 usage 与
+    reasoning 不得进飞书卡。缺字段（老版本上游/单测）不拦。"""
+    surface = _hook_platform(kwargs)
+    return bool(surface) and surface != "feishu"
+
+
+def _note_session_route(session_id: str, engine: ChatCardEngine, session: Any) -> None:
+    if not session_id:
         return
     now = time.time()
     with _ENGINES_LOCK:
         # 顺带清扫过期项（懒清理，防无界增长）
-        stale = [k for k, v in _SESSION_ROUTE.items() if now - v[2] > _SESSION_ROUTE_TTL]
+        stale = [k for k, v in _SESSION_ROUTE.items() if now - v[3] > _SESSION_ROUTE_TTL]
         for k in stale:
             _SESSION_ROUTE.pop(k, None)
         if len(_SESSION_ROUTE) > 256:
             _SESSION_ROUTE.clear()
-        _SESSION_ROUTE[session_id] = (engine, chat_id, now)
+        _SESSION_ROUTE[session_id] = (engine, session.chat_id, session.thread_id, now)
 
 
-def _route_by_session(session_id: str) -> tuple[ChatCardEngine, str] | None:
+def _bind_session_route(session_id: str) -> tuple[ChatCardEngine, str, str | None] | None:
+    """把 hermes session_id 绑到当前 profile 唯一的进行中会话；返回路由三元组.
+
+    「本 profile 恰好一个进行中会话」时（重新）登记——同回合多次 API 调用借此
+    续期并跟随 followup/redirect 换出的新会话对象；歧义（同 profile 主聊+话题
+    并发）时复用既有有效路由，没有则返回 None——宁可不路由，也不猜。
+    """
+    session_id = str(session_id or "")
+    if not session_id:
+        return None
+    hit = _single_open_session(_scope_engines())
+    if hit is not None:
+        _note_session_route(session_id, hit[0], hit[1])
+        return hit[0], hit[1].chat_id, hit[1].thread_id
+    return _route_by_session(session_id)
+
+
+def _route_by_session(session_id: str) -> tuple[ChatCardEngine, str, str | None] | None:
     if not session_id:
         return None
     now = time.time()
     with _ENGINES_LOCK:
         hit = _SESSION_ROUTE.get(session_id)
-    if hit and now - hit[2] <= _SESSION_ROUTE_TTL:
-        return hit[0], hit[1]
+    if hit and now - hit[3] <= _SESSION_ROUTE_TTL:
+        return hit[0], hit[1], hit[2]
     return None
 
 
@@ -507,33 +579,56 @@ def _make_reasoning_hook() -> Any:
         text = kwargs.get("delta") or kwargs.get("text") or ""
         if not text:
             return
-        # session_id 精确路由（usage 登记的映射）优先；未登记（首回合）回退
-        # 「全局恰好一个活跃会话」兜底
-        routed = _route_by_session(str(kwargs.get("session_id") or ""))
-        if routed is not None:
-            routed[0].on_reasoning(routed[1], text, strict=True)
+        if _non_feishu_turn(kwargs):
+            # cron/子代理/其它平台回合的思考不进飞书卡（surface=agent.platform）
             return
-        with _ENGINES_LOCK:
-            engines = list(_ENGINES)
-        actives = [(e, e.streaming_sessions()) for e in engines]
-        actives = [(e, s) for e, s in actives if s]
-        if len(actives) == 1 and len(actives[0][1]) == 1:
-            actives[0][0].on_reasoning("", text)
-        elif not actives:
+        # session_id 精确路由（pre_api_request / usage 登记的映射）优先；未登记
+        # （同 profile 并发歧义、hook 早于回合建会话）回退「本 profile 恰好一个
+        # 进行中会话」兜底——含 creating：建卡窗口内的思考此前被无声丢弃
+        session_id = str(kwargs.get("session_id") or "")
+        routed = _route_by_session(session_id)
+        if routed is not None:
+            # strict：命中即只进自己的会话（chat+thread 键），目标不活跃就丢弃
+            routed[0].on_reasoning(routed[1], text, strict=True, thread_id=routed[2])
+            return
+        hit = _single_open_session(_scope_engines())
+        if hit is not None:
+            hit[0].on_reasoning(hit[1].chat_id, text, thread_id=hit[1].thread_id)
+            return
+        opens = [(e, e.open_sessions()) for e in _scope_engines()]
+        opens = [(e, s) for e, s in opens if s]
+        if not opens:
             # 零活跃卡片会话（CLI/cron/其它平台回合，或卡片均已收尾）——没有卡片可丢，
             # 属无损忽略：计入 dropped 只会刷日志（实测非飞书长回合 4000+ 条 INFO 噪音）。
             # 不变量：只有「存在活跃卡片却没路由上」的丢弃才需要可见。
             return
-        else:
-            # 多会话并发时防串扰丢弃——但要可见（曾静默丢成「折叠条消失」）
-            dropped["n"] += 1
-            if dropped["n"] == 1 or dropped["n"] % 50 == 0:
-                logging.getLogger("gateway.run").info(
-                    "[feishu-streaming] reasoning dropped (multi-session): "
-                    "engines=%d sessions=%s total_dropped=%d",
-                    len(actives), [len(s) for _, s in actives], dropped["n"])
+        # 多会话并发时防串扰丢弃——但要可见（曾静默丢成「折叠条消失」）
+        dropped["n"] += 1
+        if dropped["n"] == 1 or dropped["n"] % 50 == 0:
+            logging.getLogger("gateway.run").info(
+                "[feishu-streaming] reasoning dropped (multi-session): "
+                "engines=%d sessions=%s total_dropped=%d",
+                len(opens), [len(s) for _, s in opens], dropped["n"])
 
     return on_stream_delta
+
+
+def _make_pre_api_hook() -> Any:
+    """pre_api_request：首个 reasoning 增量到达**之前**把 session_id 绑到进行中会话.
+
+    旧实现只在 post_api_request（API 调用结束）登记 + 10 分钟 TTL：用户歇过
+    TTL 再发消息，新回合首个 API 调用的思考到达时路由已过期，只能走全局单活跃
+    兜底——多 profile 下别的 engine 只要有进行中会话就整体丢弃（2026-11-19~24
+    两机 `reasoning dropped (multi-session)` 数百次的主因）。pre_api_request 在
+    每次 API 调用前同步触发，此时回合会话已由探针建好。
+    """
+
+    def on_pre_api_request(**kwargs: Any) -> None:
+        if _non_feishu_turn(kwargs):
+            return
+        _bind_session_route(kwargs.get("session_id") or "")
+
+    return on_pre_api_request
 
 
 def _make_usage_hook() -> Any:
@@ -543,20 +638,24 @@ def _make_usage_hook() -> Any:
         usage = kwargs.get("usage")
         if not (isinstance(usage, dict)):
             return
+        if _non_feishu_turn(kwargs):
+            # cron/子代理的 usage 不进卡片 footer（否则落 "" 桶，被下一张完成卡误取）
+            return
         session_id = kwargs.get("session_id") or ""
-        with _ENGINES_LOCK:
-            engines = list(_ENGINES)
-        engine = _route_usage_engine(engines, session_id)
+        scoped = _scope_engines()
+        routed = _bind_session_route(session_id)
+        chat_id = routed[1] if routed is not None else ""
+        engine = (routed[0] if routed is not None
+                  else _route_usage_engine(scoped, session_id))
         if engine is None:
             return
-        # 恰好一个进行中回合 → 登记 session→chat 映射，供 reasoning 增量路由
-        open_sessions = engine.open_sessions()
-        if len(open_sessions) == 1:
-            _note_session_route(session_id, engine, open_sessions[0].chat_id)
         usage = {**usage, "context_length": kwargs.get("context_length"),
                  "started_at": kwargs.get("started_at"),
                  "ended_at": kwargs.get("ended_at")}
-        engine.record_usage(session_id, usage, model=kwargs.get("model") or "")
+        # 路由命中时按路由的 chat 归桶：date_hash 形 session_id 解析不出 chat，
+        # 旧实现一律落 "" 桶，同 profile 两个并发回合的 usage 会混在一起
+        engine.record_usage(session_id, usage, model=kwargs.get("model") or "",
+                            chat_id=chat_id)
         if session_id not in logged:  # 每回合桶首条打一次（确认钩子活性）
             logged.add(session_id)
             logging.getLogger("gateway.run").info(
@@ -569,10 +668,10 @@ def _make_usage_hook() -> Any:
 def _route_usage_engine(engines: list[ChatCardEngine], session_id: str) -> ChatCardEngine | None:
     """session key 里的 chat → 拥有该 chat 会话的 engine；无命中回退唯一 engine.
 
-    multiplex（≥2 engine，10-08 晚 fan-out 后 boot 即建双 engine）下 agent.session_id
-    是 date_hash 形、不含 chat——单 engine 兜底失效即「footer 只剩时间」回归的根因；
-    补「恰好一个 engine 有进行中回合」的兜底（与 on_stream_delta 同一判据，creating
-    也算活跃）。并发歧义时放弃，footer 退化为纯时长。
+    multiplex（≥2 engine）下 agent.session_id 是 date_hash 形、不含 chat——单 engine
+    兜底失效即「footer 只剩时间」回归的根因。入参已是**当前 profile 作用域内**的
+    engine（_scope_engines）：单 profile 作用域恒为 1 个，直接采用；未标记作用域
+    （单测/老 engine）时保留「恰好一个 engine 有进行中回合」的旧兜底。
     """
     chat = ChatCardEngine._chat_of_session(session_id)
     if chat:

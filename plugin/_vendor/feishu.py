@@ -12,7 +12,6 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import URLError
-from urllib.parse import unquote
 from urllib.request import Request, urlopen
 
 import lark_oapi as lark
@@ -36,11 +35,15 @@ from lark_oapi.api.im.v1 import (
     CreateImageRequestBody,
     CreateMessageRequest,
     CreateMessageRequestBody,
+    ListMessageRequest,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
 
+# 路径工具定义在 paths（本模块顶层 import lark_oapi 很重，插件加载期不该为两个
+# 小函数付这笔钱）；此处再导出保持 `from ._vendor.feishu import local_file_*` 可用
 from .config import DEFAULT_DOMAIN
+from .paths import local_file_name, local_file_path
 
 _FILE_TYPE_BY_EXT: dict[str, str] = {
     ".pdf": "pdf",
@@ -56,25 +59,6 @@ _FILE_TYPE_BY_EXT: dict[str, str] = {
     ".opus": "opus",
     ".ogg": "opus",
 }
-
-
-def local_file_path(path: str) -> str:
-    """file:// URL → 本地路径（quote 解码）；裸路径原样返回.
-
-    gateway run_notifications 以 f"file://{quote(p)}" 传本地媒体——Windows
-    盘符路径必含 %3A%5C，含空格/中文路径必被 quote，不解码读取必失败
-    （2026-11-17 梦珊机话题群文件投递事故链之一）。
-    """
-    if path.startswith("file://"):
-        return unquote(path[len("file://"):])
-    return path
-
-
-def local_file_name(path: str, override: str | None = None) -> str:
-    """展示用文件名：显式指定优先，否则取（解码后）路径 basename."""
-    if override:
-        return override
-    return os.path.basename(local_file_path(path))
 
 
 _logger = logging.getLogger("hermes_lark_streaming")
@@ -463,6 +447,31 @@ class FeishuClient:
         if not data:
             return None
         return await self._upload_file_bytes(data, name, file_type)
+
+    async def last_message_in_thread(self, thread_id: str) -> str | None:
+        """话题（线程）内最新一条消息的 message_id——无锚回合的回复目标.
+
+        官方 adapter 无 reply 锚时用 ``receive_id_type="thread_id"`` 直发话题，
+        实测恒 99992402 field validation failed（2026-11-19~24 两机 3 条投递
+        义务失败）；话题内任意消息都是合法 reply 目标，reply 进去即落在线程里。
+        需要 im:message 读权限；失败抛 FeishuAPIError（调用方决定降级）。
+        """
+        request = (
+            ListMessageRequest.builder()
+            .container_id_type("thread")
+            .container_id(thread_id)
+            .page_size(1)
+            .sort_type("ByCreateTimeDesc")
+            .build()
+        )
+        resp = await self._checked_call(
+            "last_message_in_thread",
+            lambda: self._client.im.v1.message.alist(request),
+        )
+        items = list(getattr(resp.data, "items", None) or [])
+        if items:
+            return str(getattr(items[0], "message_id", "") or "") or None
+        return None
 
     async def reply_file_by_id(self, message_id: str, file_key: str, file_name: str) -> bool:
         """以 file 消息回复指定消息（卡片消息），文件落在卡片正下方的会话链里.

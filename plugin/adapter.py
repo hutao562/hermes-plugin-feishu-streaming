@@ -32,7 +32,7 @@ from ._vendor.cardkit.builder import (
     build_model_picker_card,
     build_model_switch_ack_card,
 )
-from ._vendor.feishu import local_file_name
+from ._vendor.paths import local_file_name
 from .contract import CRON_WRAP_DIVIDER, CRON_WRAP_FOOTER_PREFIX, CRON_WRAP_HEADER, CRON_WRAP_JOBID_LINE
 from .engine import ChatCardEngine
 
@@ -185,32 +185,36 @@ class StreamingFeishuMixin:
         interim = bool((metadata or {}).get("_interim_send"))
         thread_id = (metadata or {}).get("thread_id")
         session = engine.active_session(chat_id, thread_id)
+        is_ack = bool(content) and content.lstrip().startswith(_BUSY_ACK_PREFIXES)
 
         if interim and session is not None:
-            # 心跳/进度 → 卡片末尾状态行（不产生真消息）
+            # 心跳/进度 → 卡片末尾状态行（不产生真消息）。卡尚未建好（card_msg_id
+            # 未落）时返回无 id 成功——"lark-card:None" 会被上游拿去原生 edit
+            # （2026-11-23 j-s 实证：SSLError + 垃圾 url /im/v1/messages/lark-card%3ANone）
             engine.on_heartbeat(chat_id, content, thread_id=thread_id)
-            return _compat.send_result(success=True,
-                                       message_id=f"lark-card:{session.card_msg_id}")
+            return _compat.send_result(
+                success=True,
+                message_id=(f"lark-card:{session.card_msg_id}"
+                            if session.card_msg_id else None))
 
-        card_session = engine.latest_session_for_chat(chat_id)  # 含终态 + 任意 thread（bg 通知常在主回合完成后到达）
-        if (not interim and card_session is not None and card_session.card_id
-                and content.strip()
-                and not content.lstrip().startswith(_BUSY_ACK_PREFIXES)
+        if (not interim and thread_id and content.strip() and not is_ack
                 and not (metadata or {}).get("notify")
-                and (metadata or {}).get("thread_id")):
-            # background 回合交付 / watcher 通知（特征：无 notify 标记 + thread
-            # metadata，与普通 final 的 _mark_notify_metadata 相区分）→ 追加进
-            # 该 chat 最近一张卡（跨回合合并；thread_id 是来源标记，合并目标是
-            # 最新卡），不再散落纯文本。
-            card_msg_id = await engine.append_notice(chat_id, content,
-                                                     thread_id=card_session.thread_id)
-            if card_msg_id is not None:
-                return _compat.send_result(success=True, message_id=card_msg_id)
-            # 无可用卡片 → 落回原生文本（append_notice 已带 thread）
+                and (session is None or not session.has_draft)):
+            # 话题内的后台交付 / watcher 通知（特征：无 notify 标记 + thread_id
+            # metadata）→ 追加进**同一话题**最近一张卡。只认同话题：话题群里每个
+            # 话题是独立会话，并进「chat 里最新那张卡」会把 A 话题的内容写进 B
+            # 话题的卡。本话题的活跃会话已有 draft = 那是本回合自己的终态文本
+            # （has_draft），交下方完成分支——并入它自己的卡会让卡永不完成。
+            target = engine.latest_card_session(chat_id, thread_id)
+            if target is not None:
+                card_msg_id = await engine.append_notice(
+                    chat_id, content, thread_id=target.thread_id, session=target)
+                if card_msg_id is not None:
+                    return _compat.send_result(success=True, message_id=card_msg_id)
+            # 同话题没有可合并的卡 → 下方在话题内开新卡（官方无锚话题直发恒 99992402）
 
         if (session is not None and session.state in ("creating", "streaming") and not interim
-                and content and len(content) <= 200
-                and content.lstrip().startswith(_BUSY_ACK_PREFIXES)):
+                and is_ack and len(content) <= 200):
             # busy ack → 心跳行；回合完成时随完成卡消失。
             # ↪ redirect（用户纠正、interrupt 注入新指令）→ 即刻收旧开新（hermes
             # redirect 是同回合改锚续跑，draft 锚不变，等锚变化/首条 draft 都
@@ -228,7 +232,7 @@ class StreamingFeishuMixin:
                             if session is not None and session.card_msg_id else None))
 
         if (not interim and reply_to is None and content.strip()
-                and not content.lstrip().startswith(_BUSY_ACK_PREFIXES)
+                and not is_ack
                 and not (metadata or {}).get("thread_id")
                 and not (metadata or {}).get("notify")
                 and not (metadata or {}).get("job_id")
@@ -257,23 +261,37 @@ class StreamingFeishuMixin:
                 # 实测）。on_draft 幂等：补记锚、启动推迟的建卡任务；complete
                 # 内部 await 建卡完成后收尾。
                 engine.on_draft(chat_id, content, reply_to=reply_to, thread_id=thread_id)
+                if session.card_create_task is None and thread_id:
+                    # 话题会话等不到 reply 锚（hermes 合成入站：后台进程通知注入、
+                    # 被打断回合的收尾文本——没有 message id）→ 补话题内锚再建卡。
+                    # 此前卡停在 creating → complete 置 failed → 官方 thread_id
+                    # 直发 99992402，回答整条丢失（2026-11-19~24 两机 3 条投递
+                    # 义务失败）
+                    session.thread_anchor = await engine.resolve_thread_anchor(
+                        chat_id, thread_id)
+                    engine.on_draft(chat_id, content, reply_to=reply_to, thread_id=thread_id)
             if session.reply_to is None and reply_to:
                 session.reply_to = reply_to
             msg_id = await engine.complete(chat_id, content, thread_id=thread_id)
             if msg_id is not None:
                 return _compat.send_result(success=True, message_id=msg_id)
-            # 建卡失败 → 落回原生文本
-        elif (not interim and content.strip() and reply_to is not None
-                and not content.lstrip().startswith(_BUSY_ACK_PREFIXES)):
+            # 建卡失败 → 落回原生文本（底部补话题锚）
+        elif (not interim and content.strip() and not is_ack
+                and (reply_to is not None
+                     or (thread_id and not (metadata or {}).get("notify")))):
             # 无流式会话（短回答被 transport 的 _MIN_NEW_MSG_CHARS 吞帧 / 单 tick 直达
             # finalize，draft 让位真发）→ 现场开卡立即完成，保证回合产出卡片形态一致。
-            # reply_to 有锚 = 对话回合；无锚通知（watcher 等）保持原生文本。
+            # reply_to 有锚 = 对话回合；话题内无锚（后台交付找不到可合并的卡）→
+            # 话题内锚开卡。notify 通知与无锚非话题 send（watcher 等）保持原生文本。
             # busy-ack（↪/⏳）除外——回合早期的 ack 到达时卡还没建，误开卡会把
             # ack 文本当回答渲染成完成卡。
-            engine.on_draft(chat_id, content, reply_to=reply_to, thread_id=thread_id)
-            msg_id = await engine.complete(chat_id, content, thread_id=thread_id)
-            if msg_id is not None:
-                return _compat.send_result(success=True, message_id=msg_id)
+            if reply_to is None:
+                reply_to = await engine.resolve_thread_anchor(chat_id, thread_id)
+            if reply_to is not None:
+                engine.on_draft(chat_id, content, reply_to=reply_to, thread_id=thread_id)
+                msg_id = await engine.complete(chat_id, content, thread_id=thread_id)
+                if msg_id is not None:
+                    return _compat.send_result(success=True, message_id=msg_id)
         elif (not interim and (metadata or {}).get("job_id")
                 and content.strip() and reply_to is None):
             # cron 结果投递（scheduler live lane 特征：metadata={job_id, notify}，
@@ -289,6 +307,13 @@ class StreamingFeishuMixin:
             if msg_id is not None:
                 return _compat.send_result(success=True, message_id=msg_id)
 
+        if (reply_to is None and thread_id
+                and not (metadata or {}).get("reply_to_message_id")):
+            # 原生兜底的话题锚：官方 adapter 无 reply 锚时用 receive_id_type=
+            # "thread_id" 直发，实测恒 99992402 field validation failed（话题里
+            # 送达的原生消息无一例外都是带 reply 的）。上游给了 reply_to_message_id
+            # 时沿用它的。
+            reply_to = await engine.resolve_thread_anchor(chat_id, thread_id)
         return await super().send(chat_id, content, reply_to=reply_to,  # type: ignore[misc]
                                   metadata=metadata, **kwargs)
 
@@ -331,9 +356,12 @@ class StreamingFeishuMixin:
             await super_method(event)
         msg_id = getattr(event, "message_id", "") or "?"
         chat_id = getattr(getattr(event, "source", None), "chat_id", "") or ""
-        # 入站登记：followup 拆卡门槛的数据源（drain 消息在 drain 开始时也触发）
+        # 入站登记：followup 拆卡门槛的数据源（drain 消息在 drain 开始时也触发）；
+        # 话题内的入站同时是话题锚（无锚回合建卡/回退的兜底目标）
         if msg_id != "?" and chat_id:
-            self._engine().note_inbound(chat_id, str(msg_id))
+            self._engine().note_inbound(
+                chat_id, str(msg_id),
+                thread_id=getattr(getattr(event, "source", None), "thread_id", None))
         logging.getLogger("gateway.run").info(
             "[feishu-streaming] processing_start msg=%s typing_badge=%s",
             msg_id[:16],
@@ -361,7 +389,13 @@ class StreamingFeishuMixin:
                     # 无卡可渲（话题延迟建卡 + 零 draft 就被 /stop）→ 原生文本
                     # 反馈，reply 到回合入站锚保证落在线程内（否则用户侧静默）
                     anchor = (getattr(session, "turn_inbound", None)
-                              or session.reply_to)
+                              or session.reply_to
+                              or getattr(session, "thread_anchor", None))
+                    thread_id = getattr(source, "thread_id", None)
+                    if anchor is None and thread_id:
+                        # 合成入站/被打断的回合没有入站锚 → 话题内锚；否则原生直发
+                        # 会落到群顶层（话题群里 = 新建一个话题）
+                        anchor = await self._engine().resolve_thread_anchor(chat_id, thread_id)
                     try:
                         import json as _json
 
@@ -374,13 +408,21 @@ class StreamingFeishuMixin:
                         logging.getLogger("gateway.run").warning(
                             "[feishu-streaming] cancel text fallback failed: %s", exc)
         elif getattr(outcome, "name", outcome) == "SUCCESS":
-            # 幽灵会话清理：卡从未建（无 draft/无 final send，如模型只回 MEDIA 行）
-            # ——不清理则永停 creating，污染 usage/reasoning 的回合进行中判据
+            # 回合正常结束的收尾兜底：卡从未建（无 draft/无 final send，如模型只回
+            # MEDIA 行）→ 清理幽灵会话，否则永停 creating，污染 usage/reasoning 的
+            # 「回合进行中」判据；卡已建却全程无正文 → 收尾完成卡（否则永停「处理中」）
             source = getattr(event, "source", None)
             chat_id = getattr(source, "chat_id", "") or ""
             if chat_id:
-                self._engine().close_ghost_creating(
-                    chat_id, thread_id=getattr(source, "thread_id", None))
+                engine = self._engine()
+                thread_id = getattr(source, "thread_id", None)
+                session = engine.active_session(chat_id, thread_id)
+                if (session is not None and session.turn_inbound and msg_id != "?"
+                        and msg_id != session.turn_inbound):
+                    # 不是本回合自己的入站消息：↪ redirect ack / 排队消息的回执也各发
+                    # 一次 SUCCESS，那时本回合仍在进行，什么都不收
+                    return
+                await engine.on_turn_ended(chat_id, thread_id=thread_id)
 
     # ── clarify 内联单选（类定义期覆写；SDK connect() 注册的绑定方法即本版本）──
 
@@ -654,38 +696,68 @@ class StreamingFeishuMixin:
             logging.getLogger("gateway.run").info(
                 "[feishu-streaming][clarify] retired id=%s (no click)", clarify_id[:12])
 
+    @staticmethod
+    def _media_route(metadata: Any) -> tuple[str | None, str | None]:
+        """媒体 metadata 的路由信息：(thread_id, reply_to_message_id)."""
+        if not isinstance(metadata, dict):
+            return None, None
+        return (str(metadata.get("thread_id") or "") or None,
+                str(metadata.get("reply_to_message_id") or "") or None)
+
     def _media_session(self, chat_id: str, metadata: Any) -> Any:
-        """媒体交付（文件/图片）的锚会话：metadata.thread_id 精确命中优先.
+        """媒体交付（文件/图片）的锚会话：同话题最近一张**有卡**的会话优先.
 
         话题群回合的卡在线程里——run_notifications 的 post-stream 媒体交付带
         thread_id metadata（2026-11-17 梦珊机实测：忽略它会把话题回合的文件
-        挂到 chat 级最近卡/顶层直发，落群顶层）。查 session_for 含终态：交付
-        发生在 complete 之后；thread 未命中退 chat 级最近卡（latest 语义与
-        bg 合并一致——插入序第一张在主聊+话题并存时会挂到旧卡，v0.17.8）。
+        挂到 chat 级最近卡/顶层直发，落群顶层）。交付发生在 complete 之后，
+        且常拖到用户已发下一条消息之后：那时新回合的会话已经顶替了刚完成的
+        卡会话——被顶替的终态会话留在引擎的 _recent 里，仍是落点（2026-11-19
+        梦珊 j-s：顶替后 3 个文件 card=no 走原生，话题内无锚直发必失败）。
+        metadata 的 reply_to_message_id 命中某会话的锚时优先它——文件挂回产出
+        它的那一回合的卡，而不是新回合刚建的卡。thread 未命中退 chat 级。
         """
         engine = self._engine()
-        thread_id = ""
-        if isinstance(metadata, dict):
-            thread_id = str(metadata.get("thread_id") or "")
+        thread_id, hint = self._media_route(metadata)
+        session = engine.latest_card_session(chat_id, thread_id, anchor_hint=hint)
+        if session is not None:
+            return session
+        # 没有任何卡：退回该话题/该 chat 的会话（拿 reply 锚 / 话题锚做回复目标）
         if thread_id:
-            session = engine.session_for(chat_id, thread_id)
-            if session is not None:
-                return session
+            return engine.session_for(chat_id, thread_id)
         return engine.latest_session_for_chat(chat_id)
 
     def _media_reply_anchor(self, session: Any, fallback: str | None) -> str | None:
-        """媒体投递的回复锚：卡消息 → 会话回复锚 → 回合原始入站消息 → 调用方锚.
+        """媒体投递的回复锚：卡消息 → 会话回复锚 → 话题内已知锚 → 回合原始入站消息 → 调用方锚.
 
-        话题回合的卡要等首个 draft 才建（延迟建卡）——媒体若在 draft 之前到达
-        （2026-11-17 16:30 实测：模型只回 MEDIA 行、无正文 → 无 draft），卡不
-        存在，官方原生 send_image_file 顶层直发必 99992402（图片丢失）。此时
-        退回 reply 到回合入站消息（turn_inbound）：同样落在话题线程内，且走
-        vendor reply_image_by_id 不吃官方那条坏路径。
+        话题回合的卡可能根本没建（延迟建卡 + 模型只回 MEDIA 行），官方原生
+        send_image_file 顶层直发必 99992402（图片丢失）。此时退回话题内锚或
+        reply 到回合入站消息（turn_inbound）：同样落在话题线程里，且走 vendor
+        reply_*_by_id 不吃官方那条坏路径。
         """
         if session is None:
             return fallback
         return (session.card_msg_id or session.reply_to
+                or getattr(session, "thread_anchor", None)
                 or getattr(session, "turn_inbound", None) or fallback)
+
+    async def _media_fallback_anchor(self, chat_id: str, metadata: Any) -> str | None:
+        """会话链解不出回复锚、且目标是话题 → 查话题内锚（已知锚或话题最新消息）."""
+        thread_id, _ = self._media_route(metadata)
+        if not thread_id:
+            return None
+        return await self._engine().resolve_thread_anchor(chat_id, thread_id)
+
+    @staticmethod
+    def _note_media_delivered(session: Any) -> None:
+        count = getattr(session, "media_delivered", None)
+        if isinstance(count, int):
+            session.media_delivered = count + 1
+
+    @staticmethod
+    def _media_duplicate(kind: str, target: str, message_id: str, path: str) -> Any:
+        _gw.info("[feishu-streaming] media duplicate skipped: kind=%s target=%s name=%s",
+                 kind, target[:22], local_file_name(path)[:80])
+        return _compat.send_result(success=True, message_id=message_id)
 
     async def _reply_media_to_anchor(self, client: Any, anchor: str, *,
                                      image_path: str | None = None,
@@ -720,6 +792,10 @@ class StreamingFeishuMixin:
         session = self._media_session(chat_id, metadata)
         card_msg_id = getattr(session, "card_msg_id", None) if session else None
         if card_msg_id and not caption:
+            target = f"card:{card_msg_id}"
+            if engine.media_already_delivered(target, file_path):
+                return self._media_duplicate("document", target, card_msg_id, file_path)
+            engine.reserve_media_delivery(target, file_path)
             try:
                 client = engine.client
                 file_key = await client.upload_document(file_path, file_name=file_name)
@@ -731,12 +807,20 @@ class StreamingFeishuMixin:
                             "thread=%s card=%s name=%s",
                             (getattr(session, "thread_id", None) or "-")[:16],
                             str(card_msg_id)[:16], name)
+                        self._note_media_delivered(session)
                         return _compat.send_result(success=True, message_id=card_msg_id)
             except Exception as e:
                 _gw.warning("[feishu-streaming] media card delivery failed (document): %s", e)
+            engine.release_media_delivery(target, file_path)
         fallback_anchor = self._media_reply_anchor(session, reply_to)
+        if fallback_anchor is None:
+            fallback_anchor = await self._media_fallback_anchor(chat_id, metadata)
         if fallback_anchor and not caption:
             # 无卡（话题延迟建卡 + 媒体早于首 draft）→ reply 到锚消息，仍在线程内
+            target = f"anchor:{fallback_anchor}"
+            if engine.media_already_delivered(target, file_path):
+                return self._media_duplicate("document", target, fallback_anchor, file_path)
+            engine.reserve_media_delivery(target, file_path)
             try:
                 if await self._reply_media_to_anchor(
                         engine.client, fallback_anchor,
@@ -744,9 +828,11 @@ class StreamingFeishuMixin:
                     _gw.info(
                         "[feishu-streaming] media delivered to anchor: kind=document anchor=%s",
                         str(fallback_anchor)[:16])
+                    self._note_media_delivered(session)
                     return _compat.send_result(success=True, message_id=fallback_anchor)
             except Exception as e:
                 _gw.warning("[feishu-streaming] media anchor delivery failed (document): %s", e)
+            engine.release_media_delivery(target, file_path)
         _gw.info(
             "[feishu-streaming] media fallback to native: kind=document card=%s caption=%s reply_to=%s",
             "yes" if card_msg_id else "no", "yes" if caption else "no",
@@ -769,6 +855,10 @@ class StreamingFeishuMixin:
         session = self._media_session(chat_id, metadata)
         card_msg_id = getattr(session, "card_msg_id", None) if session else None
         if card_msg_id and not caption:
+            target = f"card:{card_msg_id}"
+            if engine.media_already_delivered(target, image_path):
+                return self._media_duplicate("image", target, card_msg_id, image_path)
+            engine.reserve_media_delivery(target, image_path)
             try:
                 client = engine.client
                 image_key = await client.upload_image_file(image_path)
@@ -778,20 +868,30 @@ class StreamingFeishuMixin:
                         "thread=%s card=%s",
                         (getattr(session, "thread_id", None) or "-")[:16],
                         str(card_msg_id)[:16])
+                    self._note_media_delivered(session)
                     return _compat.send_result(success=True, message_id=card_msg_id)
             except Exception as e:
                 _gw.warning("[feishu-streaming] media card delivery failed (image): %s", e)
+            engine.release_media_delivery(target, image_path)
         fallback_anchor = self._media_reply_anchor(session, reply_to)
+        if fallback_anchor is None:
+            fallback_anchor = await self._media_fallback_anchor(chat_id, metadata)
         if fallback_anchor and not caption:
+            target = f"anchor:{fallback_anchor}"
+            if engine.media_already_delivered(target, image_path):
+                return self._media_duplicate("image", target, fallback_anchor, image_path)
+            engine.reserve_media_delivery(target, image_path)
             try:
                 if await self._reply_media_to_anchor(
                         engine.client, fallback_anchor, image_path=image_path):
                     _gw.info(
                         "[feishu-streaming] media delivered to anchor: kind=image anchor=%s",
                         str(fallback_anchor)[:16])
+                    self._note_media_delivered(session)
                     return _compat.send_result(success=True, message_id=fallback_anchor)
             except Exception as e:
                 _gw.warning("[feishu-streaming] media anchor delivery failed (image): %s", e)
+            engine.release_media_delivery(target, image_path)
         _gw.info(
             "[feishu-streaming] media fallback to native: kind=image card=%s caption=%s reply_to=%s",
             "yes" if card_msg_id else "no", "yes" if caption else "no",
@@ -801,11 +901,13 @@ class StreamingFeishuMixin:
                                              reply_to=fallback_anchor,
                                              metadata=metadata, **kwargs)
 
-    def _media_anchor_for_native(self, chat_id: str, metadata: Any,
-                                 reply_to: str | None, kind: str) -> str | None:
+    async def _media_anchor_for_native(self, chat_id: str, metadata: Any,
+                                       reply_to: str | None, kind: str) -> str | None:
         """语音/视频/动图的线程锚（官方实现接受 reply_to，注入即可落线程）."""
         session = self._media_session(chat_id, metadata)
         anchor = self._media_reply_anchor(session, reply_to)
+        if anchor is None:
+            anchor = await self._media_fallback_anchor(chat_id, metadata)
         _gw.info("[feishu-streaming] media native send: kind=%s reply_to=%s",
                  kind, str(anchor)[:16] if anchor else "-")
         return anchor
@@ -814,7 +916,7 @@ class StreamingFeishuMixin:
                          caption: str | None = None, reply_to: str | None = None,
                          metadata: Any = None, **kwargs: Any) -> Any:
         """语音消息：注入线程锚，话题回合不落群顶层（官方负责转码/上传）."""
-        anchor = self._media_anchor_for_native(chat_id, metadata, reply_to, "voice")
+        anchor = await self._media_anchor_for_native(chat_id, metadata, reply_to, "voice")
         return await super().send_voice(chat_id, audio_path,  # type: ignore[misc]
                                         caption=caption, reply_to=anchor,
                                         metadata=metadata, **kwargs)
@@ -823,7 +925,7 @@ class StreamingFeishuMixin:
                          caption: str | None = None, reply_to: str | None = None,
                          metadata: Any = None, **kwargs: Any) -> Any:
         """视频消息：同上（官方负责上传封面，这里只补线程锚）."""
-        anchor = self._media_anchor_for_native(chat_id, metadata, reply_to, "video")
+        anchor = await self._media_anchor_for_native(chat_id, metadata, reply_to, "video")
         return await super().send_video(chat_id, video_path,  # type: ignore[misc]
                                         caption=caption, reply_to=anchor,
                                         metadata=metadata, **kwargs)
@@ -832,7 +934,7 @@ class StreamingFeishuMixin:
                              caption: str | None = None, reply_to: str | None = None,
                              metadata: Any = None, **kwargs: Any) -> Any:
         """GIF/动图：同上（官方降级为文件发送，锚定同样保持线程内）."""
-        anchor = self._media_anchor_for_native(chat_id, metadata, reply_to, "animation")
+        anchor = await self._media_anchor_for_native(chat_id, metadata, reply_to, "animation")
         return await super().send_animation(chat_id, animation_url,  # type: ignore[misc]
                                             caption=caption, reply_to=anchor,
                                             metadata=metadata, **kwargs)

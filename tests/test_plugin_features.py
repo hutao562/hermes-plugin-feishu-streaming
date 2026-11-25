@@ -9,10 +9,10 @@ import asyncio
 import sys
 import types
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
-from test_plugin_mode import _FakeBaseAdapter, _mock_client, _settle
+from test_plugin_mode import _FakeBaseAdapter, _mock_client, _settle, _streamed_texts
 
 from plugin import _clarify
 from plugin.adapter import build_adapter_class
@@ -326,17 +326,438 @@ async def test_append_notice_without_card_returns_none() -> None:
 
 @pytest.mark.asyncio
 async def test_send_bg_deliver_merges_into_card(adapter) -> None:
-    """bg 交付特征（无 notify + thread_id metadata）→ 通知进卡，不发原生文本."""
-    adapter._engine().on_draft("chat1", "主回合", reply_to="om_a")
+    """bg 交付特征（无 notify + thread_id metadata）→ 通知进**同一话题**的卡，不发原生文本.
+
+    话题范围内的后台交付只认同话题的卡：话题群每个话题是独立会话，并进「chat 里
+    最新那张卡」会把 A 话题的内容写进 B 话题的卡（见 test_bg_deliver_never_crosses_threads）。
+    """
+    adapter._engine().on_draft("chat1", "主回合", reply_to="om_root",
+                               thread_id="omt_t")
     await _settle(adapter._engine())
-    await adapter._engine().complete("chat1", "主回合")
+    await adapter._engine().complete("chat1", "主回合", thread_id="omt_t")
 
     result = await adapter.send(
-        "chat1", "📊 后台分析完成", metadata={"thread_id": "om_a"})
+        "chat1", "📊 后台分析完成", metadata={"thread_id": "omt_t"})
 
     assert result.success is True
     assert result.message_id == "om_card_msg"
     assert adapter.native_sends == []
+    assert "后台分析完成" in "".join(
+        s.text for s in adapter._engine().session_for("chat1", "omt_t").segment_state.segments)
+
+
+@pytest.mark.asyncio
+async def test_bg_deliver_never_crosses_threads(adapter) -> None:
+    """话题 B 的后台交付不得并进话题 A 的卡；B 没有卡时在 B 内开卡（话题内锚）."""
+    engine = adapter._engine()
+    engine.on_draft("chat1", "A 话题的回答", reply_to="om_a", thread_id="omt_a")
+    await _settle(engine)
+    await engine.complete("chat1", "A 话题的回答", thread_id="omt_a")
+    engine._client.last_message_in_thread = AsyncMock(return_value="om_b_last")
+
+    result = await adapter.send("chat1", "B 话题的后台结论", metadata={"thread_id": "omt_b"})
+    await _settle(engine)
+
+    assert result.success is True and result.message_id == "om_card_msg"
+    assert adapter.native_sends == []
+    assert "B 话题的后台结论" not in "".join(
+        s.text for s in engine.session_for("chat1", "omt_a").segment_state.segments)
+    session_b = engine.session_for("chat1", "omt_b")
+    assert session_b is not None and session_b.state == "completed"
+    assert session_b.reply_to == "om_b_last"
+    engine._client.last_message_in_thread.assert_awaited_once_with("omt_b")
+
+
+# ── 2026-11-19~24 两机对话日志审计：话题锚 / 卡死 / 被顶替会话的媒体落点 ──
+
+
+class _Outcome:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+def _proc_event(chat_id: str = "chat1", thread_id: str | None = None,
+                message_id: str = "om_in_1") -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(message_id=message_id,
+                           source=SimpleNamespace(chat_id=chat_id, thread_id=thread_id))
+
+
+def _card_text(engine: ChatCardEngine, chat_id: str, thread_id: str | None = None) -> str:
+    session = engine.session_for(chat_id, thread_id)
+    if session is None:
+        return ""
+    return "".join(getattr(s, "text", "") or "" for s in session.segment_state.segments)
+
+
+@pytest.mark.asyncio
+async def test_redirect_ack_success_does_not_fail_in_flight_card(adapter) -> None:
+    """↪ ack 自己的 processing_complete(SUCCESS) 紧随 mark_redirect 到达——建卡在飞
+    的新回合会话不是幽灵.
+
+    回归（2026-11-20 梦珊 j-s，窗口内仅有的两张「💭 处理中...」卡死卡片）：
+    close_ghost_creating 把刚开的新会话置 failed，卡随后建好却永不再刷新；后续
+    心跳因无活跃会话以原生文本漏进话题。
+    """
+    engine = adapter._engine()
+    thread = "omt_t"
+    await adapter.on_processing_start(_proc_event(thread_id=thread, message_id="om_m1"))
+    engine.on_draft("chat1", "旧回答的前半段", reply_to="om_m1", thread_id=thread)
+    await _settle(engine)
+    # 用户在回合进行中补发 M2 → ↪ ack（reply_to = 纠正消息）→ 即刻收旧开新
+    await adapter.send("chat1", "↪ 已按新指令重启，继续处理", reply_to="om_m2",
+                        metadata={"thread_id": thread})
+    session = engine.active_session("chat1", thread)
+    assert session is not None and session.state == "creating"
+    assert session.card_create_task is not None  # 新卡的建卡任务在飞
+
+    # ack 消息自己的处理生命周期结束（实测距 ack 仅 2ms，卡还没建好）
+    await adapter.on_processing_complete(
+        _proc_event(thread_id=thread, message_id="om_m2"), _Outcome("SUCCESS"))
+    assert session.state == "creating", "建卡在飞的会话不得被当成幽灵置 failed"
+    await _settle(engine)
+    assert session.card_id is not None and session.state == "streaming"
+
+    # 续跑的回答进入同一张卡并正常完成（此前：会话 failed → 答案另开卡，这张永停处理中）
+    engine.on_draft("chat1", "按新指令得到的完整回答", reply_to="om_m2", thread_id=thread)
+    await _settle(engine)
+    assert "完整回答" in _card_text(engine, "chat1", thread)
+    assert await engine.complete("chat1", "按新指令得到的完整回答", thread_id=thread) == "om_card_msg"
+    assert engine.session_for("chat1", thread).state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_after_redirect_ack_stays_in_card(adapter) -> None:
+    """redirect 之后的心跳 interim 进卡片状态行，不以原生文本漏进话题."""
+    engine = adapter._engine()
+    thread = "omt_t"
+    engine.on_draft("chat1", "旧内容", reply_to="om_m1", thread_id=thread)
+    await _settle(engine)
+    await adapter.send("chat1", "↪ 已按新指令重启", reply_to="om_m2",
+                        metadata={"thread_id": thread})
+    await adapter.on_processing_complete(
+        _proc_event(thread_id=thread, message_id="om_m2"), _Outcome("SUCCESS"))
+    await _settle(engine)
+
+    result = await adapter.send("chat1", "⏳ 正在处理——6 分钟 — terminal",
+                                metadata={"thread_id": thread, "_interim_send": True})
+    assert result.success is True
+    assert adapter.native_sends == []  # 实测该心跳曾以原生文本出现在话题里
+
+
+@pytest.mark.asyncio
+async def test_ack_success_after_card_ready_does_not_seal_redirect_card(adapter) -> None:
+    """ack 的 SUCCESS 晚于建卡到达（卡已 streaming、尚无内容）→ 不是回合结束，不收尾."""
+    engine = adapter._engine()
+    engine.on_draft("chat1", "旧内容", reply_to="om_m1")
+    await _settle(engine)
+    await adapter.send("chat1", "↪ 已按新指令重启", reply_to="om_m2")
+    await _settle(engine)  # 新卡已建好
+    session = engine.active_session("chat1")
+    assert session is not None and session.card_id is not None
+
+    await adapter.on_processing_complete(_proc_event(message_id="om_m2"), _Outcome("SUCCESS"))
+    assert engine.active_session("chat1") is session and session.state == "streaming"
+
+    engine.on_draft("chat1", "重启后的回答", reply_to="om_m2")
+    await _settle(engine)
+    assert await engine.complete("chat1", "重启后的回答") == "om_card_msg"
+    assert "没有文字回复" not in _card_text(engine, "chat1")
+
+
+@pytest.mark.asyncio
+async def test_turn_end_seals_card_that_never_got_text(adapter) -> None:
+    """回合正常结束但卡上没有任何正文（模型只回 MEDIA 行 / 空回复）→ 收尾完成卡.
+
+    此前只有 creating+无卡 的幽灵会话被清理；主聊的卡在探针期就已建好
+    （streaming），没人收尾就永停「💭 处理中...」。
+    """
+    engine = adapter._engine()
+    await adapter.on_processing_start(_proc_event(message_id="om_m1"))
+    engine.on_turn_started("chat1")  # 探针建卡
+    await _settle(engine)
+    await adapter.send_document("chat1", "/tmp/report.pdf")
+    session = engine.session_for("chat1")
+    assert session.state == "streaming"
+
+    await adapter.on_processing_complete(_proc_event(message_id="om_m1"), _Outcome("SUCCESS"))
+    assert session.state == "completed"
+    assert "已交付 1 个文件" in _card_text(engine, "chat1")
+    engine._client.cardkit_close_streaming.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_turn_end_leaves_card_with_text_to_final_send(adapter) -> None:
+    """有正文的会话在 SUCCESS 到达时不被代为收尾（final send / 续跑内容在路上）."""
+    engine = adapter._engine()
+    await adapter.on_processing_start(_proc_event(message_id="om_m1"))
+    engine.on_draft("chat1", "正在写的回答", reply_to="om_m1")
+    await _settle(engine)
+    await adapter.on_processing_complete(_proc_event(message_id="om_m1"), _Outcome("SUCCESS"))
+    assert engine.session_for("chat1").state == "streaming"
+
+
+@pytest.mark.asyncio
+async def test_success_of_other_message_never_closes_active_turn(adapter) -> None:
+    """排队消息/纠正消息自己的 SUCCESS（message_id ≠ 本回合入站）不动本回合的会话."""
+    engine = adapter._engine()
+    thread = "omt_t"
+    await adapter.on_processing_start(_proc_event(thread_id=thread, message_id="om_m1"))
+    engine.on_turn_started("chat1", thread_id=thread)  # 话题会话等锚：creating、无卡
+    await adapter.on_processing_complete(
+        _proc_event(thread_id=thread, message_id="om_m2"), _Outcome("SUCCESS"))
+    assert engine.active_session("chat1", thread) is not None  # 未被当幽灵清理
+    # 本回合自己的 SUCCESS 才清理
+    await adapter.on_processing_complete(
+        _proc_event(thread_id=thread, message_id="om_m1"), _Outcome("SUCCESS"))
+    assert engine.active_session("chat1", thread) is None
+
+
+@pytest.mark.asyncio
+async def test_anchorless_thread_turn_gets_card_via_known_thread_anchor(adapter) -> None:
+    """后台进程通知注入话题（无 reply 锚）：卡 reply 到话题内已知锚，回答不丢.
+
+    回归（2026-11-23 20:18 梦珊 default 话题群，733 字回答整条丢失）：话题会话
+    永远等不到 reply 锚 → 卡停 creating → complete 置 failed → 官方 thread_id
+    直发 99992402，投递义务重试两次仍失败。
+    """
+    engine = adapter._engine()
+    thread = "omt_t"
+    # 该话题此前有过一轮正常回合：留下的卡消息 id 就是话题锚
+    engine.on_draft("chat1", "上一轮的回答", reply_to="om_m1", thread_id=thread)
+    await _settle(engine)
+    await engine.complete("chat1", "上一轮的回答", thread_id=thread)
+    assert engine.thread_anchor("chat1", thread) == "om_card_msg"
+    engine.session_for("chat1", thread).completed_at -= 60  # 上一回合早已结束（非 typing 尾巴）
+
+    # 注入回合：探针建会话 → 一帧无锚 draft → 无锚终态 send（只带 thread_id）
+    adapter.supports_draft_streaming(chat_id="chat1", metadata={"thread_id": thread})
+    assert engine.active_session("chat1", thread).card_create_task is None  # 探针期仍不抢建
+    await adapter.send_draft("chat1", 7, "补充核实", metadata={"thread_id": thread})
+    assert engine.active_session("chat1", thread).card_create_task is not None
+    result = await adapter.send("chat1", "补充核实完毕，结论没变——原件确实不在本机。",
+                                metadata={"thread_id": thread})
+    await _settle(engine)
+
+    assert result.success is True and result.message_id == "om_card_msg"
+    assert adapter.native_sends == []
+    session = engine.session_for("chat1", thread)
+    assert session.state == "completed" and session.card_id is not None
+    assert "结论没变" in _card_text(engine, "chat1", thread)
+    # 卡 reply 到话题内锚（上一张卡），不是直发 chat
+    engine._client.send_card_to_chat.assert_not_called()
+    engine._client.last_message_in_thread.assert_not_awaited()  # 已知锚够用，不查接口
+
+
+@pytest.mark.asyncio
+async def test_anchorless_thread_final_resolves_anchor_from_thread(adapter) -> None:
+    """话题内没有任何已知锚（重启后首个回合就是无锚回合）→ 查话题最新消息做锚."""
+    engine = adapter._engine()
+    engine._client.last_message_in_thread = AsyncMock(return_value="om_thread_last")
+
+    result = await adapter.send("chat1", "被打断回合的收尾文本", metadata={"thread_id": "omt_new"})
+    await _settle(engine)
+
+    assert result.success is True and result.message_id == "om_card_msg"
+    assert adapter.native_sends == []
+    session = engine.session_for("chat1", "omt_new")
+    assert session.state == "completed" and session.reply_to == "om_thread_last"
+    engine._client.reply_card_by_id.assert_any_call(ANY, "card_abc")
+    assert engine.thread_anchor("chat1", "omt_new") == "om_card_msg"  # 自己的卡成为新锚
+
+
+@pytest.mark.asyncio
+async def test_native_fallback_into_thread_carries_thread_anchor(adapter) -> None:
+    """卡片建不出来时的原生兜底：带话题锚 reply 进线程，不走官方 thread_id 直发."""
+    engine = adapter._engine()
+    engine._client.last_message_in_thread = AsyncMock(return_value="om_thread_last")
+    engine._client.cardkit_create = AsyncMock(side_effect=RuntimeError("cardkit down"))
+
+    result = await adapter.send("chat1", "必须送达的结论", metadata={"thread_id": "omt_x"})
+
+    assert result.success is True and result.message_id == "om_native"
+    assert adapter.native_sends and adapter.native_sends[-1][2] == "om_thread_last"
+
+
+@pytest.mark.asyncio
+async def test_media_after_next_turn_still_targets_previous_card(adapter) -> None:
+    """用户已发下一条消息（新会话顶替了刚完成的卡会话）：上一回合的在途文件仍
+    reply 到它自己的卡，不退化成话题内无锚原生发送（必 99992402）.
+
+    回归（2026-11-19 17:08 梦珊 j-s）：顶替后 3 个文件 card=no。
+    """
+    engine = adapter._engine()
+    thread = "omt_t"
+    engine.on_draft("chat1", "带附件的回答", reply_to="om_m1", thread_id=thread)
+    await _settle(engine)
+    await engine.complete("chat1", "带附件的回答", thread_id=thread)
+    engine._client.reply_file_by_id.reset_mock()
+    engine.session_for("chat1", thread).completed_at -= 60
+
+    engine.on_turn_started("chat1", thread_id=thread)  # 下一条消息的探针
+    assert engine.session_for("chat1", thread).card_id is None
+
+    await adapter.send_document("chat1", "/tmp/a.xlsx", metadata={"thread_id": thread})
+    await adapter.send_image_file("chat1", "/tmp/b.png", metadata={"thread_id": thread})
+
+    engine._client.reply_file_by_id.assert_awaited_once()
+    engine._client.reply_image_by_id.assert_awaited_once()
+    assert adapter.native_docs == [] and adapter.native_images == []
+
+
+@pytest.mark.asyncio
+async def test_media_in_thread_without_any_card_uses_thread_anchor(adapter) -> None:
+    """话题里没有任何卡：文件 reply 到话题内锚（已知锚或话题最新消息）."""
+    engine = adapter._engine()
+    engine._client.last_message_in_thread = AsyncMock(return_value="om_thread_last")
+
+    await adapter.send_document("chat1", "/tmp/a.xlsx", metadata={"thread_id": "omt_x"})
+
+    engine._client.reply_file_by_id.assert_awaited_once()
+    assert engine._client.reply_file_by_id.call_args.args[0] == "om_thread_last"
+    assert adapter.native_docs == []
+
+
+@pytest.mark.asyncio
+async def test_same_file_not_delivered_twice_to_same_card(adapter, tmp_path) -> None:
+    """上游多条附件投递通道对同一文件各发一次 → 同一张卡只投一遍.
+
+    回归（2026-11-19~24 梦珊 default）：经卡片路径投递的 5 个文件全部被投了两遍
+    （显式 MEDIA 标签 + 自动追加标签，间隔恰为一次上传+回复的耗时）。
+    """
+    engine = adapter._engine()
+    doc = tmp_path / "清单.docx"
+    doc.write_bytes(b"x" * 32)
+    engine.on_draft("chat1", "回答", reply_to="om_m1")
+    await _settle(engine)
+
+    first = await adapter.send_document("chat1", str(doc))
+    second = await adapter.send_document("chat1", str(doc))
+
+    assert first.success and second.success and second.message_id == "om_card_msg"
+    engine._client.upload_document.assert_awaited_once()
+    engine._client.reply_file_by_id.assert_awaited_once()
+    assert adapter.native_docs == []
+
+    # 文件被重新生成（大小/修改时间变了）→ 新文件，照常投递
+    doc.write_bytes(b"y" * 64)
+    await adapter.send_document("chat1", str(doc))
+    assert engine._client.reply_file_by_id.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_media_delivery_is_sent_once(adapter, tmp_path) -> None:
+    """并发的两条上游通道：第二条必须等不到第一条完成就知道「已在投递」（先占位后上传）."""
+    engine = adapter._engine()
+    doc = tmp_path / "清单.docx"
+    doc.write_bytes(b"x" * 32)
+    engine.on_draft("chat1", "回答", reply_to="om_m1")
+    await _settle(engine)
+
+    await asyncio.gather(adapter.send_document("chat1", str(doc)),
+                         adapter.send_document("chat1", str(doc)))
+
+    engine._client.reply_file_by_id.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_media_delivery_is_not_deduped(adapter, tmp_path) -> None:
+    """投递失败要撤销占位——后续通道/重试仍能把文件送到卡下."""
+    engine = adapter._engine()
+    doc = tmp_path / "清单.docx"
+    doc.write_bytes(b"x" * 32)
+    engine.on_draft("chat1", "回答", reply_to="om_m1")
+    await _settle(engine)
+    engine._client.reply_file_by_id = AsyncMock(side_effect=[False, False, True])
+
+    await adapter.send_document("chat1", str(doc))  # 卡片路径与锚路径都失败 → 原生兜底
+    assert len(adapter.native_docs) == 1
+
+    again = await adapter.send_document("chat1", str(doc))
+    assert again.success and again.message_id == "om_card_msg"
+    assert len(adapter.native_docs) == 1
+
+
+@pytest.mark.asyncio
+async def test_media_dedupe_is_per_card(adapter, tmp_path) -> None:
+    """只在同一张卡内去重：下一回合（新卡）要求再发一次照常投递."""
+    engine = adapter._engine()
+    doc = tmp_path / "清单.docx"
+    doc.write_bytes(b"x" * 32)
+    engine.on_draft("chat1", "第一回合", reply_to="om_m1")
+    await _settle(engine)
+    await engine.complete("chat1", "第一回合")
+    await adapter.send_document("chat1", str(doc))
+
+    engine.on_draft("chat1", "第二回合", reply_to="om_m2")  # 新会话（测试替身的卡消息 id 恒为 om_card_msg）
+    await _settle(engine)
+    engine._sessions[engine._skey("chat1", None)].card_msg_id = "om_card_2"
+    await adapter.send_document("chat1", str(doc))
+
+    assert engine._client.reply_file_by_id.await_count == 2
+
+
+def test_plugin_import_does_not_load_lark_sdk() -> None:
+    """插件加载期不导入 lark-oapi：它占插件包导入耗时的 82%，而 register() 必须赶在
+    网关平台扫描的 deadline 前落地（2026-11-19 13:29 梦珊机升级后首次启动：
+    register 晚到 10 秒 → No adapter available for feishu）."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    env = {**os.environ, "PYTHONPATH": str(repo)}
+    out = subprocess.run(
+        [sys.executable, "-c", "import sys, plugin; print('lark_oapi' in sys.modules)"],
+        capture_output=True, text=True, env=env, cwd=str(repo), check=True)
+    assert out.stdout.strip() == "False"
+    from plugin._vendor.feishu import local_file_name  # 再导出仍在（旧 import 路径兼容）
+    assert local_file_name("file:///a%20b/c.txt") == "c.txt"
+
+
+@pytest.mark.asyncio
+async def test_topic_card_builds_at_processing_start_not_first_draft(adapter) -> None:
+    """话题回合的卡在首个真实入站消息（processing_start）时就建，不等首帧正文.
+
+    回归（2026-11-23 21:53 j-s）：纯思考+工具回合 9 分钟后才出首帧正文，
+    期间话题里全程空白，心跳还漏成原生文本。探针/typing 不带消息 id 仍不建卡
+    （被 redirect 打断的旧 run 收尾时的迟到探针不得多出空卡）。
+    """
+    engine = adapter._engine()
+    thread = "omt_t"
+    adapter.supports_draft_streaming(chat_id="chat1", metadata={"thread_id": thread})
+    await _settle(engine)
+    assert engine.session_for("chat1", thread).card_create_task is None  # 探针不建
+
+    await adapter.on_processing_start(_proc_event(thread_id=thread, message_id="om_user_msg"))
+    assert engine.session_for("chat1", thread).card_create_task is not None
+    await _settle(engine)
+    session = engine.session_for("chat1", thread)
+    assert session.card_id is not None
+    engine._client.reply_card_by_id.assert_awaited_with("om_user_msg", "card_abc")
+    assert session.turn_inbound == "om_user_msg"
+    # 卡建成后把自己登记为最新话题锚（bot 消息不会被撤回，是最稳的锚）
+    assert engine.thread_anchor("chat1", thread) == "om_card_msg"
+
+
+@pytest.mark.asyncio
+async def test_interim_heartbeat_without_card_returns_no_synthetic_none_id(adapter) -> None:
+    """卡未建好时的心跳返回无 id 成功，绝不产生 "lark-card:None".
+
+    回归（2026-11-23 22:02 j-s）：上游拿 "lark-card:None" 去原生 edit。
+    """
+    engine = adapter._engine()
+    engine.on_turn_started("chat1")  # creating、卡未落
+    assert engine.session_for("chat1").card_msg_id is None
+
+    result = await adapter.send("chat1", "⏳ 正在处理", metadata={"_interim_send": True})
+    assert result.success is True and result.message_id is None
+    engine.on_draft("chat1", "正文")
+    await _settle(engine)
+    result = await adapter.send("chat1", "⏳ 正在处理", metadata={"_interim_send": True})
+    assert result.message_id == "lark-card:om_card_msg"
 
 
 @pytest.mark.asyncio
@@ -524,6 +945,30 @@ async def test_redirect_straggler_draft_dropped() -> None:
     # guard 已解除：后续帧正常置换
     engine.on_draft("chat1", "全新的回答（续）", reply_to="om_a")
     assert new.answer_seg.text == "全新的回答（续）"
+
+
+@pytest.mark.asyncio
+async def test_redirect_new_answer_with_same_opening_streams_after_window() -> None:
+    """时间窗之后到达的帧必属新请求：开头与被打断的半截相同也要流进新卡.
+
+    回归（2026-11-19~24 窗口内全部 3 次重定向）：新回答开头 = 旧半截（同一个
+    问题重新回答），纯前缀规则把新回答整条流当残尾丢光——新卡空白 2~8 分钟，
+    答案最后一次性出现（2026-11-24 本机 family 126 帧、梦珊 default 49 帧、
+    梦珊 j-s 55 帧）。
+    """
+    engine = ChatCardEngine(_mock_client())
+    engine.on_draft("chat1", "听完了，先", reply_to="om_a")
+    await _settle(engine)
+    engine.mark_redirect("chat1", anchor="om_new")
+    new = engine.session_for("chat1")
+    new.straggler_until = 0.0  # ack 之后已过时间窗（真实场景是几分钟的思考期）
+
+    engine.on_draft("chat1", "听完了，先说三件最要紧的事", reply_to="om_a")
+    await _settle(engine)
+    assert new.answer_seg is not None and "三件最要紧的事" in new.answer_seg.text
+    engine.on_draft("chat1", "听完了，先说三件最要紧的事：正文", reply_to="om_a")
+    assert "正文" in new.answer_seg.text
+    assert "三件" in _streamed_texts(engine._client, new.answer_seg.el_id)[-1]
 
 
 @pytest.mark.asyncio
@@ -2074,7 +2519,7 @@ async def test_reasoning_routes_by_session_map_no_cross_chat(adapter) -> None:
     engine.on_turn_started(chat_b)
     await _settle(engine)
 
-    plugin_pkg._note_session_route("sess_b", engine, chat_b)
+    plugin_pkg._note_session_route("sess_b", engine, engine.session_for(chat_b))
     hook = plugin_pkg._make_reasoning_hook()
     hook(kind="reasoning", delta="B 的思考", session_id="sess_b")
 
@@ -2090,6 +2535,7 @@ async def test_reasoning_routes_by_session_map_no_cross_chat(adapter) -> None:
 async def test_reasoning_strict_drops_when_target_inactive(adapter) -> None:
     """strict 路由目标已终态 → 丢弃，不回落单活跃（回落=串扰）."""
     import plugin as plugin_pkg
+    from plugin.engine import ChatSession
 
     engine = adapter._engine()
     chat_a, chat_b = "oc_" + "a" * 20, "oc_" + "b" * 20
@@ -2097,7 +2543,7 @@ async def test_reasoning_strict_drops_when_target_inactive(adapter) -> None:
     await _settle(engine)
     # chat_b 会话不存在（映射过期场景）
 
-    plugin_pkg._note_session_route("sess_b", engine, chat_b)
+    plugin_pkg._note_session_route("sess_b", engine, ChatSession(chat_id=chat_b))
     hook = plugin_pkg._make_reasoning_hook()
     hook(kind="reasoning", delta="孤儿思考", session_id="sess_b")
     await _settle(engine)
@@ -2105,6 +2551,162 @@ async def test_reasoning_strict_drops_when_target_inactive(adapter) -> None:
     sa = engine.session_for(chat_a)
     assert not sa.segment_state.segments or all(
         "孤儿思考" not in (s.text or "") for s in sa.segment_state.segments)
+
+
+def _reasoning_text(engine: ChatCardEngine, chat_id: str, thread_id: str | None = None) -> str:
+    session = engine.session_for(chat_id, thread_id)
+    if session is None:
+        return ""
+    return "".join(s.text or "" for s in session.segment_state.segments
+                   if s.type.value == "reasoning")
+
+
+@pytest.fixture
+def routed_engine(adapter) -> ChatCardEngine:
+    """每个用例独占 _ENGINES/_SESSION_ROUTE（路由是进程级全局表）."""
+    import plugin as plugin_pkg
+
+    plugin_pkg._ENGINES.clear()
+    plugin_pkg._SESSION_ROUTE.clear()
+    engine = adapter._engine()
+    plugin_pkg._ENGINES.append(engine)
+    yield engine
+    plugin_pkg._ENGINES.clear()
+    plugin_pkg._SESSION_ROUTE.clear()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_strict_route_is_thread_aware(routed_engine) -> None:
+    """路由命中（strict）必须按 (chat, thread) 键找话题会话.
+
+    回归（2026-11-19~24 审计）：strict 只按 chat 查主聊键，话题回合的路由一
+    命中思考就静默丢弃——长话题回合只有首个 API 调用（尚未登记路由、走兜底）
+    的思考能进卡。
+    """
+    import plugin as plugin_pkg
+
+    engine = routed_engine
+    thread = "omt_thread_1"
+    engine.on_turn_started("chat1", thread_id=thread)
+    engine.on_draft("chat1", "正文", reply_to="om_user", thread_id=thread)
+    await _settle(engine)
+    plugin_pkg._note_session_route("sess_t", engine, engine.session_for("chat1", thread))
+
+    hook = plugin_pkg._make_reasoning_hook()
+    hook(kind="reasoning", delta="话题里的思考", session_id="sess_t", surface="feishu")
+    await _settle(engine)
+
+    assert "话题里的思考" in _reasoning_text(engine, "chat1", thread)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_hook_covers_creating_window(routed_engine) -> None:
+    """建卡窗口（会话 creating、卡未建好）内的思考增量不得丢弃.
+
+    回归：钩子层兜底只认 streaming 态——每回合开头的思考（恰是长思考回合
+    最有信息量的部分）在建卡的几百毫秒里被无声丢掉。
+    """
+    import plugin as plugin_pkg
+
+    engine = routed_engine
+    engine.on_turn_started("chat1")  # 会话已建、卡任务未落地 → creating
+    assert engine.session_for("chat1").state == "creating"
+
+    hook = plugin_pkg._make_reasoning_hook()
+    hook(kind="reasoning", delta="建卡窗口内的思考", session_id="sess_new", surface="feishu")
+    await _settle(engine)
+
+    assert "建卡窗口内的思考" in _reasoning_text(engine, "chat1")
+
+
+@pytest.mark.asyncio
+async def test_scope_engines_isolate_profiles(routed_engine, monkeypatch) -> None:
+    """multiplex：另一 profile 只要有进行中会话，不再把本 profile 的思考当并发歧义.
+
+    回归（两机实测 `reasoning dropped (multi-session): engines=2 sessions=[1, 1]`
+    数百次）：路由先按钩子回调所在回合的 profile 作用域（contextvar）收敛。
+    """
+    import plugin as plugin_pkg
+
+    engine = routed_engine
+    engine.scope_key = "home-default"
+    other = ChatCardEngine(_mock_client())
+    other.scope_key = "home-family"
+    plugin_pkg._ENGINES.append(other)
+    other.on_turn_started("oc_family_chat")
+    engine.on_turn_started("chat1")
+    await _settle(engine)
+    await _settle(other)
+    monkeypatch.setattr(plugin_pkg, "_current_scope_key", lambda: "home-default")
+
+    hook = plugin_pkg._make_reasoning_hook()
+    hook(kind="reasoning", delta="default 的思考", session_id="sess_default", surface="feishu")
+    await _settle(engine)
+
+    assert "default 的思考" in _reasoning_text(engine, "chat1")
+    assert not _reasoning_text(other, "oc_family_chat")
+
+
+@pytest.mark.asyncio
+async def test_pre_api_hook_binds_route_before_first_delta(routed_engine) -> None:
+    """pre_api_request 在首个思考增量前登记路由（旧实现要等 API 调用结束的 usage 钩子）."""
+    import plugin as plugin_pkg
+
+    engine = routed_engine
+    engine.on_turn_started("chat1", thread_id="omt_t")
+    engine.on_draft("chat1", "正文", reply_to="om_user", thread_id="omt_t")
+    await _settle(engine)
+    pre = plugin_pkg._make_pre_api_hook()
+    pre(session_id="sess_1", platform="feishu")
+    assert plugin_pkg._route_by_session("sess_1") == (engine, "chat1", "omt_t")
+
+    hook = plugin_pkg._make_reasoning_hook()
+    hook(kind="reasoning", delta="首个调用的思考", session_id="sess_1", surface="feishu")
+    await _settle(engine)
+    assert "首个调用的思考" in _reasoning_text(engine, "chat1", "omt_t")
+
+
+@pytest.mark.asyncio
+async def test_non_feishu_turns_never_reach_cards(routed_engine) -> None:
+    """cron / 子代理回合（platform≠feishu）的思考与 usage 不进飞书卡."""
+    import plugin as plugin_pkg
+
+    engine = routed_engine
+    engine.on_turn_started("chat1")
+    reasoning = plugin_pkg._make_reasoning_hook()
+    reasoning(kind="reasoning", delta="cron 的思考", session_id="cron_job", platform="cron")
+    usage = plugin_pkg._make_usage_hook()
+    usage(usage={"prompt_tokens": 5, "completion_tokens": 7}, session_id="cron_job",
+          platform="cron")
+    assert engine._usage == {}
+    assert plugin_pkg._route_by_session("cron_job") is None
+
+
+@pytest.mark.asyncio
+async def test_pre_api_hook_ignores_non_feishu_turn(routed_engine) -> None:
+    import plugin as plugin_pkg
+
+    engine = routed_engine
+    engine.on_turn_started("chat1")
+    plugin_pkg._make_pre_api_hook()(session_id="subagent_1", platform="cron")
+    assert plugin_pkg._route_by_session("subagent_1") is None
+
+
+@pytest.mark.asyncio
+async def test_usage_hook_attributes_by_route_chat(routed_engine) -> None:
+    """usage 按路由的 chat 归桶：date_hash 形 session_id 解析不出 chat 时不再落 "" 桶."""
+    import plugin as plugin_pkg
+
+    engine = routed_engine
+    chat = "oc_" + "c" * 20
+    engine.on_turn_started(chat, thread_id="omt_t")
+    usage = plugin_pkg._make_usage_hook()
+    usage(usage={"prompt_tokens": 100, "completion_tokens": 9}, session_id="20261124_120000_abc",
+          model="deepseek-flash", platform="feishu")
+
+    assert engine._usage[chat]["output"] == 9
+    assert "" not in engine._usage
+    assert plugin_pkg._route_by_session("20261124_120000_abc") == (engine, chat, "omt_t")
 
 
 @pytest.mark.asyncio

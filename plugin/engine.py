@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -49,6 +50,21 @@ _logger = logging.getLogger("gateway.run")
 
 # 心跳/interim 文本进卡前的字符上限（防异常长文本撑爆状态行）
 _HEARTBEAT_MAX_LEN = 300
+# 话题已知锚的新鲜期：超过后先查话题最新消息再回退已知锚（锚消息可能已被撤回）
+_THREAD_ANCHOR_TTL = 6 * 3600.0
+# 被顶替的终态会话保留数（每 (chat, thread) 键一条，其完成卡仍是媒体/bg 合并的落点）
+_RECENT_SESSION_MAX = 200
+# ↪ ack 开出的新卡：这段时间内到达的「回合结束」视为 ack 自己的生命周期（续跑
+# 的回答还没开始），不收尾；超过后仍无内容才按回合结束处理
+_REDIRECT_GRACE_SEC = 30.0
+# redirect 残尾拦截的时间窗：旧请求在 ack 时即被中止，残尾只在随后的 1~2 秒内到达
+_STRAGGLER_WINDOW_SEC = 5.0
+
+
+def _session_anchors(session: ChatSession) -> set[str]:
+    """会话关联过的全部消息 id（入站锚 / 回复锚 / 自己的卡消息）."""
+    return {a for a in (session.reply_to, session.turn_inbound, session.redirect_anchor,
+                        session.card_msg_id, *session.accepted_anchors) if a}
 
 
 @dataclass
@@ -66,9 +82,14 @@ class ChatSession:
     redirected: bool = False  # 诊断标记：本回合被 ↪ redirect 重启（seal/replace 日志用）
     model_switch: dict[str, str] | None = None  # footer 循环切换按钮数据（NOTICE 重渲透传）
     redirect_anchor: str | None = None  # redirect 新卡锚（用户纠正消息 id，来自 ack reply_to）
-    # redirect 残尾拦截：旧 model 请求被取消前挤出的快照是老回合内容的超集，
-    # 前缀比对命中即丢弃，防老答案闪进新卡；首个不相关内容通过后清空
+    # redirect 残尾拦截：旧 model 请求在 ack 时被上游中止（agent.redirect →
+    # _ic_abort_active_request），取消前挤出的残尾快照是老回合内容，前缀比对命中
+    # 即丢弃，防老答案闪进新卡。只在 straggler_until 之前生效：残尾一秒内到完，
+    # 之后到达的帧必属新请求——新旧回答开头往往相同（同一个问题重新回答），
+    # 不设时间窗会把新回答整条流当残尾丢光（2026-11-19~24 窗口内 3 次重定向
+    # 全部如此：新卡空白 2~8 分钟，答案最后一次性出现）
     straggler_guard: str = ""
+    straggler_until: float = 0.0
     # 本回合可接受的 draft 锚集合（followup 边界判定用）。redirect 场景同回合
     # 会出现两个锚（新指令消息 + 老回合消息），都算本回合不算新回合。
     accepted_anchors: set[str] = field(default_factory=set)
@@ -76,6 +97,15 @@ class ChatSession:
     # （watch/process 注入直投恰好落在活跃卡上时，卡可能是 redirect 刚拆开、
     # 尚无任何 draft 的新卡，绝不能当终态完成渲染）
     has_draft: bool = False
+    # 话题内兜底回复锚：本回合拿不到 reply_to（hermes 合成入站/被打断的回合没有
+    # message id）时，卡片 reply 到它——话题内上一张卡或上一条入站，仍落在线程里。
+    # 与 reply_to 分离：不参与 followup/redirect 的锚变化判定
+    thread_anchor: str | None = None
+    # 本回合经卡片/锚投递的文件·图片数（无正文回合收尾时的提示用）
+    media_delivered: int = 0
+    # redirect 续跑标记：↪ ack 开出的新卡在首个内容到达前不算「回合已结束」——
+    # ack 消息自己的 processing_complete(SUCCESS) 紧随 mark_redirect 到达
+    awaiting_content: bool = False
     _reasoning_logged: bool = False
     tool_seg: Segment | None = None
     heartbeat_text: str = ""
@@ -156,6 +186,24 @@ class ChatCardEngine:
         self._inbound_seen: dict[str, dict[str, float]] = {}
         # processing_start 早于 turn_started 到达时的原始锚暂存（chat → (锚, 时间)）
         self._pending_turn_inbound: dict[str, tuple[str, float]] = {}
+        # 会话键 → 话题内最近一条可回复的消息 id（本插件的卡 / 用户入站）及登记时间。
+        # 无 reply 锚的话题回合（hermes 合成入站：后台进程通知注入、被打断回合的
+        # 收尾文本）靠它在话题内建卡/回退；两机实测这类回合的回答整条丢失
+        # （卡一直 creating → 官方 thread_id 直发 99992402，2026-11-19~24）
+        self._thread_anchor: dict[str, tuple[str, float]] = {}
+        # 会话键 → 最近一个被顶替的终态会话。新回合的探针（含被 redirect 打断的旧 run
+        # 收尾时迟到的探针）会顶掉刚完成的卡会话，而该回合的 post-stream 媒体投递、
+        # bg 通知合并仍要找到那张卡（2026-11-19 梦珊 j-s：顶替后 3 个文件 card=no）
+        self._recent: dict[str, ChatSession] = {}
+        # (落点, 文件标识) → 投递时间：同一张卡短时间内重复投递同一文件的去重。
+        # 上游有多条附件投递通道（post-stream 媒体通道、回合持久化后的补发、被
+        # redirect 打断的旧 run 收尾），同一文件的显式 MEDIA 标签与自动追加标签也
+        # 各算一次——2026-11-19~24 梦珊 default 经卡片路径的 5 个文件全部被投了两遍
+        self._media_sent: dict[tuple[str, str], float] = {}
+        # 所属 profile 的作用域键（hermes_home_key，构建现场取）——钩子回调运行在
+        # 发起回合的 contextvars 里，据此把 reasoning/usage 路由限定在本 profile 的
+        # engine 内（multiplex 下不再靠「全局恰好一个活跃会话」猜测，见 __init__）
+        self.scope_key: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: Any = None
 
@@ -172,11 +220,16 @@ class ChatCardEngine:
         m = re.search(r"oc_[0-9a-f]{16,40}", str(session_id or ""))
         return m.group(0) if m else ""
 
-    def record_usage(self, session_id: str, usage: dict[str, Any] | None, model: str = "") -> None:
-        """单次 API 调用的 usage 累加进所属 chat 的回合桶."""
+    def record_usage(self, session_id: str, usage: dict[str, Any] | None, model: str = "",
+                     *, chat_id: str | None = None) -> None:
+        """单次 API 调用的 usage 累加进所属 chat 的回合桶.
+
+        ``chat_id``：钩子路由命中时传入的显式归属（date_hash 形 session_id 解析
+        不出 chat，旧实现只能落 "" 桶——同 profile 两个并发回合的 usage 混在一起）。
+        """
         if not usage:
             return
-        chat_id = self._chat_of_session(session_id)
+        chat_id = chat_id or self._chat_of_session(session_id)
         bucket = self._usage.setdefault(
             chat_id, {"input": 0, "output": 0, "model": "", "context_max": 0,
                       "first_started": None, "last_ended": None})
@@ -232,14 +285,19 @@ class ChatCardEngine:
                          chat_id[:12], (thread_id or "-")[:16])
         # typing 2s 心跳循环的重复调用：会话健在时静默（此前每 2s 刷一条）
 
-    def note_inbound(self, chat_id: str, message_id: str) -> None:
+    def note_inbound(self, chat_id: str, message_id: str,
+                     thread_id: str | None = None) -> None:
         """入站消息登记（adapter.on_processing_start 调用，drain 消息在 drain
         开始时同样触发）——followup 拆卡门槛的数据源：draft 锚只有在里面才
         允许拆卡。工具边界换 consumer 的重锚不是入站消息，不得拆卡
         （2026-10-09 实测：redirected 回合写文件后锚变新 id，误拆成
-        「Done.」空卡 + 内容全落第三张卡）。"""
+        「Done.」空卡 + 内容全落第三张卡）。
+
+        话题内的入站同时登记为话题锚（无锚回合建卡/回退的兜底目标）。
+        """
         if not chat_id or not message_id:
             return
+        self._remember_thread_anchor(chat_id, thread_id, message_id)
         bucket = self._inbound_seen.setdefault(chat_id, {})
         bucket[message_id] = time.time()
         while len(bucket) > 50:  # 每_chat 只留最近 50 条，防无界增长
@@ -255,7 +313,18 @@ class ChatCardEngine:
                       if s.chat_id == chat_id and not s.is_terminal
                       and s.turn_inbound is None]
         if candidates:
-            max(candidates, key=lambda s: s.created_at).turn_inbound = message_id
+            newest = max(candidates, key=lambda s: s.created_at)
+            newest.turn_inbound = message_id
+            # 话题回合：processing_start 带来本回合**真实入站消息 id**——这就是
+            # 建卡回复锚。此刻建卡（reply 到用户消息），不再等首帧正文：纯思考型
+            # 回合正文要几分钟后才出现，此前话题里全程空白（2026-11-23 j-s 实测
+            # 9 分钟）。探针/typing 不带消息 id，仍不建卡——被 redirect 打断的旧
+            # run 收尾时的迟到探针不会多出空卡。
+            if (newest.thread_id and newest.reply_to is None
+                    and newest.thread_anchor is None
+                    and newest.card_create_task is None):
+                newest.thread_anchor = message_id
+                self._maybe_start_card_task(newest)
         elif not any(s.chat_id == chat_id and not s.is_terminal
                      for s in self._sessions.values()):
             # 该 chat 无任何活跃会话：消息属于即将开始的回合——暂存待回填
@@ -308,6 +377,10 @@ class ChatCardEngine:
             reply_to=session.redirect_anchor or session.reply_to,
             straggler_guard=(session.answer_seg.text if session.answer_seg else ""))
         new.turn_inbound = session.turn_inbound  # 同一回合续跑，原始锚随行
+        new.awaiting_content = True
+        new.straggler_until = time.time() + _STRAGGLER_WINDOW_SEC
+        if thread_id and new.reply_to:
+            self._remember_thread_anchor(chat_id, thread_id, new.reply_to)
         # redirected 回合的 draft 锚会中途变回老消息 id（工具边界换 consumer
         # 重新锚定回合身份）——两个锚都算本回合，防 followup 边界拦腰拆卡。
         # probe 期 redirect（首 token 前纠正）draft 锚从未出现过，必须带上
@@ -319,6 +392,7 @@ class ChatCardEngine:
         # 立刻置终态：seal 是异步任务（cardkit close+update 要走网络），期间旧
         # 会话若仍计为 streaming，全局 reasoning 路由会把新回合的思考误送旧卡
         session.state = "completed"
+        self._retire(session)
         self._sessions[self._skey(chat_id, thread_id)] = new
         self._ensure_session(chat_id, thread_id)  # 新卡立刻建，不等首条 draft
         self._seal_session(session, notice="↪ 任务已按新指令重启，结果见下方新卡片")
@@ -342,6 +416,120 @@ class ChatCardEngine:
         if not candidates:
             return None
         return max(candidates, key=lambda s: s.created_at)
+
+    def latest_card_session(self, chat_id: str, thread_id: str | None = None,
+                            *, anchor_hint: str | None = None) -> ChatSession | None:
+        """该 chat（可限定 thread）最近一个**有卡**的会话——含被顶替的终态会话.
+
+        bg 通知合并与媒体投递的落点。只认有卡的会话：新建的 creating 会话不该
+        遮住同话题那张还能用的完成卡。``anchor_hint``（媒体 metadata 的
+        reply_to_message_id）命中某会话的锚集合时优先——用户已发下一条消息时，
+        上一回合的在途文件仍挂到它自己的卡下面，而不是新回合刚建的卡。
+        """
+        candidates: list[ChatSession] = []
+        for session in list(self._sessions.values()) + list(self._recent.values()):
+            if session.chat_id != chat_id or not session.card_id:
+                continue
+            if thread_id is not None and session.thread_id != thread_id:
+                continue
+            candidates.append(session)
+        if not candidates:
+            return None
+        if anchor_hint:
+            owned = [s for s in candidates if anchor_hint in _session_anchors(s)]
+            if owned:
+                return max(owned, key=lambda s: s.created_at)
+        return max(candidates, key=lambda s: s.created_at)
+
+    # ── 媒体去重：同一落点短时间内不重复投递同一文件 ──
+
+    _MEDIA_DEDUPE_TTL = 600.0
+
+    @staticmethod
+    def media_key(path: str) -> str:
+        """文件标识：规范化绝对路径 + （存在时）大小与修改时间——文件被重新生成
+        则视为新文件，照常投递。路径无法规范化时退回原字符串。"""
+        from ._vendor.paths import local_file_path
+
+        try:
+            real = os.path.realpath(local_file_path(str(path)))
+            st = os.stat(real)
+            return f"{os.path.normcase(real)}|{st.st_size}|{st.st_mtime_ns}"
+        except Exception:
+            return str(path)
+
+    def _prune_media_sent(self, now: float) -> None:
+        if len(self._media_sent) > 500:
+            for key, ts in list(self._media_sent.items()):
+                if now - ts > self._MEDIA_DEDUPE_TTL:
+                    self._media_sent.pop(key, None)
+            while len(self._media_sent) > 500:
+                self._media_sent.pop(next(iter(self._media_sent)))
+
+    def media_already_delivered(self, target: str, path: str) -> bool:
+        """该落点（卡消息 id）在去重窗口内已投递（或正在投递）同一文件.
+
+        只在同一落点内去重：用户下一回合要求「再发一次」是新卡，照常投递
+        （上游刻意不跨回合去重，这里口径一致）。
+        """
+        now = time.time()
+        self._prune_media_sent(now)
+        ts = self._media_sent.get((target, self.media_key(path)))
+        return ts is not None and now - ts <= self._MEDIA_DEDUPE_TTL
+
+    def reserve_media_delivery(self, target: str, path: str) -> None:
+        """投递开始即占位——并发的第二条上游通道等不到第一条完成，必须先占后发."""
+        self._media_sent[(target, self.media_key(path))] = time.time()
+
+    def release_media_delivery(self, target: str, path: str) -> None:
+        """投递失败：撤销占位，后续通道/重试仍可投递."""
+        self._media_sent.pop((target, self.media_key(path)), None)
+
+    # ── 话题锚：无 reply 锚的话题回合的建卡 / 原生回退目标 ──
+
+    def _remember_thread_anchor(self, chat_id: str, thread_id: str | None,
+                                message_id: str | None) -> None:
+        if not (chat_id and thread_id and message_id):
+            return
+        key = self._skey(chat_id, thread_id)
+        self._thread_anchor.pop(key, None)  # 重新插入 = 移到有序字典末尾（LRU 淘汰用）
+        self._thread_anchor[key] = (str(message_id), time.time())
+        while len(self._thread_anchor) > 200:
+            self._thread_anchor.pop(next(iter(self._thread_anchor)))
+
+    def thread_anchor(self, chat_id: str, thread_id: str | None) -> str | None:
+        """话题内已知锚（同步，不发网络请求）：本话题上一张卡 / 上一条入站."""
+        if not thread_id:
+            return None
+        hit = self._thread_anchor.get(self._skey(chat_id, thread_id))
+        return hit[0] if hit else None
+
+    async def resolve_thread_anchor(self, chat_id: str, thread_id: str | None,
+                                    *, refresh: bool = False) -> str | None:
+        """话题内可回复的消息 id：已知锚优先，否则（或 ``refresh``）查话题最后一条消息.
+
+        重启后该话题的第一个回合就是无锚回合、或已知锚被撤回时走查询；查询
+        失败（无读消息权限/网络）退回已知锚，再没有返回 None——调用方落原生。
+        """
+        if not thread_id:
+            return None
+        known = self.thread_anchor(chat_id, thread_id)
+        hit = self._thread_anchor.get(self._skey(chat_id, thread_id))
+        if hit and not refresh and time.time() - hit[1] < _THREAD_ANCHOR_TTL:
+            return hit[0]
+        try:
+            raw_anchor = await self._client.last_message_in_thread(thread_id)
+            message_id: str | None = str(raw_anchor) if raw_anchor else None
+        except Exception as e:
+            _logger.warning("[feishu-streaming] thread anchor lookup failed: thread=%s err=%s",
+                            thread_id[:16], e)
+            return known
+        if message_id:
+            _logger.info("[feishu-streaming] thread anchor resolved from thread: "
+                         "thread=%s anchor=%s", thread_id[:16], str(message_id)[:16])
+            self._remember_thread_anchor(chat_id, thread_id, message_id)
+            return message_id
+        return known
 
     def streaming_sessions(self) -> list[ChatSession]:
         return [s for s in self._sessions.values() if s.state == "streaming"]
@@ -369,14 +557,17 @@ class ChatCardEngine:
         self._capture_loop()
         session = self._ensure_session(chat_id, thread_id)
         guard = session.straggler_guard
-        if guard and content and (content.startswith(guard) or guard.startswith(content)):
-            # redirect 残尾：旧请求取消前挤出的快照（老回合内容的超集），
-            # 丢弃——否则新卡开头闪现老答案，思考型模型下要挂到新请求出文本
-            _logger.info("[feishu-streaming] redirect straggler draft dropped: len=%d",
-                         len(content))
-            return
         if guard:
-            session.straggler_guard = ""  # 首个真实新内容已过，不再拦（防误伤后续帧）
+            if (time.time() < session.straggler_until and content
+                    and (content.startswith(guard) or guard.startswith(content))):
+                # redirect 残尾：旧请求在 ack 时被中止，取消前挤出的快照（老回合
+                # 内容的超集）在 1~2 秒内到完——丢弃，否则新卡开头闪现老答案
+                _logger.info("[feishu-streaming] redirect straggler draft dropped: len=%d",
+                             len(content))
+                return
+            # 时间窗已过（或内容与残尾无关）：此后必是新请求的输出，不再拦。
+            # 新旧回答开头往往相同，靠「内容不匹配」解除会把新回答整条流丢光
+            session.straggler_guard = ""
         accepted = session.accepted_anchors or (
             {session.reply_to} if session.reply_to else set())
         if (session.state != "creating" and reply_to and session.reply_to
@@ -402,6 +593,7 @@ class ChatCardEngine:
                 old_session = session
                 new = ChatSession(chat_id=chat_id, thread_id=thread_id, reply_to=reply_to)
                 new.accepted_anchors = {reply_to}
+                self._retire(old_session)
                 self._sessions[self._skey(chat_id, thread_id)] = new
                 session = self._ensure_session(chat_id, thread_id)  # 新会话补建卡 task
                 # 旧卡零正文（redirect 后未出文本就被新消息接管）时别渲染成
@@ -413,8 +605,8 @@ class ChatCardEngine:
         if session.reply_to is None and reply_to:
             session.reply_to = reply_to
             session.accepted_anchors = {reply_to}
-        # 话题会话：锚已到手（首帧 draft 带 reply_to_message_id）→ 此刻才建卡
-        self._maybe_start_card_task(session)
+        if session.thread_id and session.reply_to:
+            self._remember_thread_anchor(session.chat_id, session.thread_id, session.reply_to)
         if session.answer_seg is None:
             # 空文本走 on_answer_delta：在正确位置（reasoning 之后）新建空 ANSWER 段
             session.segment_state.on_answer_delta("")
@@ -424,6 +616,9 @@ class ChatCardEngine:
         session.answer_seg.text = strip_reasoning_tags(content)
         session.answer_seg.dirty = True
         session.has_draft = True  # adapter 无锚 send 的劫持判别用（见 send 路由）
+        session.awaiting_content = False
+        # 话题会话：锚到手（首帧 draft 的 reply_to，或话题内已知锚）→ 此刻才建卡
+        self._maybe_start_card_task(session)
         self._schedule(session)
 
     def on_tool_start(self, tool_name: str, detail: str = "",
@@ -455,6 +650,10 @@ class ChatCardEngine:
             session.tool_seg = session.segment_state.segments[-1]
             session.tool_seg.created = False  # 待 flush 建元素
         session.tool_seg.dirty = True
+        session.awaiting_content = False
+        if session.state == "creating" and session.thread_id and session.reply_to is None:
+            # 无 reply 锚的话题回合：工具面板是第一份可见内容 → 用话题内已知锚建卡
+            self._maybe_start_card_task(session)
         self._schedule(session)
 
     def on_tool_end(self, tool_name: str, *, error: str = "", output: str = "") -> None:
@@ -466,14 +665,19 @@ class ChatCardEngine:
             session.tool_seg.dirty = True
         self._schedule(session)
 
-    def on_reasoning(self, chat_id: str, text: str, *, strict: bool = False) -> None:
+    def on_reasoning(self, chat_id: str, text: str, *, strict: bool = False,
+                     thread_id: str | None = None) -> None:
         """reasoning 增量 — 多会话并发时丢弃（防串扰）.
 
         ``strict``（session_id 路由命中时）：只进 chat_id 自己的会话，目标
         不活跃就丢弃——绝不回落单活跃兜底（回落=把 B 的思考写进 A 的卡，
-        catalog review 指出的串扰正是这一步）。
+        catalog review 指出的串扰正是这一步）。``thread_id`` 是会话键的另一半
+        （话题回合的会话在 ``chat::thread`` 键下）：此前 strict 只按 chat 查
+        主聊键，话题回合路由命中即静默丢弃（长话题回合只有首个 API 调用的
+        思考能进卡，之后的调用路由已登记反而全丢）。
         """
-        target = self.active_session(chat_id) if strict else self._resolve_reasoning_target(chat_id)
+        target = (self.active_session(chat_id, thread_id) if strict
+                  else self._resolve_reasoning_target(chat_id, thread_id))
         if target is None:
             return
         if not target._reasoning_logged:
@@ -575,14 +779,18 @@ class ChatCardEngine:
         return session.card_msg_id
 
     async def append_notice(self, chat_id: str, text: str,
-                            thread_id: str | None = None) -> str | None:
+                            thread_id: str | None = None, *,
+                            session: ChatSession | None = None) -> str | None:
         """把 background/系统通知追加进该 chat 最近一张卡（跨回合合并）.
 
         会话可能是 COMPLETED（bg 回合在主回合完成后到达）——追加 NOTICE segment
         后整体重渲完成卡；会话仍活跃则交由 flush 建 NOTICE 元素。
-        返回卡片消息 id；无可用卡片返回 None（调用方走原生文本保底）。
+        ``session`` 显式指定落点（被顶替的完成卡不在 _sessions 里，调用方经
+        latest_card_session 取得）。返回卡片消息 id；无可用卡片返回 None
+        （调用方走原生文本保底）。
         """
-        session = self._sessions.get(self._skey(chat_id, thread_id))
+        if session is None:
+            session = self._sessions.get(self._skey(chat_id, thread_id))
         if session is None or session.card_id is None:
             return None
         session.segment_state.add_notice(text)
@@ -671,11 +879,49 @@ class ChatCardEngine:
         session = self.active_session(chat_id, thread_id)
         if session is None or session.state != "creating" or session.card_id is not None:
             return False
+        if session.card_create_task is not None:
+            # 建卡在飞：卡马上就有，不是幽灵。↪ redirect ack 自己的
+            # processing_complete(SUCCESS) 紧随 mark_redirect 到达，旧逻辑在这里把
+            # 刚开的新回合会话置 failed——卡随后建好却永不再刷新（2026-11-20 梦珊
+            # j-s 两张卡永久停在「处理中」，窗口内全部卡死卡片皆此因）
+            _logger.info("[feishu-streaming] ghost close skipped (card create in flight): "
+                         "chat=%s thread=%s", chat_id[:12], (thread_id or "-")[:16])
+            return False
         session.state = "failed"
         session.completed_at = time.time()
         _logger.info("[feishu-streaming] ghost session closed: chat=%s thread=%s "
                      "(no card, no final send)", chat_id[:12], (thread_id or "-")[:16])
         return True
+
+    async def on_turn_ended(self, chat_id: str, thread_id: str | None = None) -> None:
+        """回合正常结束的收尾兜底——adapter 在该回合**自己入站消息**的
+        processing_complete=SUCCESS 时调用.
+
+        - 卡从未建（creating、无建卡任务）：幽灵清理（:meth:`close_ghost_creating`）
+        - 卡已建但全程没有正文：模型只回了 MEDIA 行 / 空回复，之后不会再有
+          final send——不收尾就永停「处理中」。按已有内容（工具面板/思考）渲染
+          完成卡，NOTICE 说明交付情况
+        - redirect 续跑的新卡（awaiting_content）除外：↪ ack 的 SUCCESS 到达时
+          续跑的回答还没开始，此时不是回合结束
+        """
+        session = self.active_session(chat_id, thread_id)
+        if session is None:
+            return
+        if session.state == "creating" or session.card_id is None:
+            self.close_ghost_creating(chat_id, thread_id)
+            return
+        if session.answer_seg is not None and (session.answer_seg.text or "").strip():
+            return  # 有正文却还没 complete：final send / 续跑内容在路上，不动
+        if session.awaiting_content and time.time() - session.created_at < _REDIRECT_GRACE_SEC:
+            _logger.info("[feishu-streaming] turn end ignored (redirect continuation): "
+                         "chat=%s thread=%s", chat_id[:12], (thread_id or "-")[:16])
+            return
+        notice = (f"📎 本回合已交付 {session.media_delivered} 个文件/图片"
+                  if session.media_delivered else "ℹ️ 本回合没有文字回复")
+        _logger.info("[feishu-streaming] sealing content-less card at turn end: chat=%s "
+                     "state=%s media=%d", chat_id[:12], session.state, session.media_delivered)
+        session.segment_state.add_notice(notice)
+        await self.complete(chat_id, "", thread_id=thread_id)
 
     def session_by_card_msg_id(self, message_id: str) -> ChatSession | None:
         """按卡片消息 id 找会话（stale-finalize 编辑重定向的入口）."""
@@ -753,6 +999,7 @@ class ChatCardEngine:
                     f"{time.time() - session.completed_at:.1f}s"
                     if session.completed_at else "never",
                     session.redirected)
+                self._retire(session)
             new = ChatSession(chat_id=chat_id, thread_id=thread_id)
             self._sessions[key] = new
             session = new
@@ -764,16 +1011,47 @@ class ChatCardEngine:
         self._maybe_start_card_task(session)
         return session
 
-    def _maybe_start_card_task(self, session: ChatSession) -> None:
-        """建卡任务启动；话题会话例外——建卡推迟到首个 draft（拿到 reply 锚）.
+    def _retire(self, session: ChatSession) -> None:
+        """有卡的终态会话被顶替前留档——其完成卡仍是媒体投递 / bg 合并的落点.
 
-        无锚建卡直发 chat 会落在主聊顶层，话题回合的卡必须 reply 到话题内的
-        消息才能进线程（2026-10-09 实测：探针期无锚建卡，卡落主聊、话题空壳）。
+        只留有卡的：无卡的幽灵会话不该挤掉同键上一张真正可用的卡。
+        """
+        if not session.card_id:
+            return
+        key = self._skey(session.chat_id, session.thread_id)
+        self._recent.pop(key, None)
+        self._recent[key] = session
+        while len(self._recent) > _RECENT_SESSION_MAX:
+            self._recent.pop(next(iter(self._recent)))
+
+    @staticmethod
+    def _has_visible_content(session: ChatSession) -> bool:
+        """会话是否已有可上卡的内容（draft 正文 / 工具面板 / 思考）."""
+        return (session.answer_seg is not None or session.tool_seg is not None
+                or any(seg.type == SegmentType.REASONING
+                       for seg in session.segment_state.segments))
+
+    def _maybe_start_card_task(self, session: ChatSession) -> None:
+        """建卡任务启动；话题会话例外——建卡推迟到拿到话题内的锚.
+
+        话题回合的 reply 锚由首帧 draft 带到（reply_to_message_id）；探针期无锚
+        建卡直发 chat 会落在主聊顶层（2026-10-09 实测：话题空壳），所以等。
+        hermes 合成入站的回合（后台进程通知注入、被打断回合的收尾文本）永远
+        等不到 reply 锚：此前卡一直 creating → complete 置 failed → 官方
+        thread_id 直发 99992402，回答整条丢失（2026-11-19~24 两机实测）。
+        现在「有内容却无 reply 锚」时退回话题内已知锚（上一张卡 / 上一条
+        入站），卡仍 reply 进线程；探针期仍不抢建——被 redirect 打断的旧 run
+        收尾时会再来一次探针，抢建会多出一张空卡。
         """
         if session.state != "creating" or session.card_create_task is not None:
             return
         if session.thread_id and session.reply_to is None:
-            return  # 话题会话等锚
+            if session.thread_anchor is None:
+                if not self._has_visible_content(session):
+                    return  # 等首个可见内容/真实入站锚
+                session.thread_anchor = self.thread_anchor(session.chat_id, session.thread_id)
+            if session.thread_anchor is None:
+                return  # 话题内无已知锚：send() 侧查话题最新消息后再启动
         assert self._loop is not None
         if session.flush is None:
             session.flush = FlushController(loop=self._loop)
@@ -827,11 +1105,14 @@ class ChatCardEngine:
         active = [s for s in self._sessions.values() if not s.is_terminal]
         return active[0] if active else None
 
-    def _resolve_reasoning_target(self, chat_id: str) -> ChatSession | None:
+    def _resolve_reasoning_target(self, chat_id: str,
+                                  thread_id: str | None = None) -> ChatSession | None:
         # 钩子不带 chat：显式 chat 命中优先；否则仅单会话时兜底（多会话并发丢弃防串扰）。
         # 兜底须含 creating（typing 建卡窗口内的 reasoning 也不能丢——长思考回合
         # 的 reasoning 若在建卡期被丢，卡片全程只有 loading）
-        session = self.active_session(chat_id)
+        session = self.active_session(chat_id, thread_id)
+        if session is None and not thread_id:
+            session = self.active_session(chat_id)
         if session is not None:
             return session
         active = [s for s in self._sessions.values() if not s.is_terminal]
@@ -858,17 +1139,43 @@ class ChatCardEngine:
         )
         try:
             card_id = await self._client.cardkit_create(card)
-            if session.reply_to:
-                # 有锚：卡片落在用户消息下方（话题内即同一线程）
-                card_msg_id = await self._client.reply_card_by_id(session.reply_to, card_id)
+        except Exception as e:
+            _logger.warning("plugin card create failed: chat=%s err=%s", session.chat_id, e)
+            session.state = "failed"
+            return
+        # 回复锚：回合的 reply 锚；无锚话题回合用话题内已知锚（上一张卡/上一条入站）
+        anchor = session.reply_to or session.thread_anchor
+        card_msg_id: str | None = None
+        try:
+            if anchor:
+                # 有锚：卡片落在锚消息下方（话题内即同一线程）
+                card_msg_id = await self._client.reply_card_by_id(anchor, card_id)
             else:
                 # 无锚：直发 chat（chat_id 不是合法 reply 目标，reply 会 230001）
                 card_msg_id = await self._client.send_card_to_chat(
                     session.chat_id, {"type": "card", "data": {"card_id": card_id}})
         except Exception as e:
-            _logger.warning("plugin card create failed: chat=%s err=%s", session.chat_id, e)
-            session.state = "failed"
-            return
+            if not (session.thread_id and session.reply_to is None):
+                _logger.warning("plugin card create failed: chat=%s err=%s", session.chat_id, e)
+                session.state = "failed"
+                return
+            # 话题兜底锚可能已被撤回/删除 → 查话题最新消息重试一次
+            fresh = await self.resolve_thread_anchor(
+                session.chat_id, session.thread_id, refresh=True)
+            if not fresh or fresh == anchor:
+                _logger.warning("plugin card create failed: chat=%s err=%s", session.chat_id, e)
+                session.state = "failed"
+                return
+            try:
+                card_msg_id = await self._client.reply_card_by_id(fresh, card_id)
+            except Exception as e2:
+                _logger.warning("plugin card create failed: chat=%s err=%s", session.chat_id, e2)
+                session.state = "failed"
+                return
+            session.thread_anchor = anchor = fresh
+        if session.thread_id and card_msg_id:
+            # 自己的卡是话题里最稳的锚（用户消息可能被撤回，bot 消息不会）
+            self._remember_thread_anchor(session.chat_id, session.thread_id, card_msg_id)
         session.card_id = card_id
         session.card_msg_id = card_msg_id
         if session.state == "creating":

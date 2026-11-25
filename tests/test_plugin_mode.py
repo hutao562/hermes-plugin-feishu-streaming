@@ -36,6 +36,8 @@ def _mock_client() -> MagicMock:
     client.cardkit_close_streaming = AsyncMock()
     client.cardkit_update = AsyncMock()
     client.send_card_to_chat = AsyncMock(return_value="om_card_msg")
+    # 话题内锚查询（无锚话题回合的建卡/原生回退兜底）
+    client.last_message_in_thread = AsyncMock(return_value=None)
     # 媒体交付（send_document/send_image_file 卡片锚路径）
     client.upload_document = AsyncMock(return_value="file_key_1")
     client.reply_file_by_id = AsyncMock(return_value=True)
@@ -819,8 +821,8 @@ def test_reasoning_hook_logs_on_real_contention(monkeypatch, caplog) -> None:
     import plugin as plugin_mod
 
     monkeypatch.setattr(plugin_mod, "_route_by_session", lambda _sid: None)
-    eng = SimpleNamespace(streaming_sessions=lambda: ["a", "b"],
-                          on_reasoning=MagicMock())
+    eng = SimpleNamespace(open_sessions=lambda: ["a", "b"],
+                          on_reasoning=MagicMock(), scope_key=None)
     monkeypatch.setattr(plugin_mod, "_ENGINES", [eng])
 
     hook = plugin_mod._make_reasoning_hook()
