@@ -115,3 +115,49 @@
 - 影响面：①**锚点体系与上游模块化的赛跑**——父类已拆三块（adapter/choice_cards/synthetic_events），needle 锚「文件路径+子串」形态对拆分敏感；②draft 重试增强、cron 拆分、clarify 内部精简均无插件接口变化；③合成事件语义未变（event_chat_type/raw_type 口径照旧）
 - 建议处理方案（下个锚点窗口执行，本次不处理）：①`contract.py` 合成事件面锚迁移——`adapter.py` 保留 MRO 锚（`FeishuSyntheticEventsMixin` import 行）+ `adapter_synthetic_events.py` 新文件锚 `_dispatch_synthetic_event(` 签名，**双文件锚**防再次拆分；②`adapter_choice_cards.py`/`adapter_synthetic_events.py` 纳入 manifest/TREE_FILES（同 revision 扩清单）；③验证：pytest 契约回归 + check_tree 对 pinned/main 双树 + ruff/mypy + `hermes plugins validate`
 - 关联：hermes-compat issue 0 open（hutao562 #1 已于 11-11 关闭，GH Action 已禁用，本记录为唯一报警通道）
+
+## 2026-11-25 上游 1bddac5（基线 2bd378e，较前已验证 da9c2bd 全窗 11-19~11-25 七天）
+
+- 状态：**明确影响——插件有 1 处真实调用面断裂（升级即断），另有锚点缺失 2 处**。上游 11-19 把卡片点击鉴权从 `FeishuAdapter` 类整体搬进新子包 `plugins/platforms/feishu/cards/`，其中 `_is_interactive_operator_authorized` 方法被移除，而插件有三处无保护调用。这与 11-18 那次（纯锚点位置漂移、签名未变）性质不同。
+- 巡检备注：11-19~11-24 六天调度未产出执行；这批提交全部日期为 11-19，本应当天发现，实际晚 6 天。本条覆盖七天窗口：比对 35 个文件（关注清单 34 个 + `gateway/platforms/base.py`），9 个有变、26 个字节级相同；另通读了新子包 `cards/` 的 2 个新文件。draft 契约面（stream consumer 五件、transport、fallback）、`run_notifications.py`、`clarify_gateway.py`、`stream_delivery.py`、`api_request_hooks.py`、`base.py`、`gateway_env.py`、`platform_registry.py` 本窗口全部未变。
+- 上游改动（11-19 五个提交，全部是 feishu 卡片点击鉴权的修复与搬迁）：
+  - `b3d632d` fix(feishu): resolve card-click chat type from cache and try every operator id form。修 `_is_interactive_operator_authorized` 的网关准入回退：原先会话类型硬编码 `"group"`、只试一种 id。上游提交说明称它「拒绝所有已准入用户的每一次卡片点击」（errors.log 每次点击一条 `[Feishu] Unauthorized approval click by ou_...`，审批超时按拒绝处理，而同一用户的 DM 消息正常）。pinned 2bd378e（0.23.0）里的就是这版实现。
+  - `6bb6ea0` fix(feishu): derive chat type from raw_mode, not raw_type。`get_chat_info` 的 `"type"` 原先由 `raw_type` 映射，而 `raw_type` 取自飞书 `chat_type`，是 private/public（可见性）；映射器要的是 p2p/group/topic，所以 private 可见性的聊天全部落到 `"dm"` 默认值。现改由 `raw_mode`（取自 `chat_mode`）映射。
+  - `bf353dd` / `797be25` / `e97efa9` refactor：鉴权与 chat 类型映射搬进新子包 `plugins/platforms/feishu/cards/`（`__init__.py` + `authz.py`），父类内部 import 改为包相对（`from .cards import …`）。
+  - 方法迁移对照（旧 = pinned 2bd378e 的 `FeishuAdapter` 方法；新 = `cards.authz` 的模块级函数，首参为 adapter）：
+
+    | 旧方法 | 新函数 | 插件是否调用 |
+    |---|---|---|
+    | `_is_interactive_operator_authorized(open_id, *, user_id, union_id, chat_id)` | `is_operator_authorized(adapter, open_id, *, user_id="", union_id="", chat_id="")` | **是，3 处** |
+    | `_validate_card_action(...)` | `validate_card_action(adapter, ...)` | 否 |
+    | `_pop_validated_prompt_state(...)` | `pop_validated_prompt_state(adapter, ...)` | 否 |
+    | `_map_chat_type(raw)` | `map_chat_type(raw)` | 否 |
+    | `_resolve_source_chat_type(*, chat_info, event_chat_type)` | `resolve_source_chat_type(*, chat_info, event_chat_type)`（签名不变） | 否（仅注释提及） |
+
+  - 新 `is_operator_authorized` 相对旧实现的差别：未配置 FEISHU admins / `FEISHU_ALLOWED_USERS` 时，从 `_chat_info_cache` 里该 chat 的 `raw_mode` 解析真实 dm/group/forum（缓存未命中按 `"group"`，fail-closed），并依次尝试 user_id / union_id / open_id 三种 id 形态，任一通过即放行。
+  - 其余变化均与插件无关：`cron/scheduler_delivery.py` +16（新增 `_snapshot_delivery_job`）、`cron/scheduler.py`（一段代码缩进平移）、`gateway/response_filters.py` +115（静默标记受损形态的容错识别）、`gateway/run_startup.py` +27（可选的状态上报 watcher）、`gateway/run.py`、`feishu_comment_rules.py`。CRON_WRAP 信封 needle 在位。
+- 影响面：
+  1. **升级即断（确定）**。插件三处直接调用该方法，都没有 try/except 或 getattr 兜底：`plugin/_clarify.py:141`（`resolve_clarify`，点击 clarify 按钮后唤醒 agent 的异步分支）、`plugin/_clarify.py:210`（`handle_clarify_card_action`，SDK 同步回调）、`plugin/adapter.py:572`（`_handle_model_switch_action`，行号基于 1682bef）。最后一处排在 `pick` / `admin` / `toggle` / `admin_done` / `switch` 全部分支之前。升级到含这批提交的 hermes 后，clarify 按钮与模型选择相关的全部按钮（footer 🧠⇄、选择卡、管理卡）一点就 `AttributeError`。流式卡片本体、cron 卡、话题媒体、/stop 收卡不走这条路径。
+  2. **只改名字不够（确定）**。三处调用都只传 `open_id`。按新实现，`chat_id` 为空时会话类型一律按 `"group"` 判，且只有 open_id 一种 id 形态——行为与旧实现相同，拿不到这次的修复。要吃到修复需补传 `chat_id`（三处都有现成值）与 `user_id` / `union_id`（取自 `event.operator`）。
+  3. **`event_chat_type` 的取值依据存疑（代码事实确定，运行时表现未实测）**。`plugin/adapter.py` 的 `_dispatch_model_switch` 把 `chat_info["raw_type"]` 当作 `event_chat_type` 传给合成事件，注释与测试 mock（`tests/test_plugin_features.py` 的 `test_dispatch_model_switch_uses_raw_type_for_dm`，`raw_type="p2p"`）都假定它是 p2p/group；但 `raw_type` 是 private/public，p2p/group/topic 在 `raw_mode`。pinned 样本 `adapter.py:2011-2014` 即如此；本机 lark SDK 的 `GetChatResponseBody` 里 `chat_mode` 与 `chat_type` 是两个独立字段（取值含义依据上游 6bb6ea0 的提交说明与代码注释）。按代码推演 `resolve_source_chat_type`：
+     - DM：新旧版 `"type"` 都是 `"dm"`，都回退到比较 `event_chat_type == "p2p"`。传真实的 `"private"` 得 `"group"`；只有 `get_chat_info` 走 fallback 或抛异常（字典里没有 `raw_type` 键）时，插件才兜底成 `"p2p"` 得 `"dm"`。
+     - 普通群：新旧版结果都是 `"group"`。
+     - 话题群：旧版 `"group"`；新版 `"type"` 变成 `"forum"`，合成事件的 chat_type 也随之变成 `"forum"`——这是本次升级带来的新行为，对 `/model` override 键的影响需实测。
+     AGENTS.md 记载 v0.17.6 以传 `raw_type` 定稿（0.17.4 / 0.17.5 两次踩坑实测），与上面对 DM 的推演对不上，原因我没能确证——测试用的是 mock，不是飞书真实返回值的证据。
+  4. **锚点与监视清单**。缺失 2 处：`_dispatch_synthetic_event(`（11-18 已记录，尚未迁移）与本次新增的 `_resolve_source_chat_type(`。更要紧的是 `_is_interactive_operator_authorized` 被插件调用 3 次却从未入锚——父类八针只覆盖了覆写面。这次把插件引用的 26 个继承成员名逐个在新旧上游树里查了定义，只有它是旧有新无（其余 17 个在新树均有定义，另 8 个是实例属性/类常量）；这个「调用面差集」检查比锚点更不容易漏。监视清单另补上三处盲区：feishu 目录的子目录（此前列目录只筛了文件，漏掉 `cards/`）、`gateway/platforms/base.py`（间接基类，从未进每日比对；本次补查未变）、feishu 目录其余模块。
+  5. **已核对不受影响**：父类按正常包模块导入（`_import_base_adapter` 优先 `hermes_plugins.*` 真身，回退 `plugins.platforms.feishu.adapter`），不是单文件影子加载，父类内部的包相对 import 在官方包内自洽，不构成加载期风险；新版 `is_operator_authorized` 读取的 `_chat_info_cache` / `_admins` / `_allowed_group_users` / `_is_sender_authorized`，插件子类实例都继承得到。
+- 建议处理方案（本次不处理；升级到含 11-19 提交的 hermes 之前必须完成第 1 项）：
+  1. **鉴权适配**。在插件侧做双版本兼容的转发层，三处调用不必各自判断版本。可行写法之一是在插件 adapter 类上定义同名方法（导入路径以运行时真身的包名为准，也可沿用 `_official_feishu_attr` 的延迟解析风格）：
+     ```python
+     def _is_interactive_operator_authorized(self, open_id, *, user_id="", union_id="", chat_id=""):
+         legacy = getattr(super(), "_is_interactive_operator_authorized", None)   # hermes ≤ 0.23.0
+         if legacy is not None:
+             return legacy(open_id, user_id=user_id, union_id=union_id, chat_id=chat_id)
+         from plugins.platforms.feishu.cards import is_operator_authorized        # 2026-11-19 起
+         return is_operator_authorized(self, open_id, user_id=user_id, union_id=union_id, chat_id=chat_id)
+     ```
+     同时三处调用补传 `chat_id`、`user_id`、`union_id`。这只是在插件子类上新增方法、不写 hermes 私有字段，不触碰 catalog 的 "no core override" 红线。
+  2. **`event_chat_type` 取值**。新版的正确来源是 `chat_info["raw_mode"]`（p2p/group/topic），pinned 0.23.0 没有这个键，需做兼容；`resolve_source_chat_type` 的 `"p2p"` 字面比较在新位置原样保留，所以传入值仍须是原始的 `p2p` 而非映射后的 `dm`。实现前先按影响面 3 在真实 DM / 普通群 / 话题群各点一次，确认当前实际落点；AGENTS.md 里「raw_type（飞书原始 p2p/group）」这句的前提随之复核。
+  3. **锚点迁移与清单扩充（与升级同批做）**。两针迁到新位置（`adapter_synthetic_events.py` / `cards/authz.py`），新增 `def is_operator_authorized(` 针，并按「插件实际调用的父类成员」补齐选针；`cards/`、`adapter_synthetic_events.py`、`adapter_choice_cards.py` 入 manifest 与 TREE_FILES；每日比对清单加入 `gateway/platforms/base.py` 与 feishu 目录全部模块（含子包）。pinned 2bd378e 没有 `cards/`，现在迁锚会让 doctor 与 pinned 回归对 0.23.0 报缺失，所以只能跟 bump revision 一起做——**在升级之前，每日巡检会持续报这 2 处缺失，属已知状态**。
+  4. **验证**。pytest / ruff / mypy / `hermes plugins validate` / doctor；升级后实测 clarify 按钮、footer 🧠⇄ `pick`、选择卡 `switch`、管理卡 `admin` / `toggle` / `admin_done`，在 DM、普通群、话题群各点一遍；另在未配置 FEISHU admins / `FEISHU_ALLOWED_USERS` 的部署上单独验一次点击不再被拒（b3d632d 修的就是这个场景）。
+- 关联：hermes-compat issue 0 open（Cheerwhy、hutao562 两仓库）。检查期间本地 HEAD 由 9cc2542 前移到 1682bef（v0.22.0，用户提交在途改动），调用面核查已对 1682bef 复跑，结论不变；`plugin/contract.py` 与 manifest 自 11-18 起未动。
