@@ -19,8 +19,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+import time
 import uuid
 from datetime import datetime
 from typing import Any, cast
@@ -58,6 +60,89 @@ _draft_log_state: dict[int, int] = {}
 # cron/scheduler_failure_copy.py 全部文案的公共前缀（该模块 pinned revision
 # 尚未抽出，未锚——改版只降级为蓝卡）；**Status:** script failed 是脚本门形状。
 _CRON_FAILURE_RE = re.compile(r"Cron '[^']{0,120}' failed: |\*\*Status:\*\* [^\n]{0,60}(?:failed|error)")
+
+# ── 飞书任务（todo）转发识别（v0.22.1）──
+# 任务从 Tasks 应用转发进会话 = msg_type=todo。官方 normalize_feishu_message 不认
+# todo → 归一化为空文本 → 「Ignoring empty text message」丢弃，bot 对转发完全失明
+# （2026-11-25 话题群实测：转发任务零反应，用户追问「你看不到我转发的卡片吗」）。
+# content 形状（2026-11-25 抓包实证）：{"task_id": uuid, "summary": {"title": "",
+# "content": [[{"tag": "text", "text": "…"}]]}, "due_time": "epoch-ms 字符串"} ——
+# summary 是 post 形嵌套数组，title 常为空，可见文本在 content。上游若原生支持
+# todo，此覆写可整体退场。
+_TODO_PREFIX = "[飞书任务]"
+
+
+def _todo_task_text(raw_content: Any) -> tuple[str, dict[str, Any]] | None:
+    """todo 消息 content → ``(入站文本, metadata)``；非 todo JSON / 空对象返回 None.
+
+    文本形态：``[飞书任务] <标题>（截止 %Y-%m-%d %H:%M）``——标题优先，缺失时
+    拼 content 里的 text run；截止时间按本机时区格式化。
+    """
+    try:
+        payload = json.loads(raw_content) if isinstance(raw_content, str) else (raw_content or {})
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict) or not payload:
+        return None
+    summary = payload.get("summary")
+    summary = summary if isinstance(summary, dict) else {}
+    title = str(summary.get("title") or "").strip()
+    lines: list[str] = []
+    for row in summary.get("content") or []:
+        if not isinstance(row, list):
+            continue
+        for item in row:
+            if isinstance(item, dict) and str(item.get("tag") or "") == "text":
+                run = str(item.get("text") or "").strip()
+                if run:
+                    lines.append(run)
+    metadata: dict[str, Any] = {}
+    task_id = str(payload.get("task_id") or "").strip()
+    if task_id:
+        metadata["task_id"] = task_id
+    due_text = ""
+    due = payload.get("due_time")
+    if due:
+        try:
+            ts = int(due) / 1000.0
+            if ts > 0:
+                due_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+                metadata["due_time"] = int(due)
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+    body = title or " ".join(lines) or "（未携带标题）"
+    text = f"{_TODO_PREFIX} {body}"
+    if due_text:
+        text += f"（截止 {due_text}）"
+    return text, metadata
+
+
+def _official_adapter_module() -> Any:
+    """官方 feishu adapter 模块（经 FeishuAdapter 类反查；无源树环境返回 None）."""
+    import sys
+
+    try:
+        cls = _import_base_adapter()
+    except Exception:
+        return None
+    return sys.modules.get(cls.__module__)
+
+
+def _normalized_todo_message(text: str, metadata: dict[str, Any]) -> Any:
+    """构造 todo 的归一化结果：官方 dataclass 优先，无源树环境 duck-type 兜底."""
+    mod = _official_adapter_module()
+    cls = getattr(mod, "FeishuNormalizedMessage", None) if mod is not None else None
+    if cls is not None:
+        try:
+            return cls(raw_type="todo", text_content=text, relation_kind="todo",
+                       metadata=metadata)
+        except Exception:
+            pass
+    from types import SimpleNamespace
+
+    return SimpleNamespace(raw_type="todo", text_content=text, preferred_message_type="text",
+                           image_keys=[], media_refs=[], mentions=[],
+                           relation_kind="todo", metadata=metadata)
 
 
 def _looks_like_cron_failure(body: str) -> bool:
@@ -127,6 +212,18 @@ class StreamingFeishuMixin:
     def _engine(self) -> ChatCardEngine:
         engine: ChatCardEngine = self._engine_instance  # type: ignore[attr-defined]
         return engine
+
+    def _normalize(self, message_type: Any, raw_content: Any, mentions: Any) -> Any:
+        """官方归一化入口的 todo 补课：飞书任务转发 → 可读文本入站（v0.22.1）.
+
+        官方 normalize_feishu_message 不认 todo（空文本 → 「Ignoring empty text
+        message」丢弃）。其余类型原样走官方通道。
+        """
+        if str(message_type or "").strip().lower() == "todo":
+            parsed = _todo_task_text(raw_content)
+            if parsed is not None:
+                return _normalized_todo_message(*parsed)
+        return super()._normalize(message_type, raw_content, mentions)  # type: ignore[misc]
 
     # ── draft-streaming 契约 ──
 

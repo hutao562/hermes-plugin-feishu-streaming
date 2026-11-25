@@ -71,6 +71,8 @@ CONTRACT_ANCHORS: dict[str, tuple[tuple[str, str], ...]] = {
         ("def send_image_file(", "本地图片交付覆写（图片随话题卡进线程，v0.21.0）"),
         ("def _dispatch_synthetic_event(", "合成事件通道（footer 🧠⇄ /model、clarify 按钮）"),
         ("def _resolve_source_chat_type(", "chat_type 解析（event_chat_type 传 raw_type 的对端）"),
+        ("def _normalize(", "消息归一化入口（飞书任务 todo 覆写的挂点，v0.22.1）"),
+        ("class FeishuNormalizedMessage", "归一化结果类型（todo 覆写构造的对象）"),
         ("_feishu_send_with_retry", "text 兜底直发通道（clarify/降级路径）"),
     ),
     # clarify 交互依赖面（2026-11-11 补锚：本文件第二次在无锚状态下变动——

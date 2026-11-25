@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import types
 from typing import Any
@@ -15,7 +16,7 @@ import pytest
 from test_plugin_mode import _FakeBaseAdapter, _mock_client, _settle, _streamed_texts
 
 from plugin import _clarify
-from plugin.adapter import build_adapter_class
+from plugin.adapter import _todo_task_text, build_adapter_class
 from plugin.engine import ChatCardEngine
 
 
@@ -758,6 +759,63 @@ async def test_interim_heartbeat_without_card_returns_no_synthetic_none_id(adapt
     await _settle(engine)
     result = await adapter.send("chat1", "⏳ 正在处理", metadata={"_interim_send": True})
     assert result.message_id == "lark-card:om_card_msg"
+
+
+# ── v0.22.1：飞书任务（todo）转发识别 ──
+
+# 2026-11-25 话题群实抓报文（om_x100b7f55d92…，msg_type=todo）
+_TODO_PAYLOAD = json.dumps({
+    "task_id": "9c92245a-2bf3-47a4-b9bf-15a51ef2d360",
+    "summary": {"title": "", "content": [[{"tag": "text", "style": [],
+                "text": "⏰【组织73】村干部报酬1-11月摊平重算＋11-25上午报县里汇总"}]]},
+    "due_time": "1795579200000",
+}, ensure_ascii=False)
+
+
+def test_todo_task_text_parses_real_payload() -> None:
+    import time
+
+    parsed = _todo_task_text(_TODO_PAYLOAD)
+    assert parsed is not None
+    text, meta = parsed
+    assert text.startswith("[飞书任务]")
+    assert "村干部报酬1-11月摊平重算" in text
+    assert "（截止 " in text
+    assert time.strftime("%Y-%m-%d", time.localtime(1795579200)) in text
+    assert meta["task_id"] == "9c92245a-2bf3-47a4-b9bf-15a51ef2d360"
+    assert meta["due_time"] == 1795579200000
+
+
+def test_todo_task_text_title_and_edge_cases() -> None:
+    # title 优先于 content
+    text, _ = _todo_task_text(json.dumps(
+        {"summary": {"title": "周报", "content": [[{"tag": "text", "text": "正文"}]]}}))
+    assert "[飞书任务] 周报" in text and "正文" not in text
+    # 无 due（或 due=0）不出截止段
+    text, _ = _todo_task_text(json.dumps({"summary": {"title": "周报"}, "due_time": "0"}))
+    assert "（截止" not in text
+    # title 空、content 多行 → 拼 text run
+    text, _ = _todo_task_text(json.dumps(
+        {"summary": {"title": "", "content": [[{"tag": "text", "text": "甲"}, {"tag": "text", "text": "乙"}]]}}))
+    assert "甲 乙" in text
+    # 全空 → 占位文本，回合仍能发生
+    text, _ = _todo_task_text(json.dumps({"task_id": "t"}))
+    assert "[飞书任务]" in text
+    # 非 todo JSON / 空对象 → None（交回官方通道）
+    assert _todo_task_text("not json{") is None
+    assert _todo_task_text("[]") is None
+    assert _todo_task_text("{}") is None
+
+
+def test_adapter_normalize_routes_todo(adapter) -> None:
+    normalized = adapter._normalize("todo", _TODO_PAYLOAD, None)
+    assert normalized.text_content.startswith("[飞书任务]")
+    assert normalized.raw_type == "todo"
+    assert normalized.relation_kind == "todo"
+    assert normalized.metadata["task_id"] == "9c92245a-2bf3-47a4-b9bf-15a51ef2d360"
+    # 小写归一：官方可能传 "TODO"
+    assert adapter._normalize("TODO", _TODO_PAYLOAD, None).text_content.startswith("[飞书任务]")
+    # 非 todo 不拦（_FakeBaseAdapter 无 _normalize：仅确保 todo 分支独立判定）
 
 
 @pytest.mark.asyncio
